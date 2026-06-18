@@ -20,6 +20,85 @@
 
 #include "zero.cc"
 
+#ifdef BFP16_IREE
+// ---------------------------------------------------------------------------
+// Drop-in bf16 fast path via the BFP16 (block-floating-point) 8x8x8 datapath.
+// Ported from iree-amd-aie's npu4/peano matmul.cc (load_v64bf16_as_bfp16 +
+// mac_8x8_8x8T). This is DISTINCT from the AIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16
+// flag (which routes aie::mmul through bfp16 WITHOUT the in-kernel B transpose-
+// shuffle, scrambling the output -- see 00-measured-facts.md F5). Here we keep
+// whole_array's proven 2x2 C-block addressing (identical to the working int8
+// 8x8x8 path) and replace ONLY the MAC. Row-major A/B/C only (the encoder case).
+static inline v64bfp16ebs8 load_v64bf16_as_bfp16(const bfloat16 *__restrict p) {
+  v32bfloat16 v0 = *(v32bfloat16 *)(p);
+  v32bfloat16 v1 = *(v32bfloat16 *)(p + 32);
+  v32accfloat a0 = ups(v0);
+  v32accfloat a1 = ups(v1);
+  return to_v64bfp16ebs8(concat(a0, a1));
+}
+static inline v64bfp16ebs8 load_v64bf16_as_bfp16_T(const bfloat16 *__restrict p) {
+  v32bfloat16 v0 = *(v32bfloat16 *)(p);
+  v32bfloat16 v1 = *(v32bfloat16 *)(p + 32);
+  v32bfloat16 v0s = shuffle(v0, 29);
+  v32bfloat16 v1s = shuffle(v1, 29);
+  v32bfloat16 lo = shuffle(v0s, v1s, 14);
+  v32bfloat16 hi = shuffle(v0s, v1s, 15);
+  v32accfloat a0 = ups(lo);
+  v32accfloat a1 = ups(hi);
+  return to_v64bfp16ebs8(concat(a0, a1));
+}
+
+// Same loop structure / pointer arithmetic as matmul_vectorized_2x2_mmul
+// (row-major), but bfp16 datapath. rowA=m/r, colA=k/s, colB=n/t; r=s=t=8.
+template <unsigned rowA, unsigned colA, unsigned colB>
+static inline void matmul_vectorized_2x2_bfp16_row(const bfloat16 *__restrict pA,
+                                                   const bfloat16 *__restrict pB,
+                                                   float *__restrict pC) {
+  constexpr unsigned szA = 64; // r*s
+  constexpr unsigned szB = 64; // s*t
+  constexpr unsigned szC = 64; // r*t
+  event0();
+  for (unsigned z = 0; z < rowA; z += 2)
+    chess_prepare_for_pipelining chess_loop_range(4, ) {
+      float *__restrict pC1 = pC + (z * colB) * szC;
+      float *__restrict pC2 = pC + ((z + 1) * colB) * szC;
+      for (unsigned j = 0; j < colB; j += 2) {
+        const bfloat16 *__restrict pA1 = pA + (z * colA) * szA;
+        const bfloat16 *__restrict pA2 = pA + ((z + 1) * colA) * szA;
+        const bfloat16 *__restrict pB1 = pB + (j)*szB;
+        const bfloat16 *__restrict pB2 = pB + (j + 1) * szB;
+
+        v64accfloat acc_C00 = *(v64accfloat *)(pC1);
+        v64accfloat acc_C01 = *(v64accfloat *)(pC1 + szC);
+        v64accfloat acc_C10 = *(v64accfloat *)(pC2);
+        v64accfloat acc_C11 = *(v64accfloat *)(pC2 + szC);
+
+        for (unsigned i = 0; i < colA; ++i) {
+          v64bfp16ebs8 A0 = load_v64bf16_as_bfp16(pA1);
+          pA1 += szA;
+          v64bfp16ebs8 A1 = load_v64bf16_as_bfp16(pA2);
+          pA2 += szA;
+          v64bfp16ebs8 B0 = load_v64bf16_as_bfp16_T(pB1);
+          pB1 += szB * colB;
+          v64bfp16ebs8 B1 = load_v64bf16_as_bfp16_T(pB2);
+          pB2 += szB * colB;
+          acc_C00 = mac_8x8_8x8T(A0, B0, acc_C00);
+          acc_C01 = mac_8x8_8x8T(A0, B1, acc_C01);
+          acc_C10 = mac_8x8_8x8T(A1, B0, acc_C10);
+          acc_C11 = mac_8x8_8x8T(A1, B1, acc_C11);
+        }
+        *(v64accfloat *)(pC1) = acc_C00;
+        *(v64accfloat *)(pC1 + szC) = acc_C01;
+        *(v64accfloat *)(pC2) = acc_C10;
+        *(v64accfloat *)(pC2 + szC) = acc_C11;
+        pC1 += 2 * szC;
+        pC2 += 2 * szC;
+      }
+    }
+  event1();
+}
+#endif // BFP16_IREE
+
 template <typename T_in, typename T_out, int rowA, int colA, int colB,
           bool b_row_maj = true, bool c_row_maj = true>
 static inline void matmul_scalar(T_in *a, T_in *b, T_out *c) {
@@ -341,9 +420,15 @@ matmul_vectorized_8x8x8_bf16_f32(const bfloat16 *__restrict pA,
   static_assert(k % s == 0);
   static_assert(n % (2 * t) == 0);
 
+#ifdef BFP16_IREE
+  static_assert(is_b_row_maj && is_c_row_maj,
+                "BFP16_IREE path supports row-major B and C only");
+  return matmul_vectorized_2x2_bfp16_row<(m / r), (k / s), (n / t)>(pA, pB, pC);
+#else
   return matmul_vectorized_2x2_mmul<bfloat16, float, (m / r), (k / s), (n / t),
                                     r, s, t, is_b_row_maj, is_c_row_maj>(pA, pB,
                                                                          pC);
+#endif
 }
 
 template <unsigned m, unsigned k, unsigned n>

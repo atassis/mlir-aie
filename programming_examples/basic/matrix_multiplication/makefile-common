@@ -69,8 +69,75 @@ trace_insts_target?=build/trace_insts_${target_suffix}.bin
 aie_py_src?=${targetname}.py
 
 runargs?=-v 2 --warmup 1 --iters 1
-aieargs+=--dev ${devicename} -M $M -K $K -N $N --dtype_in ${dtype_in} --dtype_out ${dtype_out} \
-	--use-chess ${use_chess} --emulate-bf16-mmul-with-bfp16 ${emulate_bfloat16_mmul_with_bfp16}
+aieargs+=--dev ${devicename} -M $M -K $K -N $N --dtype_in ${dtype_in} --dtype_out ${dtype_out}
+
+use_chess?=0
+
+# default sequential buffer allocation, if not already defined
+buffer_aloc_flag?=basic-sequential
+
+ifeq ($(devicename),npu2)
+col_shift?=0
+else 
+#shift first column in Phoenix/Hawk, because deosn't have shimTile 
+col_shift?=1
+endif
+
+ifneq (${use_chess}, 1)
+aiecc_peano_flags=--no-xchesscc --no-xbridge --peano ${PEANO_INSTALL_DIR}
+else
+# --unified compiles all cores in a single xchesscc invocation, reducing
+# per-core Chess process startups and peak memory usage on CI runners.
+aiecc_chess_flags=--unified
+endif
+
+ifeq ($(devicename),npu2)
+kernels_dir=${srcdir}/../../../../aie_kernels/aie2p
+else 
+kernels_dir=${srcdir}/../../../../aie_kernels/aie2
+endif
+
+# When this flag is set to 1, optimal performance is attained
+# via the usage of chess pragmas (see mm.cc).
+# Instruction memory and compilation time increases in this case.
+# Set to 0 otherwise.
+# Only affects kernel compilation using chess.
+opt_perf?=0
+
+# KERNEL_CC defines the C compiler used to compile the kernel.
+# KERNEL_CFLAGS holds the flags passed to that compiler.
+# By default, we use Peano, a.k.a. llvm-aie.
+KERNEL_CC=${PEANO_INSTALL_DIR}/bin/clang++
+ifeq (${devicename}, npu)
+KERNEL_CFLAGS=${PEANOWRAP2_FLAGS}
+else ifeq (${devicename}, npu2)
+KERNEL_CFLAGS=${PEANOWRAP2P_FLAGS}
+endif
+
+ifeq (${use_chess}, 1)
+KERNEL_CC=xchesscc_wrapper
+ifeq (${devicename}, npu)
+KERNEL_CFLAGS=${CHESSCCWRAP2_FLAGS}
+else ifeq (${devicename}, npu2)
+KERNEL_CFLAGS=${CHESSCCWRAP2P_FLAGS}
+endif
+endif
+
+ifeq ($(emulate_bfloat16_mmul_with_bfp16), 1)
+KERNEL_DEFINES += -DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16
+aieargs += --emulate-bf16-mmul-with-bfp16 true
+endif
+
+# Route the bf16->f32 8x8x8 path through the iree-ported explicit bfp16 microkernel
+# (mm.cc, BFP16_IREE) instead of aie::mmul-emulate. Use WITH emulate_..._bfp16=1.
+ifeq ($(bfp16_iree), 1)
+KERNEL_DEFINES += -DBFP16_IREE
+endif
+
+ifeq (${opt_perf}, 1)
+	KERNEL_DEFINES+=-DOPT_PERF_ENABLED
+endif
+
 
 # ##########################################################################
 # Targets
