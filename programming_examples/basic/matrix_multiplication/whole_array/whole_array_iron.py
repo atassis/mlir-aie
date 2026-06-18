@@ -162,6 +162,13 @@ def my_matmul(
     # a big performance cost.
     fifo_depth = 2
 
+    # The L1 C tile is held resident across the whole K reduction and only drained
+    # once per output tile, so its double-buffering buys little but costs m*n*sizeof
+    # L1 bytes -- the binding resource at wide-N int8. Single-buffering C (WA_C_DEPTH=1)
+    # frees that L1 to allow a wider N tile. A/B stay double-buffered.
+    import os as _os
+    c_fifo_depth = int(_os.environ.get("WA_C_DEPTH", str(fifo_depth)))
+
     n_tiles_per_core = (M // m) * (N // n) // n_aie_cores
 
     # When using more AIE columns than n_aie_rows (4) (applicable to NPU2),
@@ -295,7 +302,7 @@ def my_matmul(
                 of_offsets,
                 obj_types=[C_l1_ty] * n_aie_rows,
                 names=[f"C_L1L2_{col}_{row}" for row in range(n_aie_rows)],
-                depths=[fifo_depth] * n_aie_rows,
+                depths=[c_fifo_depth] * n_aie_rows,
             )
         )
         for j in range(n_aie_rows):

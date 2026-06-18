@@ -139,6 +139,12 @@ KERNEL_DEFINES += -DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16
 aieargs += --emulate-bf16-mmul-with-bfp16 true
 endif
 
+# Route the bf16->f32 8x8x8 path through the iree-ported explicit bfp16 microkernel
+# (mm.cc, BFP16_IREE) instead of aie::mmul-emulate. Use WITH emulate_..._bfp16=1.
+ifeq ($(bfp16_iree), 1)
+KERNEL_DEFINES += -DBFP16_IREE
+endif
+
 ifeq (${opt_perf}, 1)
 	KERNEL_DEFINES+=-DOPT_PERF_ENABLED
 endif

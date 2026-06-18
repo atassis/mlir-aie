@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <bits/stdc++.h>
+#include <cassert>  // local fix: gcc16 no longer pulls assert transitively
 #include <cmath>
 #include <fstream>
 #include <iostream>

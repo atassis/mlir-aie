@@ -50,6 +50,14 @@ endif()
 # -----------------------------------------------------------------------------
 # XRT auto-detection (supports both Ubuntu packages and legacy /opt/xilinx/xrt)
 # -----------------------------------------------------------------------------
+# LOCAL PATCH (CachyOS): Arch's xrt cmake export references missing static .a libs,
+# so find_package(XRT) hard-fails. Allow overriding via env to use the shared .so.
+if(NOT DEFINED XRT_INC_DIR AND DEFINED ENV{XRT_INC_DIR})
+    set(XRT_INC_DIR "$ENV{XRT_INC_DIR}" CACHE STRING "Path to XRT headers")
+endif()
+if(NOT DEFINED XRT_LIB_DIR AND DEFINED ENV{XRT_LIB_DIR})
+    set(XRT_LIB_DIR "$ENV{XRT_LIB_DIR}" CACHE STRING "Path to XRT libraries")
+endif()
 if(NOT DEFINED XRT_INC_DIR OR NOT DEFINED XRT_LIB_DIR)
     find_package(XRT QUIET)
     if(XRT_FOUND)

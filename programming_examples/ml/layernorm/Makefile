@@ -37,7 +37,7 @@ endif
 
 build/aie.mlir: ${srcdir}/${aie_py_src}
 	mkdir -p ${@D}
-	python3 $< -d ${devicename} -r ${rows} -c ${cols} -t ${trace_size}>$@
+	python3 $< -d ${devicename} -r ${rows} -c ${cols} -t ${trace_size} >$@
 
 build/aie_trace.mlir: ${srcdir}/${aie_py_src}
 	mkdir -p ${@D}
