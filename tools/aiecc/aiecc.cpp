@@ -2519,24 +2519,60 @@ static LogicalResult peanoLlcAndLink(StringRef optPath, StringRef objPath,
       if (auto b = llvm::MemoryBuffer::getFile(p))
         keyHasher.update((*b)->getBuffer());
     };
-    hashFile(optPath);
-    hashFile(ldScriptPath);
-    keyHasher.update(aieTarget);
-    keyHasher.update(StringRef(optLevelStr));
+    auto hashStr = [&](StringRef s) { keyHasher.update(s); };
+    // Everything that determines the linked .elf bytes goes into the key.
+    hashFile(optPath);      // per-core optimized IR
+    hashFile(ldScriptPath); // tile-specific linker script
+    hashStr(aieTarget);
+    hashStr(StringRef(optLevelStr));
+    // Link-command-determining flags: two configs differing only here must NOT
+    // collide (the link cmd below branches on these).
+    hashStr(linkAgainstHsa ? "hsa1" : "hsa0");
+    hashStr(StringRef(sysroot));
+    // Toolchain identity: stamp the Peano llc binary (size:mtime) so a Peano
+    // upgrade with a persistent CORE_CACHE_DIR invalidates the cache instead of
+    // serving stale bytes.
+    if (sys::fs::file_status st; !sys::fs::status(peanoLlc, st))
+      hashStr(std::to_string(st.getSize()) + ":" +
+              std::to_string(
+                  st.getLastModificationTime().time_since_epoch().count()));
+    // External link objects: resolve the SAME 4-level way as the link loop below
+    // (absolute -> CWD -> tmpDir -> input-dir) and hash the SOURCE content +
+    // INPUT() basename — at this point they are not yet copied into tmpDir.
     for (const auto &lf : core.linkFiles) {
-      SmallString<256> p;
+      SmallString<256> src;
       if (sys::path::is_absolute(lf))
-        p = lf;
+        src = lf;
       else {
-        p = tmpDirName;
-        sys::path::append(p, lf);
+        SmallString<256> cwd;
+        sys::fs::current_path(cwd);
+        sys::path::append(cwd, lf);
+        if (sys::fs::exists(cwd))
+          src = cwd;
+        else {
+          SmallString<256> t(tmpDirName);
+          sys::path::append(t, lf);
+          if (sys::fs::exists(t))
+            src = t;
+          else {
+            SmallString<256> in = sys::path::parent_path(getInputFilename());
+            if (in.empty())
+              sys::fs::current_path(in);
+            src = in;
+            sys::path::append(src, lf);
+            sys::path::remove_dots(src, /*remove_dot_dot=*/true);
+          }
+        }
       }
-      hashFile(p);
+      hashStr(sys::path::filename(lf));
+      hashFile(src);
     }
     std::string key = llvm::toHex(keyHasher.final(), /*LowerCase=*/true);
     SmallString<256> cp(coreCacheDir);
     sys::path::append(cp, key + ".elf");
     coreCachePath = std::string(cp);
+    // Read is safe given the ATOMIC store below: rename() means a reader sees
+    // either the old or the new complete file, never a torn one.
     if (sys::fs::exists(coreCachePath) &&
         !sys::fs::copy_file(coreCachePath, elfPath))
       return success(); // cache hit: skip llc+link
@@ -2682,11 +2718,15 @@ static LogicalResult peanoLlcAndLink(StringRef optPath, StringRef objPath,
   }
   g_phaseLinkNs += elapsedNs(tLink0);
   // Store the freshly-linked .elf in the persistent core cache (best-effort).
+  // ATOMIC: write to a unique temp in the cache dir then rename into place, so a
+  // concurrent reader (parallel core-compile workers, or an overlapping build)
+  // never observes a torn/partial .elf. (A plain copy_file here was a real data
+  // race — the source of the transient rc=1 cold/warm-overlap failures.)
   if (!coreCachePath.empty()) {
     SmallString<256> dir(coreCachePath);
     sys::path::remove_filename(dir);
     sys::fs::create_directories(dir);
-    sys::fs::copy_file(elfPath, coreCachePath);
+    (void)atomicCopyFile(elfPath, dir, sys::path::filename(coreCachePath));
   }
   return success();
 }
