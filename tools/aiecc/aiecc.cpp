@@ -1714,6 +1714,11 @@ static LogicalResult runNpuLoweringPipeline(ModuleOp moduleOp,
     if (verbose) {
       pm.enableVerifier(true);
     }
+    // Build-chain attack: per-pass MLIR timing (byte-neutral; prints on PM
+    // destruction). Opt-in via AIECC_PASS_TIMING to locate the npu-lowering wall
+    // (materialize-greedy vs the device-level DMA-lowering passes).
+    if (std::getenv("AIECC_PASS_TIMING"))
+      pm.enableTiming();
 
     // Add materialize runtime sequences pass at module level (before device
     // nesting) unless --no-materialize is specified
