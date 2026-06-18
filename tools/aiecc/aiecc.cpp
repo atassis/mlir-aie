@@ -2784,6 +2784,42 @@ static LogicalResult peanoLlcAndLink(StringRef optPath, StringRef objPath,
   }
   std::string optLevelStr = std::to_string(optLevel);
 
+  // Build-speed lever (opt-in CORE_CACHE_DIR): the per-core .elf is fully
+  // determined by its .opt.ll + ld.script + external link objects + target + opt
+  // level. Content-address it so a fixed-config REBUILD skips the dominant
+  // llc+link (~4s for ~200 cores at B=128 -> sub-10s warm block build). The
+  // whole-array ELF assembly still runs downstream, and the byte gate validates
+  // every build, so a stale/colliding hit cannot ship silently.
+  std::string coreCachePath;
+  if (const char *coreCacheDir = std::getenv("CORE_CACHE_DIR")) {
+    llvm::SHA256 keyHasher;
+    auto hashFile = [&](StringRef p) {
+      if (auto b = llvm::MemoryBuffer::getFile(p))
+        keyHasher.update((*b)->getBuffer());
+    };
+    hashFile(optPath);
+    hashFile(ldScriptPath);
+    keyHasher.update(aieTarget);
+    keyHasher.update(StringRef(optLevelStr));
+    for (const auto &lf : core.linkFiles) {
+      SmallString<256> p;
+      if (sys::path::is_absolute(lf))
+        p = lf;
+      else {
+        p = tmpDirName;
+        sys::path::append(p, lf);
+      }
+      hashFile(p);
+    }
+    std::string key = llvm::toHex(keyHasher.final(), /*LowerCase=*/true);
+    SmallString<256> cp(coreCacheDir);
+    sys::path::append(cp, key + ".elf");
+    coreCachePath = std::string(cp);
+    if (sys::fs::exists(coreCachePath) &&
+        !sys::fs::copy_file(coreCachePath, elfPath))
+      return success(); // cache hit: skip llc+link
+  }
+
   // Run llc
   SmallVector<std::string, 10> llcCmd = {peanoLlc,
                                          std::string(optPath),
@@ -2923,6 +2959,13 @@ static LogicalResult peanoLlcAndLink(StringRef optPath, StringRef objPath,
     return failure();
   }
   g_phaseLinkNs += elapsedNs(tLink0);
+  // Store the freshly-linked .elf in the persistent core cache (best-effort).
+  if (!coreCachePath.empty()) {
+    SmallString<256> dir(coreCachePath);
+    sys::path::remove_filename(dir);
+    sys::fs::create_directories(dir);
+    sys::fs::copy_file(elfPath, coreCachePath);
+  }
   return success();
 }
 
