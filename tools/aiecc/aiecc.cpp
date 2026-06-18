@@ -128,6 +128,87 @@ using namespace llvm;
 using namespace mlir;
 
 //===----------------------------------------------------------------------===//
+// Build-chain attack: phase wall-clock instrumentation (byte-neutral; prints to
+// stdout only, does NOT change any emitted artifact). Accumulates wall time per
+// named phase across the serial compile driver (the per-device loop calls each
+// phase repeatedly, so we sum). A summary table is printed at the end of
+// compileAIEModule. Enabled whenever the AIECC_PHASE_TIMERS env var is set (so
+// it is opt-in and adds zero output to normal builds). See
+// docs/handoffs/active/aiecc-build-chain-attack.md.
+//===----------------------------------------------------------------------===//
+namespace {
+struct PhaseAccum {
+  std::mutex mu;
+  std::map<std::string, double> totals; // name -> seconds (summed)
+  std::map<std::string, unsigned> counts;
+  std::vector<std::string> order; // first-seen order
+  bool enabled = false;
+  std::string filePath; // optional: also append timer lines here (IRON swallows
+                        // aiecc stdout, so a file is the reliable sink)
+  PhaseAccum() {
+    enabled = (std::getenv("AIECC_PHASE_TIMERS") != nullptr);
+    if (const char *f = std::getenv("AIECC_PHASE_TIMERS_FILE"))
+      filePath = f;
+  }
+  void writeFile(const std::string &line) {
+    if (filePath.empty())
+      return;
+    std::ofstream ofs(filePath, std::ios::app);
+    if (ofs)
+      ofs << line << "\n";
+  }
+  void add(const std::string &name, double secs) {
+    std::lock_guard<std::mutex> lock(mu);
+    auto it = totals.find(name);
+    if (it == totals.end()) {
+      order.push_back(name);
+      totals[name] = secs;
+      counts[name] = 1;
+    } else {
+      it->second += secs;
+      counts[name]++;
+    }
+    writeFile("[phase-timer] " + name + " += " + std::to_string(secs) + " s");
+  }
+  void report() {
+    std::lock_guard<std::mutex> lock(mu);
+    double sum = 0.0;
+    for (auto &n : order)
+      sum += totals[n];
+    llvm::outs() << "\n[phase-timer] ===== SERIAL PHASE BREAKDOWN (wall, "
+                    "summed across device loop) =====\n";
+    writeFile("[phase-timer] ===== SERIAL PHASE BREAKDOWN (wall, summed) =====");
+    for (auto &n : order) {
+      llvm::outs() << "[phase-timer]   " << n << " : " << totals[n] << " s ("
+                   << counts[n] << " call(s))\n";
+      writeFile("[phase-timer]   " + n + " : " + std::to_string(totals[n]) +
+                " s (" + std::to_string(counts[n]) + " calls)");
+    }
+    llvm::outs() << "[phase-timer]   ---- timed-sum : " << sum << " s\n";
+    writeFile("[phase-timer]   ---- timed-sum : " + std::to_string(sum) + " s");
+    llvm::outs() << "[phase-timer] =============================================="
+                    "==============\n";
+  }
+};
+static PhaseAccum gPhaseAccum;
+struct ScopedPhaseTimer {
+  std::string name;
+  std::chrono::steady_clock::time_point t0;
+  ScopedPhaseTimer(std::string n)
+      : name(std::move(n)), t0(std::chrono::steady_clock::now()) {}
+  ~ScopedPhaseTimer() {
+    if (!gPhaseAccum.enabled)
+      return;
+    double secs = std::chrono::duration<double>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count();
+    gPhaseAccum.add(name, secs);
+    llvm::outs() << "[phase-timer] " << name << " += " << secs << " s\n";
+  }
+};
+} // namespace
+
+//===----------------------------------------------------------------------===//
 // Command Line Options
 //===----------------------------------------------------------------------===//
 
@@ -6201,18 +6282,27 @@ static LogicalResult compileAIEModule(MLIRContext &context, ModuleOp moduleOp,
 
   // Step 0: Run tile placement (only when logical tile ops exist)
   // This converts aie.logical_tile -> aie.tile before any other passes.
-  if (failed(runPlacementPipeline(moduleOp, tmpDirName))) {
-    return failure();
+  {
+    ScopedPhaseTimer _t("placement");
+    if (failed(runPlacementPipeline(moduleOp, tmpDirName))) {
+      return failure();
+    }
   }
 
   // Step 1a: Run trace lowering (only when trace ops exist)
-  if (failed(runTraceLoweringPipeline(moduleOp, tmpDirName))) {
-    return failure();
+  {
+    ScopedPhaseTimer _t("trace-lowering");
+    if (failed(runTraceLoweringPipeline(moduleOp, tmpDirName))) {
+      return failure();
+    }
   }
 
   // Step 1b: Run resource allocation and lowering passes in-memory
-  if (failed(runResourceAllocationPipeline(moduleOp, aieTarget, tmpDirName))) {
-    return failure();
+  {
+    ScopedPhaseTimer _t("resource-allocation");
+    if (failed(runResourceAllocationPipeline(moduleOp, aieTarget, tmpDirName))) {
+      return failure();
+    }
   }
 
   // Write intermediate file only if we're compiling cores (LLVM lowering
@@ -6241,8 +6331,11 @@ static LogicalResult compileAIEModule(MLIRContext &context, ModuleOp moduleOp,
   }
 
   // Step 2: Run routing in-memory
-  if (failed(runRoutingPipeline(moduleOp, tmpDirName))) {
-    return failure();
+  {
+    ScopedPhaseTimer _t("routing");
+    if (failed(runRoutingPipeline(moduleOp, tmpDirName))) {
+      return failure();
+    }
   }
 
   // Dump physical module if requested (for debugging only)
@@ -6268,12 +6361,14 @@ static LogicalResult compileAIEModule(MLIRContext &context, ModuleOp moduleOp,
     std::map<std::pair<int, int>, std::string> elfPaths;
     if (unified) {
       // Unified compilation: all cores compiled together into one object
+      ScopedPhaseTimer _t("per-core-compile(unified)");
       if (failed(compileCoresUnified(context, moduleOp, deviceOp, devName,
                                      tmpDirName, aieTarget, elfPaths))) {
         return failure();
       }
     } else {
       // Per-core compilation (default): each core compiled separately
+      ScopedPhaseTimer _t("per-core-compile");
       if (failed(compileCores(context, moduleOp, deviceOp, devName, tmpDirName,
                               aieTarget, elfPaths))) {
         return failure();
@@ -6321,6 +6416,7 @@ static LogicalResult compileAIEModule(MLIRContext &context, ModuleOp moduleOp,
     bool deferNpuInstsToOncePass =
         generateFullElf && !expandLoadPdis && !generateCtrlPkt;
     if (!deferNpuInstsToOncePass) {
+      ScopedPhaseTimer _t("npu-insts+materialize");
       if (!generateCtrlPkt &&
           failed(generateNpuInstructions(moduleOp, tmpDirName, devName))) {
         return failure();
@@ -6333,13 +6429,19 @@ static LogicalResult compileAIEModule(MLIRContext &context, ModuleOp moduleOp,
     }
 
     // Generate ELF from NPU instructions (via aiebu-asm)
-    if (failed(generateElfFromInsts(moduleOp, tmpDirName, devName))) {
-      return failure();
+    {
+      ScopedPhaseTimer _t("elf-from-insts");
+      if (failed(generateElfFromInsts(moduleOp, tmpDirName, devName))) {
+        return failure();
+      }
     }
 
     // Generate CDO/PDI/xclbin from in-memory module
-    if (failed(generateCdoArtifacts(moduleOp, tmpDirName, devName))) {
-      return failure();
+    {
+      ScopedPhaseTimer _t("cdo-artifacts");
+      if (failed(generateCdoArtifacts(moduleOp, tmpDirName, devName))) {
+        return failure();
+      }
     }
 
     // Generate aie_inc.cpp and aiesim work folder if requested
@@ -6409,10 +6511,13 @@ static LogicalResult compileAIEModule(MLIRContext &context, ModuleOp moduleOp,
     OwningOpRef<ModuleOp> expandedModule = moduleOp.clone();
 
     // 2. Run NPU lowering + expand-load-pdis ONCE (no PDI IDs yet)
-    if (failed(runNpuLoweringPipeline(*expandedModule, tmpDirName,
-                                      /*patchPdiIds=*/false))) {
-      llvm::errs() << "Error: expanded NPU lowering pipeline failed\n";
-      return failure();
+    {
+      ScopedPhaseTimer _t("npu-lowering-expand+materialize");
+      if (failed(runNpuLoweringPipeline(*expandedModule, tmpDirName,
+                                        /*patchPdiIds=*/false))) {
+        llvm::errs() << "Error: expanded NPU lowering pipeline failed\n";
+        return failure();
+      }
     }
 
     // 3. Enumerate ALL devices in module iteration order (includes empties)
@@ -6458,8 +6563,11 @@ static LogicalResult compileAIEModule(MLIRContext &context, ModuleOp moduleOp,
       }
 
       // Generate CDO/PDI
-      if (failed(generateCdoArtifacts(*expandedModule, tmpDirName, devName))) {
-        return failure();
+      {
+        ScopedPhaseTimer _t("cdo-artifacts");
+        if (failed(generateCdoArtifacts(*expandedModule, tmpDirName, devName))) {
+          return failure();
+        }
       }
 
       // Collect DeviceElfInfo
@@ -6540,8 +6648,11 @@ static LogicalResult compileAIEModule(MLIRContext &context, ModuleOp moduleOp,
   }
 
   // Generate full ELF after all devices are processed
-  if (failed(generateFullElfArtifact(deviceElfInfos, tmpDirName))) {
-    return failure();
+  {
+    ScopedPhaseTimer _t("full-elf-assembly");
+    if (failed(generateFullElfArtifact(deviceElfInfos, tmpDirName))) {
+      return failure();
+    }
   }
 
   // Host compilation (after all device processing, since host code may
@@ -6550,6 +6661,7 @@ static LogicalResult compileAIEModule(MLIRContext &context, ModuleOp moduleOp,
     return failure();
   }
 
+  gPhaseAccum.report();
   return success();
 }
 
@@ -6585,7 +6697,10 @@ static int processInputFile(StringRef inputFile, StringRef tmpDirName) {
 
   ParserConfig parseConfig(&context);
   SourceMgr sourceMgr;
-  inputModuleOp = parseSourceFile<ModuleOp>(inputFile, sourceMgr, parseConfig);
+  {
+    ScopedPhaseTimer _t("parse-input-mlir");
+    inputModuleOp = parseSourceFile<ModuleOp>(inputFile, sourceMgr, parseConfig);
+  }
 
   if (!inputModuleOp) {
     llvm::errs() << "Error parsing MLIR file\n";
