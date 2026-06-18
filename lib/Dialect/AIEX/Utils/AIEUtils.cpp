@@ -14,8 +14,9 @@
 using namespace mlir;
 using namespace xilinx;
 
-// Counter shared across calls to getOrCreateDataMemref so that uniquing scans
-// can skip past previously used indices efficiently.
+// Fallback counter for naming the private blockwrite data globals when no caller
+// `nextId` is supplied. Combined with the legacy symbol-table probe below this
+// stays correct; hot callers pass a seeded `nextId` to avoid the O(n) probe.
 static unsigned blockwriteDataCounter = 0;
 
 std::optional<AIEX::SubviewTraceResult>
@@ -125,37 +126,59 @@ AIEX::traceSubviewToBlockArgument(Value value) {
   return std::nullopt;
 }
 
-memref::GlobalOp AIEX::getOrCreateDataMemref(OpBuilder &builder,
-                                             AIE::DeviceOp dev,
-                                             mlir::Location loc,
-                                             ArrayRef<uint32_t> words) {
+memref::GlobalOp AIEX::getOrCreateDataMemref(
+    OpBuilder &builder, AIE::DeviceOp dev, mlir::Location loc,
+    ArrayRef<uint32_t> words,
+    llvm::DenseMap<mlir::Attribute, memref::GlobalOp> *dedupCache,
+    unsigned *nextId) {
   uint32_t num_words = words.size();
   MemRefType memrefType = MemRefType::get({num_words}, builder.getI32Type());
   TensorType tensorType =
       RankedTensorType::get({num_words}, builder.getI32Type());
-  memref::GlobalOp global = nullptr;
   auto initVal = DenseElementsAttr::get<uint32_t>(tensorType, words);
-  auto otherGlobals = dev.getOps<memref::GlobalOp>();
-  for (auto g : otherGlobals) {
-    if (g.getType() != memrefType)
-      continue;
-    auto otherValue = g.getInitialValue();
-    if (!otherValue)
-      continue;
-    if (*otherValue != initVal)
-      continue;
-    global = g;
-    break;
+
+  // Dedup. The initial-value attribute is uniqued and encodes both the element
+  // data and the (shaped) type, so it is a sufficient key on its own.
+  memref::GlobalOp global = nullptr;
+  if (dedupCache) {
+    // O(1): the cache is seeded by the caller from the device's existing globals
+    // and kept in sync below as we create new ones.
+    auto it = dedupCache->find(initVal);
+    if (it != dedupCache->end())
+      return it->second;
+  } else {
+    // No cache supplied: fall back to the original O(n) linear scan. Kept so the
+    // helper stays correct for any low-volume caller, but hot callers must pass a
+    // cache (see header) to avoid O(n^2) behavior.
+    for (auto g : dev.getOps<memref::GlobalOp>()) {
+      if (g.getType() != memrefType)
+        continue;
+      auto otherValue = g.getInitialValue();
+      if (!otherValue)
+        continue;
+      if (*otherValue != initVal)
+        continue;
+      return g;
+    }
   }
-  if (!global) {
-    std::string name = "blockwrite_data_";
+
+  // Choose a name. With a caller-supplied `nextId` (seeded one past the largest
+  // existing blockwrite_data_<n>) the name is unique by construction, so no
+  // symbol-table probe is needed. Without it, fall back to the legacy probe.
+  std::string name;
+  if (nextId) {
+    name = "blockwrite_data_" + std::to_string((*nextId)++);
+  } else {
+    name = "blockwrite_data_";
     while (dev.lookupSymbol(name + std::to_string(blockwriteDataCounter)))
       blockwriteDataCounter++;
-    name += std::to_string(blockwriteDataCounter);
-    global = memref::GlobalOp::create(builder, loc, name,
-                                      builder.getStringAttr("private"),
-                                      memrefType, initVal, true, nullptr);
+    name += std::to_string(blockwriteDataCounter++);
   }
+  global = memref::GlobalOp::create(builder, loc, name,
+                                    builder.getStringAttr("private"), memrefType,
+                                    initVal, true, nullptr);
+  if (dedupCache)
+    (*dedupCache)[initVal] = global;
   return global;
 }
 

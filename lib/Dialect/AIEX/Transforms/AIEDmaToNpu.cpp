@@ -526,8 +526,17 @@ struct WriteBdToBlockWritePattern : OpConversionPattern<NpuWriteBdOp> {
   using OpConversionPattern::OpConversionPattern;
 
 public:
-  WriteBdToBlockWritePattern(MLIRContext *context, PatternBenefit benefit = 1)
-      : OpConversionPattern(context, benefit) {}
+  WriteBdToBlockWritePattern(
+      MLIRContext *context,
+      llvm::DenseMap<Attribute, memref::GlobalOp> *dedupCache, unsigned *nextId,
+      PatternBenefit benefit = 1)
+      : OpConversionPattern(context, benefit), dedupCache(dedupCache),
+        nextId(nextId) {}
+
+  // Per-pass-run memo + next free name index for blockwrite data globals (see
+  // getOrCreateDataMemref). Owned by the pass; live only during the conversion.
+  llvm::DenseMap<Attribute, memref::GlobalOp> *dedupCache;
+  unsigned *nextId;
 
   LogicalResult
   matchAndRewrite(NpuWriteBdOp op, OpAdaptor adaptor,
@@ -705,7 +714,8 @@ public:
     {
       OpBuilder::InsertionGuard guard(rewriter);
       rewriter.setInsertionPoint(op->getParentOfType<AIE::RuntimeSequenceOp>());
-      global = getOrCreateDataMemref(rewriter, dev, op.getLoc(), words);
+      global = getOrCreateDataMemref(rewriter, dev, op.getLoc(), words,
+                                     dedupCache, nextId);
     }
     auto memref = memref::GetGlobalOp::create(
         rewriter, op.getLoc(), global.getType(), global.getName());
@@ -746,6 +756,27 @@ struct AIEDmaToNpuPass : xilinx::AIEX::impl::AIEDmaToNpuBase<AIEDmaToNpuPass> {
     target.addDynamicallyLegalOp<NpuMaskWrite32Op>(
         [&](NpuMaskWrite32Op op) { return !op.getBuffer(); });
 
+    // Seed, from the device's existing globals, (a) a dedup cache (initial-value
+    // -> global) and (b) the next free "blockwrite_data_<n>" name index (one past
+    // the current max). WriteBdToBlockWritePattern then keeps both in sync as it
+    // creates globals. This turns the per-BD dedup AND name-uniquing from O(n)
+    // each (a full rescan / symbol-table probe per call) into O(1), i.e. O(n^2)
+    // -> O(n) over the whole runtime sequence. Seeding the index past the max
+    // keeps names unique by construction. Both are locals (raw op handles) and
+    // must not outlive this conversion.
+    llvm::DenseMap<Attribute, memref::GlobalOp> dataMemrefCache;
+    unsigned nextBlockwriteId = 0;
+    for (auto g : device.getOps<memref::GlobalOp>()) {
+      if (auto initVal = g.getInitialValue())
+        dataMemrefCache.try_emplace(*initVal, g);
+      StringRef suffix = g.getSymName();
+      if (suffix.consume_front("blockwrite_data_")) {
+        unsigned idx;
+        if (!suffix.getAsInteger(10, idx) && idx >= nextBlockwriteId)
+          nextBlockwriteId = idx + 1;
+      }
+    }
+
     RewritePatternSet patterns(&getContext());
     patterns.insert<BlockWriteSymToAddr>(&getContext());
     patterns.insert<DmaToNpuPattern>(&getContext());
@@ -754,7 +785,8 @@ struct AIEDmaToNpuPass : xilinx::AIEX::impl::AIEDmaToNpuBase<AIEDmaToNpuPass> {
     patterns.insert<PushQueuetoWrite32Pattern>(&getContext());
     patterns.insert<RtpToWrite32Pattern>(&getContext());
     patterns.insert<Write32SymToAddr>(&getContext());
-    patterns.insert<WriteBdToBlockWritePattern>(&getContext());
+    patterns.insert<WriteBdToBlockWritePattern>(&getContext(), &dataMemrefCache,
+                                                &nextBlockwriteId);
 
     if (failed(applyPartialConversion(device, target, std::move(patterns))))
       signalPassFailure();
