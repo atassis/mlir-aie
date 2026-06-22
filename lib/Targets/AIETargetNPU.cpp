@@ -194,6 +194,14 @@ cachedBlockWriteData(NpuBlockWriteOp op, mlir::SymbolTable &symTab,
   auto getGlobal = op.getData().getDefiningOp<mlir::memref::GetGlobalOp>();
   if (!getGlobal)
     return op.getDataWords();
+  // Honor getDataWords()'s 32-bit-element contract exactly: a non-32-bit memref
+  // must take the canonical path (which emits "Only 32-bit data type is
+  // supported" + returns nullptr), not the cached fast path.
+  mlir::DataLayout dataLayout = mlir::DataLayout::closest(op);
+  if (dataLayout.getTypeSizeInBits(
+          mlir::cast<mlir::MemRefType>(op.getData().getType())
+              .getElementType()) != 32)
+    return op.getDataWords();
   mlir::StringAttr key = getGlobal.getNameAttr().getAttr();
   auto it = cache.find(key);
   if (it != cache.end())

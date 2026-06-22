@@ -17,6 +17,7 @@
 
 #include "llvm/Support/Debug.h"
 #include <llvm/ADT/APInt.h>
+#include <llvm/ADT/DenseSet.h>
 
 extern "C" {
 #include "xaiengine/xaiegbl_defs.h"
@@ -657,20 +658,23 @@ static LogicalResult convertTransactionOpsToMLIR(
   {
     OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToStart(device.getBody());
-    // O(n^2)->O(n): seed the name counter one past the largest existing
-    // <blockwrite_prefix><n> so each name below is unique by construction. This
-    // avoids generateUniqueSymbolName's per-blockwrite O(n) SymbolTable probe,
-    // which made this loop O(n^2) (AIEExpandLoadPdiPass calls it once per
-    // blockwrite — the dominant cost of large multi-column with-PDI builds).
-    unsigned id = 0;
+    // O(n^2)->O(n): collect the existing <blockwrite_prefix><n> indices once,
+    // then below pick names by advancing a monotonic counter past any taken
+    // index. This reproduces generateUniqueSymbolName's exact selection (a
+    // persistent counter from 0 that skips occupied slots and uses the first
+    // free one) without its per-blockwrite O(n) SymbolTable probe, which made
+    // this loop O(n^2) (AIEExpandLoadPdiPass calls it once per blockwrite — the
+    // dominant cost of large multi-column with-PDI builds).
+    llvm::DenseSet<unsigned> takenIds;
     for (auto g : device.getOps<memref::GlobalOp>()) {
       StringRef suffix = g.getSymName();
       if (suffix.consume_front(blockwrite_prefix)) {
         unsigned idx;
-        if (!suffix.getAsInteger(10, idx) && idx >= id)
-          id = idx + 1;
+        if (!suffix.getAsInteger(10, idx))
+          takenIds.insert(idx);
       }
     }
+    unsigned id = 0;
     for (auto &op : operations) {
       if (op.cmd.Opcode != XAIE_IO_BLOCKWRITE) {
         global_data.push_back(nullptr);
@@ -680,7 +684,10 @@ static LogicalResult convertTransactionOpsToMLIR(
       const uint32_t *d = reinterpret_cast<const uint32_t *>(op.cmd.DataPtr);
       std::vector<uint32_t> data32(d, d + size);
 
-      // Unique by construction (counter seeded past any existing names above).
+      // First free slot at/above the running counter (matches the old
+      // generateUniqueSymbolName probe); amortized O(1) across the loop.
+      while (takenIds.contains(id))
+        ++id;
       std::string name = (blockwrite_prefix + llvm::Twine(id++)).str();
 
       MemRefType memrefType = MemRefType::get({size}, builder.getI32Type());
