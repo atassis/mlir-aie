@@ -38,6 +38,7 @@
 #include "mlir/Support/FileUtilities.h"
 #include "mlir/Support/ToolUtilities.h"
 
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/InitLLVM.h"
@@ -46,6 +47,7 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Process.h"
 #include "llvm/Support/Program.h"
+#include "llvm/Support/SHA256.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/raw_ostream.h"
@@ -2101,6 +2103,27 @@ static LogicalResult applyPeanoCompat(StringRef inputPath,
   return success();
 }
 
+// Toolchain-identity component of the per-core ELF cache key (below). Content
+// hashes the Peano binaries that turn the cached inputs into the linked .elf:
+// llc (.opt.ll -> .o) and clang/lld (link). opt is also stamped for symmetry,
+// though the .opt.ll content already captures its effect. The point is that a
+// Peano upgrade must invalidate a persistent NPU_CACHE_HOME cache rather than
+// serve stale bytes. Computed once per process (the install is fixed for an
+// aiecc run) and reused across all cores; the C++11 static-local guarantees a
+// thread-safe single initialization even under parallel core compilation.
+static StringRef getPeanoToolchainDigest(StringRef peanoOpt, StringRef peanoLlc,
+                                         StringRef peanoClang,
+                                         StringRef peanoLld) {
+  static const std::string digest = [&] {
+    llvm::SHA256 h;
+    for (StringRef tool : {peanoOpt, peanoLlc, peanoClang, peanoLld})
+      if (auto b = llvm::MemoryBuffer::getFile(tool))
+        h.update((*b)->getBuffer());
+    return llvm::toHex(h.final(), /*LowerCase=*/true);
+  }();
+  return digest;
+}
+
 static LogicalResult compileCore(MLIRContext &context, ModuleOp moduleOp,
                                  StringRef deviceName, const CoreInfo &core,
                                  StringRef tmpDirName, StringRef aieTarget,
@@ -2237,6 +2260,46 @@ static LogicalResult compileCore(MLIRContext &context, ModuleOp moduleOp,
       llvm::outs() << "Generated linker script: " << ldScriptPath << "\n";
     }
   }
+
+  // Compute the output ELF path early (it has no dependency on the compile
+  // step) so the per-core ELF cache in the Peano path below can address it
+  // before llc/link run.
+  // When elf_file is already set in the MLIR (e.g., elf_file =
+  // "custom_1_3.elf"), use that path as the output ELF. This matches the Python
+  // driver's behavior:
+  //   file_core_elf = elf_file if elf_file else corefile(...)
+  // The test flow compiles the core body to that path, then the test's RUN step
+  // overwrites it with the actual kernel. The aiesim artifacts reference this
+  // path, so they must point to the same file the test populates.
+  SmallString<128> elfPath;
+  if (!core.elfFile.empty()) {
+    elfPath = core.elfFile;
+  } else {
+    elfPath = tmpDirName;
+    sys::path::append(elfPath, deviceName.str() + "_core_" +
+                                   std::to_string(core.col) + "_" +
+                                   std::to_string(core.row) + ".elf");
+  }
+
+  // Make the ELF path absolute so CDO generation can find it
+  SmallString<256> absElfPath;
+  std::error_code elfPathEc = sys::fs::real_path(elfPath, absElfPath);
+  if (elfPathEc) {
+    // If real_path fails (file doesn't exist yet), make it absolute manually
+    if (sys::path::is_absolute(elfPath)) {
+      absElfPath = elfPath;
+    } else {
+      sys::fs::current_path(absElfPath);
+      sys::path::append(absElfPath, elfPath);
+      sys::path::remove_dots(absElfPath, /*remove_dot_dot=*/true);
+    }
+  }
+  elfPath = absElfPath;
+
+  // Set on a per-core ELF cache miss (opt-in via NPU_CACHE_HOME, Peano link
+  // path only): the freshly-linked .elf is stored here after linking. Empty
+  // means caching is off or not applicable for this core.
+  std::string coreCachePath;
 
   // Step 4: Compile LLVM IR to object file
   SmallString<128> objPath(tmpDirName);
@@ -2385,6 +2448,104 @@ static LogicalResult compileCore(MLIRContext &context, ModuleOp moduleOp,
       return failure();
     }
 
+    // Per-core ELF cache (opt-in via NPU_CACHE_HOME): the linked .elf is fully
+    // determined by its .opt.ll + linker script + external link objects +
+    // target + opt level + link flags + the Peano toolchain. Content-address it
+    // so a fixed-config rebuild copies the cached .elf and skips the dominant
+    // llc + link. Shares the NPU_CACHE_HOME store with the @iron.jit design
+    // cache; per-core .elf objects live under a dedicated core-elf/ subdir,
+    // which cannot collide with that cache's per-design <hash>/ directories.
+    // Gated to the Peano link path (!xbridge, and this branch is already
+    // !xchesscc); the Chess compile/link path is out of the key's model and is
+    // not cached.
+    if (link && !xbridge) {
+      if (const char *cacheHome = std::getenv("NPU_CACHE_HOME")) {
+        // Resolve the link-stage Peano binaries the same way the link step
+        // below does, so the toolchain digest reflects the actual tools.
+        std::string peanoClangForKey = findPeanoTool("clang");
+        SmallString<256> peanoLldForKey;
+        if (StringRef pd = getPeanoInstallDir(); !pd.empty()) {
+          peanoLldForKey = pd;
+          sys::path::append(peanoLldForKey, "bin", "ld.lld");
+        } else if (!peanoClangForKey.empty()) {
+          peanoLldForKey = sys::path::parent_path(peanoClangForKey);
+          sys::path::append(peanoLldForKey, "ld.lld");
+        }
+
+        llvm::SHA256 keyHasher;
+        auto hashFile = [&](StringRef p) {
+          if (auto b = llvm::MemoryBuffer::getFile(p))
+            keyHasher.update((*b)->getBuffer());
+        };
+        auto hashStr = [&](StringRef s) { keyHasher.update(s); };
+        // Everything that determines the linked .elf bytes goes into the key.
+        // optPath content captures the opt stage, including the safeOptLevel
+        // cap (opt is capped at O1 for Peano) which is distinct from the
+        // un-capped optLevelStr that llc and the linker use below.
+        hashFile(optPath);
+        hashFile(ldScriptPath);
+        hashStr(aieTarget);              // llc --march / clang --target
+        hashStr(StringRef(optLevelStr)); // llc/link -O (un-capped)
+        hashStr(linkAgainstHsa ? "hsa1" : "hsa0");
+        hashStr(StringRef(sysroot));
+        hashStr("peano"); // compile/link mode tag (Chess path is not cached)
+        hashStr(getPeanoToolchainDigest(peanoOpt, peanoLlc, peanoClangForKey,
+                                        peanoLldForKey));
+        // External link objects: resolve the SAME way the link loop below does
+        // (absolute -> CWD -> tmpDir -> input-dir), hash SOURCE content +
+        // INPUT() basename. At this point they are not yet copied into tmpDir.
+        for (const auto &lf : core.linkFiles) {
+          SmallString<256> src;
+          if (sys::path::is_absolute(lf))
+            src = lf;
+          else {
+            SmallString<256> cwd;
+            sys::fs::current_path(cwd);
+            sys::path::append(cwd, lf);
+            if (sys::fs::exists(cwd))
+              src = cwd;
+            else {
+              SmallString<256> t(tmpDirName);
+              sys::path::append(t, lf);
+              if (sys::fs::exists(t))
+                src = t;
+              else {
+                SmallString<256> in =
+                    sys::path::parent_path(getInputFilename());
+                if (in.empty())
+                  sys::fs::current_path(in);
+                src = in;
+                sys::path::append(src, lf);
+                sys::path::remove_dots(src, /*remove_dot_dot=*/true);
+              }
+            }
+          }
+          hashStr(sys::path::filename(lf));
+          hashFile(src);
+        }
+
+        std::string key = llvm::toHex(keyHasher.final(), /*LowerCase=*/true);
+        SmallString<256> cp(cacheHome);
+        sys::path::append(cp, "core-elf", key + ".elf");
+        coreCachePath = std::string(cp);
+        // Cache hit: copy the cached .elf into this core's output path and skip
+        // llc + link. The store side (after linking) uses an atomic temp+rename
+        // so a reader sees a complete file, never a torn one. The copy into the
+        // process-private elfPath is intentionally non-atomic (no shared
+        // reader). copy_file failing just falls through to a normal build.
+        if (sys::fs::exists(coreCachePath) &&
+            !sys::fs::copy_file(coreCachePath, elfPath)) {
+          if (verbose) {
+            std::lock_guard<std::mutex> lock(outputMutex);
+            llvm::outs() << "Core ELF cache hit: " << coreCachePath << " -> "
+                         << elfPath << "\n";
+          }
+          outElfPath = std::string(elfPath);
+          return success();
+        }
+      }
+    }
+
     // Run llc
     SmallVector<std::string, 10> llcCmd = {peanoLlc,
                                            std::string(optPath),
@@ -2407,38 +2568,6 @@ static LogicalResult compileCore(MLIRContext &context, ModuleOp moduleOp,
     outElfPath = std::string(objPath);
     return success();
   }
-
-  // When elf_file is already set in the MLIR (e.g., elf_file =
-  // "custom_1_3.elf"), use that path as the output ELF. This matches the Python
-  // driver's behavior:
-  //   file_core_elf = elf_file if elf_file else corefile(...)
-  // The test flow compiles the core body to that path, then the test's RUN step
-  // overwrites it with the actual kernel. The aiesim artifacts reference this
-  // path, so they must point to the same file the test populates.
-  SmallString<128> elfPath;
-  if (!core.elfFile.empty()) {
-    elfPath = core.elfFile;
-  } else {
-    elfPath = tmpDirName;
-    sys::path::append(elfPath, deviceName.str() + "_core_" +
-                                   std::to_string(core.col) + "_" +
-                                   std::to_string(core.row) + ".elf");
-  }
-
-  // Make the ELF path absolute so CDO generation can find it
-  SmallString<256> absElfPath;
-  std::error_code ec = sys::fs::real_path(elfPath, absElfPath);
-  if (ec) {
-    // If real_path fails (file doesn't exist yet), make it absolute manually
-    if (sys::path::is_absolute(elfPath)) {
-      absElfPath = elfPath;
-    } else {
-      sys::fs::current_path(absElfPath);
-      sys::path::append(absElfPath, elfPath);
-      sys::path::remove_dots(absElfPath, /*remove_dot_dot=*/true);
-    }
-  }
-  elfPath = absElfPath;
 
   if (xbridge) {
     // xbridge linking: generate BCF, extract link_with, link with
@@ -2711,6 +2840,17 @@ static LogicalResult compileCore(MLIRContext &context, ModuleOp moduleOp,
       llvm::errs() << "Error linking ELF file\n";
       return failure();
     }
+  }
+
+  // Store the freshly-linked .elf in the persistent per-core cache
+  // (best-effort). coreCachePath is non-empty only on a Peano-path cache miss.
+  // Atomic temp+rename so concurrent core workers / an overlapping build never
+  // observe a torn .elf.
+  if (!coreCachePath.empty()) {
+    SmallString<256> dir(coreCachePath);
+    sys::path::remove_filename(dir);
+    sys::fs::create_directories(dir);
+    (void)atomicCopyFile(elfPath, dir, sys::path::filename(coreCachePath));
   }
 
   outElfPath = std::string(elfPath);
