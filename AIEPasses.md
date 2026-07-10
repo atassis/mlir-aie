@@ -66,15 +66,15 @@ _Canonicalize Designs to include a toplevel device_
 
 This pass inserts a toplevel device operation in designs that do not have one.
 This allows us to support backwards compatability for older models targetting the VC1902
-device without explicit device operations. 
+device without explicit device operations.
 
 ### `-aie-create-pathfinder-flows`
 
 _Route aie.flow and aie.packetflow operations through switchboxes_
 
-Uses Pathfinder congestion-aware algorithm. 
+Uses Pathfinder congestion-aware algorithm.
 Each aie.flow is replaced with aie.connect operation.
-Each aie.packetflow is replace with the set of aie.amsel, aie.masterset 
+Each aie.packetflow is replace with the set of aie.amsel, aie.masterset
 and aie.packet_rules operations.
 
 #### Options
@@ -193,8 +193,8 @@ AIE.core(%tile) {
 
 _Lower aie.cascade_flow operations through `aie.configure_cascade` operations_
 
-Replace each aie.cascade_flow operation with an equivalent set of `aie.configure_cascade` 
-operations. 
+Replace each aie.cascade_flow operation with an equivalent set of `aie.configure_cascade`
+operations.
 
 ### `-aie-normalize-address-spaces`
 
@@ -210,24 +210,54 @@ space.
 
 _Instantiate the buffers and locks of aie.objectFifo.createObjectFifo operations_
 
-Replace each aie.objectFifo.createObjectFifo operation with aie.buffer and aie.lock operations in the 
+Replace each aie.objectFifo.createObjectFifo operation with aie.buffer and aie.lock operations in the
 producer tile. Convert aie.objectFifo.acquire, aie.objectFifo.release and aie.objectFifo.subviewAccess
 operations into useLock operations by keeping track of acquire/release operations on each objectFifo by
 each process.
 
-If the producer and consumer tiles of an aie.objectFifo.createObjectFifo operation are not adjacent, the 
+If the producer and consumer tiles of an aie.objectFifo.createObjectFifo operation are not adjacent, the
 pass also establised aie.flow and aie.dma operations to enable communication between the tiles.
 Extend the body of each loop that contains operations on objectFifos such that it is unrolled
-based on the number of elements in the objectFifos. If the number of iterations of the loop 
-cannot be divided pefectly by the unrolling factor, the pass duplicates the loop body after 
+based on the number of elements in the objectFifos. If the number of iterations of the loop
+cannot be divided pefectly by the unrolling factor, the pass duplicates the loop body after
 the original loop.
 
 #### Options
 
 ```
--dynamic-objFifos   : Flag to enable dynamic object fifo lowering in cores instead of loop unrolling.
+-dynamic-objFifos   : Use dynamic (loop-preserving) object fifo lowering in cores. When false, use static loop unrolling instead.
 -packet-sw-objFifos : Flag to enable aie.packetflow lowering from objectfifos.
 ```
+
+### `-aie-objectfifo-liveness`
+
+_Flag a specific under-buffered coupled-multicast objectFIFO class that hangs at runtime (not a general deadlock detector)._
+
+A coupled multicast (broadcast) objectFIFO whose consumers back-pressure the
+producer forms a dependency cycle. When the producer must re-acquire a slot
+on a later trip (replay, repeat_count >= 2) while the prior trip's tokens are
+still outstanding, the round-trip slack (2 * depth) can be smaller than the
+number of outstanding tokens demanded by the coupled fan-out
+(array_fan * trip_count). That is a static, structural deadlock: the IR
+compiles clean and then hangs the array at runtime.
+
+This pass builds the objectFIFO data + back-pressure dependency graph, finds
+cyclic strongly-connected components (Tarjan), and applies the validated SDF
+model PER coupled-multicast group (grouped by name base). Each group is
+scoped independently so an unrelated cycle elsewhere in the device cannot
+inflate its demand:
+
+  demand   = array_fan * T          (array_fan = the group's multicast
+                                      fan-out, summed across the SCCs it
+                                      spans; T = max repeat_count among the
+                                      fifos in those SCCs)
+  slack    = 2 * depth              (depth = min depth in the group)
+  DEADLOCK iff  T >= 2  AND  depth > 0  AND  demand > slack
+
+The T >= 2 replay guard avoids false positives on single-trip broadcasts.
+The analysis is sound for this static SDF class and conservative elsewhere
+(it never errors outside a proven cyclic under-buffered multicast); it does
+not claim to catch other deadlock classes.
 
 ### `-aie-place-tiles`
 
@@ -246,14 +276,6 @@ to one aie.tile.
 -merge-logical-tiles : When true (default), allow multiple non-core (ShimNOCTile / MemTile) aie.logical_tile ops to share one physical aie.tile if combined DMA channel demand fits. When false, each non-core aie.logical_tile is pinned to its own physical tile. CoreTile placement is unaffected.
 -sa-seed             : Random seed for SA placer (0 = non-deterministic).
 ```
-
-### `-aie-register-objectFifos`
-
-_Generate acquire/release patterns for producer/consumer processes registered to an objectFifo_
-
-Generate acquire/release patterns in the CoreOps of associated cores for each 
-aie.objectfifo.register_process operation. Patterns are generated as for loops
-of different sizes depending on input patterns.
 
 ### `-aie-standard-lowering`
 
@@ -313,13 +335,6 @@ specifications that can be further lowered to NPU register writes.
 Note: This pass only does semantic lowering. NPU write generation
 happens in aie-inline-trace-config (AIEX dialect).
 
-### `-aie-vector-opt`
-
-_Optimize vector instructions for AIE_
-
-After super-vectorization, some additional optimizations are important
-for improving QOR and enabling lowering to LLVM.
-
 ### `-aie-vector-to-pointer-loops`
 
 _Transform vector load/store loops to use ptr dialect for explicit pointer arithmetic_
@@ -355,7 +370,7 @@ _Lower vector.transfer_read/write to vector.load/store for AIE_
 This pass lowers vector.transfer_read operations to vector.load + vector.broadcast
 and vector.transfer_write operations to vector.store, when applicable.
 It's a wrapper for the upstream `populateVectorTransferLoweringPatterns`.
-TODO: Deprecate this pass once `populateVectorTransferLoweringPatterns` is included in 
+TODO: Deprecate this pass once `populateVectorTransferLoweringPatterns` is included in
 `convert-to-llvm`.
 
 #### Options
