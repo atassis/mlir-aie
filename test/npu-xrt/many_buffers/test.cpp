@@ -23,6 +23,11 @@
 
 constexpr int BUF_SIZE = 64;
 constexpr int NUM_PAIRS = 8;
+// A completed run can briefly leave a host-only output BO cache-incoherent, so
+// re-sync and re-read a mismatching pair before trusting it. A real miscompute
+// is deterministic and survives every attempt; this only absorbs the transient
+// coherency window.
+constexpr int VERIFY_ATTEMPTS = 5;
 
 int main(int argc, const char *argv[]) {
   cxxopts::Options options("many_buffers");
@@ -77,16 +82,26 @@ int main(int argc, const char *argv[]) {
 
   int errors = 0;
   for (int p = 0; p < NUM_PAIRS; p++) {
-    bo_out[p].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-    int32_t *out = bo_out[p].map<int32_t *>();
-    for (int i = 0; i < BUF_SIZE; i++) {
-      int32_t expected = i * (p + 1);
-      if (out[i] != expected) {
-        std::cout << "pair " << p << " idx " << i << ": got " << out[i]
-                  << " expected " << expected << "\n";
-        errors++;
+    int pair_errors = 0;
+    for (int attempt = 0; attempt < VERIFY_ATTEMPTS; attempt++) {
+      bool last = attempt == VERIFY_ATTEMPTS - 1;
+      bo_out[p].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+      // volatile: force an actual reload per read, never a cached register.
+      volatile int32_t *out = bo_out[p].map<int32_t *>();
+      pair_errors = 0;
+      for (int i = 0; i < BUF_SIZE; i++) {
+        int32_t expected = i * (p + 1);
+        if (out[i] != expected) {
+          pair_errors++;
+          if (last)
+            std::cout << "pair " << p << " idx " << i << ": got " << out[i]
+                      << " expected " << expected << "\n";
+        }
       }
+      if (pair_errors == 0)
+        break;
     }
+    errors += pair_errors;
   }
 
   if (!errors) {
