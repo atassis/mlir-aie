@@ -11,9 +11,21 @@ import sys
 import time
 
 # Retry configuration
-TRANSIENT_FAILURE_TEXT = "No such device"
+#
+# Signatures of transient, non-deterministic device/driver failures that are
+# safe to retry. These are infrastructure errors (device not enumerated yet, a
+# transient kernel-submit IOCTL error), never a test-logic mismatch: a real
+# regression fails deterministically and is returned on the first attempt.
+TRANSIENT_FAILURE_TEXTS = (
+    "No such device",
+    "DRM_IOCTL_AMDXDNA_EXEC_CMD IOCTL failed (err=-5): Input/output error",
+)
 MAX_ATTEMPTS = 3
 TAIL_LINES = 200
+
+
+def is_transient_failure(output: str) -> bool:
+    return any(text in output for text in TRANSIENT_FAILURE_TEXTS)
 
 
 # Logging and diagnostics helpers
@@ -139,7 +151,7 @@ def main() -> int:
         returncode, recent_output = run_command(launched_command)
         if returncode == 0:
             return 0
-        if TRANSIENT_FAILURE_TEXT not in recent_output:
+        if not is_transient_failure(recent_output):
             return returncode
         emit_failure_diagnostics(xrt_dir, attempt)
         if attempt == MAX_ATTEMPTS:
