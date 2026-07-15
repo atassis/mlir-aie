@@ -350,10 +350,14 @@ endif()
 
 
 # Last because each of these has its own CMakeLists.txt which reloads/re-finds LLVM, thus resettings globals.
-add_subdirectory(programming_examples)
-add_subdirectory(programming_guide)
-add_subdirectory(test)
-add_subdirectory(mlir_exercises)
+option(AIE_INCLUDE_TESTS_AND_EXAMPLES
+       "Build the test/example/tutorial subdirectories (need Python bindings)" ON)
+if(AIE_INCLUDE_TESTS_AND_EXAMPLES)
+  add_subdirectory(programming_examples)
+  add_subdirectory(programming_guide)
+  add_subdirectory(test)
+  add_subdirectory(mlir_exercises)
+endif()
 add_subdirectory(cmake/modules)
 
 get_filename_component(COMPILER_DIRECTORY ${CMAKE_CXX_COMPILER} DIRECTORY)
