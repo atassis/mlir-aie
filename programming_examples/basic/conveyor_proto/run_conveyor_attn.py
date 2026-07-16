@@ -13,13 +13,28 @@ N_QT = int(os.environ.get("ATTN_NQT", 16))
 SCALE = float(os.environ.get("ATTN_SCALE", 1.0 / (DK ** 0.5)))
 NQ = N_QT * TQ
 
+RELPOS = os.environ.get("ATTN_RELPOS", "0") == "1"
+P = 2 * T - 1
 rng = np.random.default_rng(0)
 q = rng.standard_normal((NQ, DK)).astype(bfloat16)
 k = rng.standard_normal((T, DK)).astype(bfloat16)
 v = rng.standard_normal((T, DK)).astype(bfloat16)
-ac = SCALE * (q.astype(np.float32) @ k.astype(np.float32).T)
-ac -= ac.max(axis=1, keepdims=True)
-e = np.exp(ac); probs = e / e.sum(axis=1, keepdims=True)
+if RELPOS:
+    # fused relpos scores: scores[i,j] = (q.k^T + rel_shift(q.p^T))[i,j] * SCALE ; rel_shift
+    # BD_shifted[i,j] = BD[i, (T-1-i)+j], BD = q.p^T [NQ,P]. row_off=0 (N_QT=1 validation).
+    p = rng.standard_normal((P, DK)).astype(bfloat16)
+    ac_raw = q.astype(np.float32) @ k.astype(np.float32).T          # [NQ,T]
+    BD = q.astype(np.float32) @ p.astype(np.float32).T              # [NQ,P]
+    scores = np.empty((NQ, T), np.float32)
+    for i in range(NQ):
+        base = (T - 1 - i) if i < T else 0
+        scores[i] = (ac_raw[i] + BD[i, base:base + T]) * SCALE
+    kpack = np.concatenate([k, p], axis=0)                          # [(T+P),DK] resident kp
+else:
+    scores = SCALE * (q.astype(np.float32) @ k.astype(np.float32).T)
+    kpack = k
+sc = scores - scores.max(axis=1, keepdims=True)
+e = np.exp(sc); probs = e / e.sum(axis=1, keepdims=True)
 ctx_ref = probs @ v.astype(np.float32)
 
 instr = np.fromfile(f"{EX}/{which}.insts", dtype=np.uint32)
@@ -31,7 +46,7 @@ kern = pyxrt.kernel(hw, kname)
 TO = pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE
 FROM = pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE
 
-qb = q.reshape(-1).view(np.uint16); kb = k.reshape(-1).view(np.uint16); vb = v.reshape(-1).view(np.uint16)
+qb = q.reshape(-1).view(np.uint16); kb = kpack.reshape(-1).view(np.uint16); vb = v.reshape(-1).view(np.uint16)
 bo_instr = pyxrt.bo(d, instr.nbytes, pyxrt.bo.cacheable, kern.group_id(1))
 bo_q = pyxrt.bo(d, qb.nbytes, pyxrt.bo.host_only, kern.group_id(3))
 bo_k = pyxrt.bo(d, kb.nbytes, pyxrt.bo.host_only, kern.group_id(4))
