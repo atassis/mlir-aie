@@ -44,10 +44,19 @@ def gen_head(seed):
     return q_belt.reshape(-1), k.reshape(-1), v.reshape(-1), ctx
 
 
+GJ = 4                                       # heads per MemTile group (must match the generator)
+QELEM = TQ * DK + (TQ * T if RELPOS else 0)
 heads = [gen_head(h) for h in range(H)]
-q_belt = np.concatenate([hd[0] for hd in heads])          # [H * QT] bf16
-kpack = np.concatenate([hd[1] for hd in heads])           # [H * KT] bf16
-v_all = np.concatenate([hd[2] for hd in heads])           # [H * VT] bf16
+# q: GROUP-MAJOR, step-interleaved per group [N_QT, gsz, QELEM] (the input split expects one
+# [gsz*QELEM] object per step). k/v: head-major (groups are contiguous head ranges). ctx_ref: per-head.
+_qh = [hd[0].reshape(N_QT, QELEM) for hd in heads]
+_qparts = []
+for _g in range(0, H, GJ):
+    _gsz = min(GJ, H - _g)
+    _qparts.append(np.stack([_qh[_g + i] for i in range(_gsz)], axis=1).reshape(-1))  # [N_QT,gsz,QELEM]
+q_belt = np.concatenate(_qparts)
+kpack = np.concatenate([hd[1] for hd in heads])           # [H * T*DK] bf16 head-major
+v_all = np.concatenate([hd[2] for hd in heads])           # [H * T*DK] bf16 head-major
 ctx_ref = np.concatenate([hd[3] for hd in heads], axis=0)  # [H*NQ, DK] f32
 
 instr = np.fromfile(f"{EX}/{which}.insts", dtype=np.uint32)
