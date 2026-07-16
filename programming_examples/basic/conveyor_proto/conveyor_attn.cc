@@ -352,6 +352,26 @@ extern "C" void bd_stream_block(const bfloat16 *__restrict qv, const bfloat16 *_
                                 int32_t pb, int32_t j0) {
   event0(); bd_dot_block(qv, pblk, (int)pb, (int)j0); event1();
 }
+
+// STREAMING bakes (zero-scalar-arg) for the p-block conveyor at real T (p=88 KB > L1 -> streamed in
+// BD_KB-row blocks). Two static counters advance without a scalar arg: j0 (p-block offset, wraps at P,
+// BD_KB blocks/tile) and q0 (query-tile row base, wraps at TQ*N_QT). Requires ATTN_P % BD_KB == 0 (real
+// dims 351 = 9*39). bd_block_bake accumulates one p-block into g_bd; bd_emit_bake rel_shifts + emits.
+extern "C" void bd_block_bake(const bfloat16 *__restrict qpv, const bfloat16 *__restrict pblk) {
+  static int j0 = 0;
+  const bfloat16 *qv = qpv + ATTN_TQ * ATTN_DK;       // qpv = q_pass[TQ,DK] || qv[TQ,DK]
+  int pb = (ATTN_P - j0 < BD_KB) ? (ATTN_P - j0) : BD_KB;
+  bd_dot_block(qv, pblk, pb, j0);
+  j0 += BD_KB; if (j0 >= ATTN_P) j0 = 0;              // wrap per query tile (BD_KB blocks each)
+}
+extern "C" void bd_emit_bake(const bfloat16 *__restrict qpv, bfloat16 *__restrict out) {
+  static int q0 = 0;
+  for (int i = 0; i < ATTN_TQ * ATTN_DK; i++) out[i] = qpv[i]; // forward q_pass into the belt head
+  bfloat16 *bd_hi = out + ATTN_TQ * ATTN_DK;
+  bfloat16 *bd_lo = bd_hi + (BD_SPLIT ? ATTN_TQ * ATTN_T : 0);
+  bd_relshift_emit(q0, bd_hi, bd_lo);                  // rel_shift + split emit
+  q0 += ATTN_TQ; if (q0 >= ATTN_TQ * ATTN_NQT) q0 = 0; // wrap per dispatch
+}
 extern "C" void bd_stream_emit(const bfloat16 *__restrict q_pass, bfloat16 *__restrict out, int32_t q0) {
   constexpr int TQ = ATTN_TQ, DK = ATTN_DK, T = ATTN_T;
   event0();
