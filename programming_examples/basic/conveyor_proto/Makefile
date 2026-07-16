@@ -36,7 +36,7 @@ endif
 build/kernels.a: ${kernel_obj}
 	ar rvs $@ $+
 
-GEN_EXTRA = $(if $(filter 1,$(MONO)),--mono,) $(if $(TRIVIAL),--trivial $(TRIVIAL),)
+GEN_EXTRA = $(if $(filter 1,$(MONO)),--mono,) $(if $(TRIVIAL),--trivial $(TRIVIAL),) $(if $(filter 1,$(RELPOS)),--relpos,)
 
 build/${targetname}.mlir: ${srcdir}/${aie_py_src}
 	mkdir -p ${@D}
