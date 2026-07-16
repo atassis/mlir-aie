@@ -110,6 +110,37 @@ extern "C" void stage_scores_relpos(const bfloat16 *__restrict q,
   event1();
 }
 
+// STAGE A (RELPOS, REAL-DIMS) -- host-precomputed rel_shifted BD packed in the query belt.
+// On-chip BD needs p[P,DK] resident = 88 KB at real dims (blows L1), so instead the host computes
+// BD = q.p^T THEN rel_shift -> BD_shifted[TQ,T] bf16, packed AFTER q in ONE belt object. Stage A stays
+// at 2 inputs (qbd belt + k resident, 44 KB) and holds NO p / NO bd scratch. rel_shift being host-side
+// means there is NO row_off (global-row) dependence -> N_QT>1 needs no tile-offset wiring.
+//   qbd    : [TQ*DK + TQ*T] bf16   q[TQ,DK] then BD_shifted[TQ,T]
+//   k      : [T*DK] bf16 resident
+//   scores : [TQ,T] f32 = (q.k^T + BD_shifted) * inv_scale
+extern "C" void stage_scores_relpos_bd(const bfloat16 *__restrict qbd,
+                                       const bfloat16 *__restrict k, float *__restrict scores) {
+  constexpr int TQ = ATTN_TQ, T = ATTN_T, DK = ATTN_DK;
+  constexpr float inv_scale = ATTN_SCALE;
+  const bfloat16 *q = qbd;
+  const bfloat16 *bdsh = qbd + TQ * DK;   // BD_shifted[TQ,T] packed after q
+  event0();
+  for (int li = 0; li < TQ; li++) {
+    const bfloat16 *qr = q + li * DK;
+    const bfloat16 *bdr = bdsh + li * T;
+    float *sc = scores + li * T;
+    for (int j = 0; j < T; j++) {
+      const bfloat16 *kr = k + j * DK;
+      aie::accum<accfloat, VL> acc = aie::zeros<accfloat, VL>();
+      for (int d = 0; d < DK; d += VL)
+        acc = aie::mac(acc, aie::load_v<VL>(qr + d), aie::load_v<VL>(kr + d));
+      const float ac = aie::reduce_add(acc.to_vector<float>());
+      sc[j] = (ac + (float)bdr[j]) * inv_scale;
+    }
+  }
+  event1();
+}
+
 // Zero-scalar-arg bake wrapper (IRON kernels avoid scalar args -> bake constants). N_QT=1 validation:
 // row_off = 0 (the single query tile is rows [0,TQ)). N_QT>1 needs an advancing row_off (tile-offset
 // wiring, a follow-up) -- do NOT use this bake for N_QT>1.
