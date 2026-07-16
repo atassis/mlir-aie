@@ -118,16 +118,23 @@ extern "C" void stage_scores_relpos(const bfloat16 *__restrict q,
 //   qbd    : [TQ*DK + TQ*T] bf16   q[TQ,DK] then BD_shifted[TQ,T]
 //   k      : [T*DK] bf16 resident
 //   scores : [TQ,T] f32 = (q.k^T + BD_shifted) * inv_scale
+// BD carriage in the belt tail: hi-only (plain bf16, BD_SPLIT=0, byte-identical to the host BD-in-belt
+// conveyor) or split-bf16 hi+lo (BD_SPLIT=1) reconstructing ~f32 for the on-chip-BD 4th-stage precision.
+#ifndef BD_SPLIT
+#define BD_SPLIT 0
+#endif
 extern "C" void stage_scores_relpos_bd(const bfloat16 *__restrict qbd,
                                        const bfloat16 *__restrict k, float *__restrict scores) {
   constexpr int TQ = ATTN_TQ, T = ATTN_T, DK = ATTN_DK;
   constexpr float inv_scale = ATTN_SCALE;
   const bfloat16 *q = qbd;
-  const bfloat16 *bdsh = qbd + TQ * DK;   // BD_shifted[TQ,T] packed after q
+  const bfloat16 *bdhi = qbd + TQ * DK;                 // BD_hi[TQ,T] packed after q
+  const bfloat16 *bdlo = bdhi + (BD_SPLIT ? TQ * T : 0); // BD_lo[TQ,T] only when split
   event0();
   for (int li = 0; li < TQ; li++) {
     const bfloat16 *qr = q + li * DK;
-    const bfloat16 *bdr = bdsh + li * T;
+    const bfloat16 *hir = bdhi + li * T;
+    const bfloat16 *lor = bdlo + li * T;
     float *sc = scores + li * T;
     for (int j = 0; j < T; j++) {
       const bfloat16 *kr = k + j * DK;
@@ -135,7 +142,11 @@ extern "C" void stage_scores_relpos_bd(const bfloat16 *__restrict qbd,
       for (int d = 0; d < DK; d += VL)
         acc = aie::mac(acc, aie::load_v<VL>(qr + d), aie::load_v<VL>(kr + d));
       const float ac = aie::reduce_add(acc.to_vector<float>());
-      sc[j] = (ac + (float)bdr[j]) * inv_scale;
+      float bd = (float)hir[j];
+#if BD_SPLIT
+      bd += (float)lor[j];                              // reconstruct ~f32 (hi + lo residual)
+#endif
+      sc[j] = (ac + bd) * inv_scale;
     }
   }
   event1();
@@ -282,5 +293,84 @@ extern "C" void stage_softmax(const float *__restrict ac, bfloat16 *__restrict p
       aie::store_v(pr + j, aie::mul(e, inv_v).to_vector<bfloat16>());
     }
   }
+  event1();
+}
+
+// ==================== STAGE BD -- 4th conveyor stage (on-chip BD) ====================
+// On-chip BD = rel_shift((q+pos_bias_v) @ p^T), carried to the scores stage as SPLIT-BF16 in the belt
+// tail. Compute is bit-equivalent to relpos_mha.cc (bf16*bf16 -> f32 accfloat, g_bd f32); the split is a
+// TRANSPORT device to cross the bf16 belt within the scores tile's 2-input budget. p=[P,DK] ~88 KB is
+// L2-resident (MemTile) + streamed in BD_KB-row blocks. Spec: bd-onchip-4th-stage. Placed by the
+// generator's --relpos-bd-onchip path; INERT in the current 3-stage build (no caller). g_bd is `static`
+// resident scratch -- valid for the mono-style H=1 gate (single BD worker, like stage_mono's statics);
+// the pipelined/streaming generator must allocate it as a resident Buffer to avoid the belt-alias hazard.
+#ifndef BD_KB
+#define BD_KB 39   // p key-block rows (P=2T-1=351 = 9*39, no ragged tail at real dims)
+#endif
+
+alignas(32) static float g_bd[ATTN_TQ * ATTN_P]; // resident per-query-tile f32 score scratch (~11 KB)
+
+// COLUMN-SLICE dot: g_bd[il, j0+jj] = dot(qv[il,:], pblk[jj,:]). bf16*bf16 -> f32 accfloat (= relpos_mha.cc).
+static inline void bd_dot_block(const bfloat16 *__restrict qv, const bfloat16 *__restrict pblk, int pb, int j0) {
+  constexpr int TQ = ATTN_TQ, DK = ATTN_DK, P = ATTN_P;
+  for (int il = 0; il < TQ; il++) {
+    const bfloat16 *qr = qv + il * DK;
+    float *o = g_bd + il * P + j0;
+    for (int jj = 0; jj < pb; jj++) {
+      const bfloat16 *pr = pblk + jj * DK;
+      aie::accum<accfloat, VL> acc = aie::zeros<accfloat, VL>();
+      for (int d = 0; d < DK; d += VL)
+        acc = aie::mac(acc, aie::load_v<VL>(qr + d), aie::load_v<VL>(pr + d));
+      o[jj] = aie::reduce_add(acc.to_vector<float>());
+    }
+  }
+}
+
+// rel_shift + f32->split-bf16 emit. The window base (T-1)-(q0+il) is ~never VL-aligned; a vectorized
+// aie::load_v there truncates to the 128b boundary (silent garbage, data-masked -- see the unaligned-load
+// kb note). We emit SCALAR: `win[j]` is byte-addressed so it is inherently correct at any offset, and the
+// emit (TQ*T ops) is trivial vs the dot (TQ*P*DK MACs). Avoids the alignment hazard by construction.
+static inline void bd_relshift_emit(int q0, bfloat16 *__restrict bd_hi, bfloat16 *__restrict bd_lo) {
+  constexpr int TQ = ATTN_TQ, T = ATTN_T, P = ATTN_P;
+  for (int il = 0; il < TQ; il++) {
+    const int base = (T - 1) - (q0 + il);           // >= 0 for real rows (q0+il < T)
+    const float *win = g_bd + il * P + base;
+    bfloat16 *hr = bd_hi + il * T;
+    for (int j = 0; j < T; j++) {
+      float x = win[j];
+      bfloat16 hi = (bfloat16)x;
+      hr[j] = hi;
+#if BD_SPLIT
+      bd_lo[il * T + j] = (bfloat16)(x - (float)hi); // lo residual ~= 8 extra mantissa bits
+#endif
+    }
+  }
+}
+
+// STREAMING bricks for the generator Worker loop (int32 scalar ABI). g_bd is the resident scratch.
+extern "C" void bd_stream_block(const bfloat16 *__restrict qv, const bfloat16 *__restrict pblk,
+                                int32_t pb, int32_t j0) {
+  event0(); bd_dot_block(qv, pblk, (int)pb, (int)j0); event1();
+}
+extern "C" void bd_stream_emit(const bfloat16 *__restrict q_pass, bfloat16 *__restrict out, int32_t q0) {
+  constexpr int TQ = ATTN_TQ, DK = ATTN_DK, T = ATTN_T;
+  event0();
+  for (int i = 0; i < TQ * DK; i++) out[i] = q_pass[i];
+  bfloat16 *bd_hi = out + TQ * DK;
+  bfloat16 *bd_lo = bd_hi + (BD_SPLIT ? TQ * T : 0);
+  bd_relshift_emit((int)q0, bd_hi, bd_lo);
+  event1();
+}
+
+// MONOLITH bake (H=1 arithmetic gate, p kpv-resident full): dot p in-block, then rel_shift+split emit.
+extern "C" void stage_bd(const bfloat16 *__restrict qv, const bfloat16 *__restrict q_pass,
+                         const bfloat16 *__restrict p_resident, bfloat16 *__restrict out, int32_t q0) {
+  constexpr int P = ATTN_P, DK = ATTN_DK;
+  event0();
+  for (int j0 = 0; j0 < P; j0 += BD_KB) {
+    int pb = (P - j0 < BD_KB) ? (P - j0) : BD_KB;
+    bd_dot_block(qv, p_resident + j0 * DK, pb, j0);
+  }
+  bd_stream_emit(q_pass, out, q0);
   event1();
 }
