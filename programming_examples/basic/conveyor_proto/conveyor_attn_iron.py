@@ -31,7 +31,9 @@ N_HEADS = int(os.environ.get("ATTN_HEADS", 1))  # data-parallel heads, one 3-til
 P = 2 * T - 1  # relative-position length (NeMo/Parakeet rel-pos)
 
 
-def build(dev, mono=False, TRIVIAL=False, relpos=False):
+def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False):
+    if bd_onchip:
+        relpos = True   # BD-on-chip reuses the relpos scores kernel (q||BD belt -> stage_scores_relpos_bd)
     q_ty = np.ndarray[(TQ * DK,), np.dtype[bfloat16]]      # one query tile (fifo object)
     # relpos (real-dims): query belt carries q[TQ,DK] then host-precomputed rel_shifted BD_shifted[TQ,T],
     # both bf16, in one object -> stage A does AC on-chip + adds BD_shifted (no p resident, no row_off).
@@ -90,6 +92,67 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False):
             rt.start(w)
             rt.fill(of_q.prod(), Q, tap=q_tap)
             rt.fill(of_kv.prod(), KV, tap=kv_replay)
+            rt.drain(of_ctx.cons(), CTX, tap=ctx_tap, wait=True)
+    elif bd_onchip:
+        # BD-ON-CHIP 4-stage column (H=1 arithmetic gate): BD -> scores -> softmax -> ctx.
+        # BD tile: g_bd = qv @ p^T (f32 accfloat) then rel_shift(q0=0)+split -> q_pass||BD_hi belt.
+        # 2-input budget per tile respected: BD gets {qpv streamed, p resident}; scores gets {q||BD belt,
+        # k resident}. N_QT=1 bakes q0=0 (stage_bd_bake); N_QT>1 needs an advancing q0 (the follow-up).
+        qpv_ty = np.ndarray[(2 * TQ * DK,), np.dtype[bfloat16]]   # q_pass[TQ,DK] || qv[TQ,DK]
+        p_ty = np.ndarray[(P * DK,), np.dtype[bfloat16]]          # resident p (fits L1 at the gate T)
+        bd_k = Kernel("stage_bd_bake", "kernels.a", [qpv_ty, p_ty, qbd_ty])
+        of_qpv = ObjectFifo(qpv_ty, name="qpv", depth=2)
+        of_p = ObjectFifo(p_ty, name="p", depth=1)
+        of_bd = ObjectFifo(qbd_ty, name="bd", depth=1)           # BD -> scores belt (q||BD_hi)
+        of_k = ObjectFifo(k_ty, name="k", depth=1)
+        of_v = ObjectFifo(v_ty, name="v", depth=1)
+        of_ac = ObjectFifo(ac_ty, name="ac", depth=2)
+        of_pr = ObjectFifo(probs_ty, name="probs", depth=2)
+
+        def stage_bd_w(f_qpv, f_p, f_bd, k_bd):
+            ep = f_p.acquire(1)                     # p resident (acquire-once)
+            for _ in range_(N_QT):
+                eqpv = f_qpv.acquire(1); ebd = f_bd.acquire(1)
+                k_bd(eqpv, ep, ebd)
+                f_qpv.release(1); f_bd.release(1)
+            f_p.release(1)
+
+        def bd_stage_a(f_bd, f_k, f_ac, k_sc):
+            ek = f_k.acquire(1)                     # k resident (acquire-once)
+            for _ in range_(N_QT):
+                ebd = f_bd.acquire(1); eac = f_ac.acquire(1)
+                k_sc(ebd, ek, eac)
+                f_bd.release(1); f_ac.release(1)
+            f_k.release(1)
+
+        def bd_stage_b(f_ac, f_probs, k_sm):
+            for _ in range_(N_QT):
+                eac = f_ac.acquire(1); ep2 = f_probs.acquire(1)
+                k_sm(eac, ep2)
+                f_ac.release(1); f_probs.release(1)
+
+        def bd_stage_c(f_probs, f_v, f_ctx, k_cx):
+            ev = f_v.acquire(1)                     # v resident (acquire-once)
+            for _ in range_(N_QT):
+                ep2 = f_probs.acquire(1); ec = f_ctx.acquire(1)
+                k_cx(ep2, ev, ec)
+                f_probs.release(1); f_ctx.release(1)
+            f_v.release(1)
+
+        w_bd = Worker(stage_bd_w, [of_qpv.cons(), of_p.cons(), of_bd.prod(), bd_k], stack_size=0x1000)
+        w_a = Worker(bd_stage_a, [of_bd.cons(), of_k.cons(), of_ac.prod(), scores])
+        w_b = Worker(bd_stage_b, [of_ac.cons(), of_pr.prod(), softmax], stack_size=0x1000)
+        w_c = Worker(bd_stage_c, [of_pr.cons(), of_v.cons(), of_ctx.prod(), ctx_k])
+
+        qpv_full_ty = np.ndarray[(N_QT * 2 * TQ * DK,), np.dtype[bfloat16]]
+        qpv_tap = TensorAccessPattern([N_QT * 2 * TQ * DK], 0, [N_QT, 1, 1, 2 * TQ * DK], [2 * TQ * DK, 0, 0, 1])
+        p_replay = TensorAccessPattern([P * DK], 0, [N_QT, 1, P, DK], [0, 0, DK, 1])
+        with rt.sequence(qpv_full_ty, p_ty, k_ty, v_ty, ctx_full_ty) as (QPV, PP, K, V, CTX):
+            rt.start(w_bd, w_a, w_b, w_c)
+            rt.fill(of_qpv.prod(), QPV, tap=qpv_tap)
+            rt.fill(of_p.prod(), PP, tap=p_replay)
+            rt.fill(of_k.prod(), K, tap=replay_tap)
+            rt.fill(of_v.prod(), V, tap=replay_tap)
             rt.drain(of_ctx.cons(), CTX, tap=ctx_tap, wait=True)
     else:
         # k, V are read-only weights. At real dims (T*DK bf16 = 44 KB) a depth-2 weight fifo blows the
@@ -190,6 +253,8 @@ ap.add_argument("-d", "--dev", required=True, dest="device")
 ap.add_argument("--mono", action="store_true", help="single-tile baseline (all 3 stages on 1 tile)")
 ap.add_argument("--trivial", type=int, default=0, help="0=real; 1=all trivial; 2=softmax trivial; 3=scores trivial")
 ap.add_argument("--relpos", action="store_true", help="fused relpos scores stage (on-chip AC+BD+rel_shift)")
+ap.add_argument("--relpos-bd-onchip", dest="bd_onchip", action="store_true",
+                help="BD on-chip as a 4th stage (BD->scores->softmax->ctx); H=1 N_QT=1 arithmetic gate")
 opts = ap.parse_args(sys.argv[1:])
 dev = NPU2() if opts.device == "npu2" else NPU1()
-print(build(dev, mono=opts.mono, TRIVIAL=opts.trivial, relpos=opts.relpos))
+print(build(dev, mono=opts.mono, TRIVIAL=opts.trivial, relpos=opts.relpos, bd_onchip=opts.bd_onchip))
