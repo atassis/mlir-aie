@@ -75,7 +75,17 @@ def once():
 
 once()
 bo_c.sync(FROM)
-dev_ctx = np.frombuffer(bo_c.read(H * NQ * DK * 2, 0), dtype=np.uint16).view(bfloat16).astype(np.float32).reshape(H * NQ, DK)
+# joined ctx: heads grouped by GJ into MemTiles; each group drains contiguously as [N_QT, gsz, TQ, DK].
+# de-interleave per group (H<->N_QT) then concat -> per-head [H*NQ, DK]. (GJ must match the generator.)
+GJ = 4
+_dev_raw = np.frombuffer(bo_c.read(H * NQ * DK * 2, 0), dtype=np.uint16).view(bfloat16).astype(np.float32)
+_parts, _off = [], 0
+for _g in range(0, H, GJ):
+    _gsz = min(GJ, H - _g)
+    _n = N_QT * _gsz * TQ * DK
+    _parts.append(_dev_raw[_off:_off + _n].reshape(N_QT, _gsz, TQ, DK).transpose(1, 0, 2, 3).reshape(_gsz * NQ, DK))
+    _off += _n
+dev_ctx = np.concatenate(_parts, axis=0)   # [H*NQ, DK]
 rel = np.linalg.norm(dev_ctx - ctx_ref) / np.linalg.norm(ctx_ref)
 ph = [np.linalg.norm(dev_ctx[h*NQ:(h+1)*NQ]-ctx_ref[h*NQ:(h+1)*NQ])/max(np.linalg.norm(ctx_ref[h*NQ:(h+1)*NQ]),1e-9) for h in range(H)]
 print(f"  per-head rel-err ({H} heads):", " ".join(f"{x:.3f}" for x in ph))
