@@ -27,9 +27,13 @@ DK = int(os.environ.get("ATTN_DK", 64))
 N_QT = int(os.environ.get("ATTN_NQT", 16))  # query tiles streamed through the pipeline
 
 
-def build(dev, mono=False, TRIVIAL=False):
+P = 2 * T - 1  # relative-position length (NeMo/Parakeet rel-pos)
+
+
+def build(dev, mono=False, TRIVIAL=False, relpos=False):
     q_ty = np.ndarray[(TQ * DK,), np.dtype[bfloat16]]      # one query tile (fifo object)
     k_ty = np.ndarray[(T * DK,), np.dtype[bfloat16]]
+    kp_ty = np.ndarray[((T + P) * DK,), np.dtype[bfloat16]]  # relpos: k[T,DK] then p[P,DK] packed resident
     v_ty = np.ndarray[(T * DK,), np.dtype[bfloat16]]
     ac_ty = np.ndarray[(TQ * T,), np.dtype[np.float32]]
     probs_ty = np.ndarray[(TQ * T,), np.dtype[bfloat16]]
@@ -45,7 +49,9 @@ def build(dev, mono=False, TRIVIAL=False):
     sc_sfx = "_t" if TRIVIAL in (1, 3) else ""
     sm_sfx = "_t" if TRIVIAL in (1, 2) else ""
     cx_sfx = "_t" if TRIVIAL == 1 else ""
-    scores = Kernel("stage_scores" + sc_sfx, "kernels.a", [q_ty, k_ty, ac_ty])
+    wt_ty = kp_ty if relpos else k_ty     # stage A resident weight: packed kp (relpos) or k (plain)
+    scores = (Kernel("stage_scores_relpos_bake", "kernels.a", [q_ty, kp_ty, ac_ty]) if relpos
+              else Kernel("stage_scores" + sc_sfx, "kernels.a", [q_ty, k_ty, ac_ty]))
     softmax = Kernel("stage_softmax" + sm_sfx, "kernels.a", [ac_ty, probs_ty])
     ctx_k = Kernel("stage_ctx" + cx_sfx, "kernels.a", [probs_ty, v_ty, ctx_ty])
 
@@ -82,7 +88,7 @@ def build(dev, mono=False, TRIVIAL=False):
         # 64 KB L1, so depth-1. Structure = the validated per-tile-acquire + stride-0 replay tap (the
         # tiny-dims proven path), only single-buffered. (True acquire-once residency deadlocked at
         # depth-1 -- deferred; this re-streams weights on-chip but is the fair, known-good dataflow.)
-        of_k = ObjectFifo(k_ty, name="k", depth=1)
+        of_k = ObjectFifo(wt_ty, name="k", depth=1)   # relpos: kp (k+p packed); plain: k
         of_v = ObjectFifo(v_ty, name="v", depth=1)
         of_ac = ObjectFifo(ac_ty, name="ac", depth=2)       # A->B belt
         of_probs = ObjectFifo(probs_ty, name="probs", depth=2)  # B->C belt
@@ -108,13 +114,17 @@ def build(dev, mono=False, TRIVIAL=False):
         # stage_b (softmax) holds `float srow[T]` on the AIE stack; default stack is 1 KB, so at real
         # T (srow[176]=704 B + call frames) it OVERFLOWS -> silent device hang. Bump only stage_b's
         # stack (its tile has small belts = ample L1). Stages A/C have no T-sized stack array.
-        wl = [Worker(stage_a, [of_q.cons(), of_k.cons(), of_ac.prod(), scores]),
+        # relpos stage A holds bd[P] f32 (~1.4 KB) on the stack -> bump its stack_size too.
+        wl = [Worker(stage_a, [of_q.cons(), of_k.cons(), of_ac.prod(), scores],
+                     stack_size=0x1000 if relpos else 0x400),
               Worker(stage_b, [of_ac.cons(), of_probs.prod(), softmax], stack_size=0x1000),
               Worker(stage_c, [of_probs.cons(), of_v.cons(), of_ctx.prod(), ctx_k])]
-        with rt.sequence(q_full_ty, k_ty, v_ty, ctx_full_ty) as (Q, K, V, CTX):
+        wt_replay = (TensorAccessPattern([(T + P) * DK], 0, [N_QT, 1, T + P, DK], [0, 0, DK, 1])
+                     if relpos else replay_tap)
+        with rt.sequence(q_full_ty, wt_ty, v_ty, ctx_full_ty) as (Q, K, V, CTX):
             rt.start(*wl)
             rt.fill(of_q.prod(), Q, tap=q_tap)
-            rt.fill(of_k.prod(), K, tap=replay_tap)
+            rt.fill(of_k.prod(), K, tap=wt_replay)
             rt.fill(of_v.prod(), V, tap=replay_tap)
             rt.drain(of_ctx.cons(), CTX, tap=ctx_tap, wait=True)
 
@@ -125,6 +135,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("-d", "--dev", required=True, dest="device")
 ap.add_argument("--mono", action="store_true", help="single-tile baseline (all 3 stages on 1 tile)")
 ap.add_argument("--trivial", type=int, default=0, help="0=real; 1=all trivial; 2=softmax trivial; 3=scores trivial")
+ap.add_argument("--relpos", action="store_true", help="fused relpos scores stage (on-chip AC+BD+rel_shift)")
 opts = ap.parse_args(sys.argv[1:])
 dev = NPU2() if opts.device == "npu2" else NPU1()
-print(build(dev, mono=opts.mono, TRIVIAL=opts.trivial))
+print(build(dev, mono=opts.mono, TRIVIAL=opts.trivial, relpos=opts.relpos))
