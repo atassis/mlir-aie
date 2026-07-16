@@ -19,6 +19,9 @@
 #ifndef ATTN_SCALE
 #define ATTN_SCALE 0.125f // 1/sqrt(64)
 #endif
+#ifndef ATTN_P
+#define ATTN_P (2 * ATTN_T - 1) // relative-position length (NeMo/Parakeet rel-pos)
+#endif
 
 static constexpr float LOG2E = 1.4426950408889634f;
 static constexpr int VL = 16;
@@ -62,6 +65,57 @@ extern "C" void stage_scores(const bfloat16 *__restrict q,
     }
   }
   event1();
+}
+
+// STAGE A (RELPOS) -- fused scores with on-chip AC + BD + rel_shift + scale (Parakeet/NeMo rel-pos).
+//   q       : [TQ, DK] bf16          one query tile from the belt
+//   kp      : [(T+P)*DK] bf16 RESIDENT -- k[T,DK] then p[P,DK] packed (2-input budget: q + kp)
+//   scores  : [TQ, T] f32 (out)      = (AC + rel_shift(BD)) * inv_scale, feeds the softmax stage
+//   row_off : global row index of this query tile (qt*TQ); the rel_shift base uses the GLOBAL row i.
+// AC[li,j]=q[li].k[j]; BD[li,jp]=q[li].p[jp]; scores[li,j]=(AC+BD[(T-1-i)+j])*inv_scale, i=row_off+li.
+// rel_shift = strided read bd + (T-1-i) (relpos_mha.cc brick 2). BD held per-row in a stack scratch ->
+// stage A needs a bumped stack_size at real P (bd[343] f32 = ~1.4 KB). Scalar AC/BD dots (correctness
+// first; the vectorized-unaligned path is the follow-up optimization).
+extern "C" void stage_scores_relpos(const bfloat16 *__restrict q,
+                                    const bfloat16 *__restrict kp,
+                                    float *__restrict scores, int32_t row_off) {
+  constexpr int TQ = ATTN_TQ, T = ATTN_T, DK = ATTN_DK, P = ATTN_P;
+  constexpr float inv_scale = ATTN_SCALE;
+  const bfloat16 *k = kp;
+  const bfloat16 *p = kp + T * DK;
+  float bd[ATTN_P];   // per-row BD = q[li] . p^T ; stack scratch (stage A worker gets a bumped stack_size)
+  event0();
+  for (int li = 0; li < TQ; li++) {
+    const bfloat16 *qr = q + li * DK;
+    const int i = row_off + li;                 // GLOBAL row index -> rel_shift base
+    for (int jp = 0; jp < P; jp++) {
+      const bfloat16 *pr = p + jp * DK;
+      aie::accum<accfloat, VL> acc = aie::zeros<accfloat, VL>();
+      for (int d = 0; d < DK; d += VL)
+        acc = aie::mac(acc, aie::load_v<VL>(qr + d), aie::load_v<VL>(pr + d));
+      bd[jp] = aie::reduce_add(acc.to_vector<float>());
+    }
+    const int base = (i < T) ? (T - 1 - i) : 0;  // rel_shift base (clamp padding rows i>=T -> no OOB)
+    const float *bd_row = bd + base;
+    float *sc = scores + li * T;
+    for (int j = 0; j < T; j++) {
+      const bfloat16 *kr = k + j * DK;
+      aie::accum<accfloat, VL> acc = aie::zeros<accfloat, VL>();
+      for (int d = 0; d < DK; d += VL)
+        acc = aie::mac(acc, aie::load_v<VL>(qr + d), aie::load_v<VL>(kr + d));
+      const float ac = aie::reduce_add(acc.to_vector<float>());
+      sc[j] = (ac + bd_row[j]) * inv_scale;
+    }
+  }
+  event1();
+}
+
+// Zero-scalar-arg bake wrapper (IRON kernels avoid scalar args -> bake constants). N_QT=1 validation:
+// row_off = 0 (the single query tile is rows [0,TQ)). N_QT>1 needs an advancing row_off (tile-offset
+// wiring, a follow-up) -- do NOT use this bake for N_QT>1.
+extern "C" void stage_scores_relpos_bake(const bfloat16 *__restrict q,
+                                         const bfloat16 *__restrict kp, float *__restrict scores) {
+  stage_scores_relpos(q, kp, scores, 0);
 }
 
 // MONOLITH baseline: all 3 stages on ONE tile, per query tile. 2 inputs (q + kv, k|V packed) to fit
