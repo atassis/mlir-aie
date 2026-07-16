@@ -25,6 +25,7 @@ TQ = int(os.environ.get("ATTN_TQ", 8))
 T = int(os.environ.get("ATTN_T", 64))
 DK = int(os.environ.get("ATTN_DK", 64))
 N_QT = int(os.environ.get("ATTN_NQT", 16))  # query tiles streamed through the pipeline
+N_HEADS = int(os.environ.get("ATTN_HEADS", 1))  # data-parallel heads, one 3-tile conveyor per column
 
 
 P = 2 * T - 1  # relative-position length (NeMo/Parakeet rel-pos)
@@ -95,10 +96,15 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False):
         # 64 KB L1, so depth-1. Structure = the validated per-tile-acquire + stride-0 replay tap (the
         # tiny-dims proven path), only single-buffered. (True acquire-once residency deadlocked at
         # depth-1 -- deferred; this re-streams weights on-chip but is the fair, known-good dataflow.)
-        of_k = ObjectFifo(k_ty, name="k", depth=1)   # k resident (relpos adds BD via the query belt, not here)
-        of_v = ObjectFifo(v_ty, name="v", depth=1)
-        of_ac = ObjectFifo(ac_ty, name="ac", depth=2)       # A->B belt
-        of_probs = ObjectFifo(probs_ty, name="probs", depth=2)  # B->C belt
+        # MULTI-HEAD: replicate the 3-tile conveyor per head; place-tiles assigns each head its own
+        # column (data-parallel heads, no cross-head data). Per-head fifos (unique names).
+        H = N_HEADS
+        of_qh = [ObjectFifo(qbelt_ty, name=f"q{h}", depth=1 if relpos else 2) for h in range(H)]
+        of_kh = [ObjectFifo(k_ty, name=f"k{h}", depth=1) for h in range(H)]
+        of_vh = [ObjectFifo(v_ty, name=f"v{h}", depth=1) for h in range(H)]
+        of_ach = [ObjectFifo(ac_ty, name=f"ac{h}", depth=2) for h in range(H)]
+        of_ph = [ObjectFifo(probs_ty, name=f"probs{h}", depth=2) for h in range(H)]
+        of_ctxh = [ObjectFifo(ctx_ty, name=f"ctx{h}", depth=2) for h in range(H)]
 
         def stage_a(f_q, f_k, f_ac, k_sc):
             for _ in range_(N_QT):
@@ -118,20 +124,32 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False):
                 k_cx(ep, ev, ec)
                 f_probs.release(1); f_v.release(1); f_ctx.release(1)
 
-        # stage_b (softmax) holds `float srow[T]` on the AIE stack; default stack is 1 KB, so at real
-        # T (srow[176]=704 B + call frames) it OVERFLOWS -> silent device hang. Bump only stage_b's
-        # stack (its tile has small belts = ample L1). Stages A/C have no T-sized stack array.
-        # (relpos BD-in-belt stage A has no scratch -> no stack bump; only softmax stage B needs it.)
-        wl = [Worker(stage_a, [of_q.cons(), of_k.cons(), of_ac.prod(), scores]),
-              Worker(stage_b, [of_ac.cons(), of_probs.prod(), softmax], stack_size=0x1000),
-              Worker(stage_c, [of_probs.cons(), of_v.cons(), of_ctx.prod(), ctx_k])]
-        wt_replay = replay_tap
-        with rt.sequence(q_full_ty, k_ty, v_ty, ctx_full_ty) as (Q, K, V, CTX):
+        # stage_b (softmax) holds `float srow[T]` on the AIE stack -> bump its stack_size (real T
+        # overflows the 1 KB default -> silent hang). stage A (relpos BD-in-belt) / C need no bump.
+        wl = []
+        for h in range(H):
+            wl += [Worker(stage_a, [of_qh[h].cons(), of_kh[h].cons(), of_ach[h].prod(), scores]),
+                   Worker(stage_b, [of_ach[h].cons(), of_ph[h].prod(), softmax], stack_size=0x1000),
+                   Worker(stage_c, [of_ph[h].cons(), of_vh[h].cons(), of_ctxh[h].prod(), ctx_k])]
+
+        # ONE big buffer per role [H * per-head]; per-head fills index in with an offset tap. The flat
+        # [N_QT,1,1,QELEM] query tap works for plain (QELEM=TQ*DK) and relpos (QELEM=TQ*DK+TQ*T) alike.
+        QT, KT, VT, CT = N_QT * QELEM, T * DK, T * DK, N_QT * TQ * DK
+        q_all_ty = np.ndarray[(H * QT,), np.dtype[bfloat16]]
+        k_all_ty = np.ndarray[(H * KT,), np.dtype[bfloat16]]
+        v_all_ty = np.ndarray[(H * VT,), np.dtype[bfloat16]]
+        c_all_ty = np.ndarray[(H * CT,), np.dtype[bfloat16]]
+        with rt.sequence(q_all_ty, k_all_ty, v_all_ty, c_all_ty) as (Q, K, V, CTX):
             rt.start(*wl)
-            rt.fill(of_q.prod(), Q, tap=q_tap)
-            rt.fill(of_k.prod(), K, tap=wt_replay)
-            rt.fill(of_v.prod(), V, tap=replay_tap)
-            rt.drain(of_ctx.cons(), CTX, tap=ctx_tap, wait=True)
+            for h in range(H):
+                qh = TensorAccessPattern([H * QT], h * QT, [N_QT, 1, 1, QELEM], [QELEM, 0, 0, 1])
+                kh = TensorAccessPattern([H * KT], h * KT, [N_QT, 1, T, DK], [0, 0, DK, 1])
+                vh = TensorAccessPattern([H * VT], h * VT, [N_QT, 1, T, DK], [0, 0, DK, 1])
+                ch = TensorAccessPattern([H * CT], h * CT, [N_QT, 1, TQ, DK], [TQ * DK, 0, DK, 1])
+                rt.fill(of_qh[h].prod(), Q, tap=qh)
+                rt.fill(of_kh[h].prod(), K, tap=kh)
+                rt.fill(of_vh[h].prod(), V, tap=vh)
+                rt.drain(of_ctxh[h].cons(), CTX, tap=ch, wait=True)
 
     return Program(dev, rt).resolve_program()
 
