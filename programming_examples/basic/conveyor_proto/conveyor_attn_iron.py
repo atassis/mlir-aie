@@ -99,34 +99,39 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False):
         # MULTI-HEAD: replicate the 3-tile conveyor per head; place-tiles assigns each head its own
         # column (data-parallel heads, no cross-head data). Per-head fifos (unique names).
         H = N_HEADS
-        of_qh = [ObjectFifo(qbelt_ty, name=f"q{h}", depth=1 if relpos else 2) for h in range(H)]
-        of_kh = [ObjectFifo(k_ty, name=f"k{h}", depth=1) for h in range(H)]
+        qd = 1 if relpos else 2
         of_vh = [ObjectFifo(v_ty, name=f"v{h}", depth=1) for h in range(H)]
         of_ach = [ObjectFifo(ac_ty, name=f"ac{h}", depth=2) for h in range(H)]
         of_ph = [ObjectFifo(probs_ty, name=f"probs{h}", depth=2) for h in range(H)]
-        # ctx OUTPUT: JOIN heads' ctx through MemTiles -> few shim drains (H separate ctx drains exhaust
-        # the shim NOC at >=6 heads). ONE MemTile can't take 8 head-inputs either (MemTile DMA-channel
-        # budget), so join in GROUPS of GJ heads -> ceil(H/GJ) MemTiles / shim drains. Each head writes its
-        # [TQ*DK] slice into its group's [gsz*TQ*DK] big object.
+        # 8-head fit: split q AND k (v stays per-head DIRECT) + ctx JOIN = 3 MemTile ops/group. Shim math
+        # at H=8: q-split 2 + k-split 2 + v-direct 8 + ctx-join 2 = 14 streams (under budget). 4 MemTile
+        # ops (q+k+v split + join) DEADLOCKED at runtime; 2 (q-split+join) worked -> 3 is the target.
         GJ = 4
-        ctx_groups = [list(range(g, min(g + GJ, H))) for g in range(0, H, GJ)]
-        ctx_subs = [None] * H
-        of_ctx_bigs = []
-        for gi, hs in enumerate(ctx_groups):
+        groups = [list(range(g, min(g + GJ, H))) for g in range(0, H, GJ)]
+        q_subs = [None] * H; k_subs = [None] * H; ctx_subs = [None] * H
+        of_q_bigs, of_k_bigs, of_ctx_bigs = [], [], []
+        for gi, hs in enumerate(groups):
             gsz = len(hs)
-            big_ty = np.ndarray[(gsz * TQ * DK,), np.dtype[bfloat16]]
-            ofb = ObjectFifo(big_ty, name=f"ctxbig{gi}", depth=2)
-            subs = ofb.prod().join([i * TQ * DK for i in range(gsz)],
-                                   obj_types=[ctx_ty] * gsz, names=[f"ctxj{gi}_{i}" for i in range(gsz)])
-            of_ctx_bigs.append((ofb, hs))
+            ofq = ObjectFifo(np.ndarray[(gsz * QELEM,), np.dtype[bfloat16]], name=f"qbig{gi}", depth=2)
+            qs = ofq.cons().split([i * QELEM for i in range(gsz)], obj_types=[qbelt_ty] * gsz,
+                                  depths=[qd] * gsz, names=[f"qs{gi}_{i}" for i in range(gsz)])
+            ofk = ObjectFifo(np.ndarray[(gsz * T * DK,), np.dtype[bfloat16]], name=f"kbig{gi}", depth=2)
+            ks = ofk.cons().split([i * T * DK for i in range(gsz)], obj_types=[k_ty] * gsz,
+                                  depths=[1] * gsz, names=[f"ks{gi}_{i}" for i in range(gsz)])
+            ofb = ObjectFifo(np.ndarray[(gsz * TQ * DK,), np.dtype[bfloat16]], name=f"ctxbig{gi}", depth=2)
+            cs = ofb.prod().join([i * TQ * DK for i in range(gsz)],
+                                 obj_types=[ctx_ty] * gsz, names=[f"ctxj{gi}_{i}" for i in range(gsz)])
+            of_q_bigs.append((ofq, hs)); of_k_bigs.append((ofk, hs)); of_ctx_bigs.append((ofb, hs))
             for i, h in enumerate(hs):
-                ctx_subs[h] = subs[i]
+                q_subs[h] = qs[i]; k_subs[h] = ks[i]; ctx_subs[h] = cs[i]
 
         def stage_a(f_q, f_k, f_ac, k_sc):
+            ek = f_k.acquire(1)          # DIAGNOSTIC: acquire-once k (test acquire-once in isolation, no split)
             for _ in range_(N_QT):
-                eq = f_q.acquire(1); ek = f_k.acquire(1); eac = f_ac.acquire(1)
+                eq = f_q.acquire(1); eac = f_ac.acquire(1)
                 k_sc(eq, ek, eac)
-                f_q.release(1); f_k.release(1); f_ac.release(1)
+                f_q.release(1); f_ac.release(1)
+            f_k.release(1)
 
         def stage_b(f_ac, f_probs, k_sm):
             for _ in range_(N_QT):
@@ -135,37 +140,40 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False):
                 f_ac.release(1); f_probs.release(1)
 
         def stage_c(f_probs, f_v, f_ctx, k_cx):
+            ev = f_v.acquire(1)          # DIAGNOSTIC: acquire-once v
             for _ in range_(N_QT):
-                ep = f_probs.acquire(1); ev = f_v.acquire(1); ec = f_ctx.acquire(1)
+                ep = f_probs.acquire(1); ec = f_ctx.acquire(1)
                 k_cx(ep, ev, ec)
-                f_probs.release(1); f_v.release(1); f_ctx.release(1)
+                f_probs.release(1); f_ctx.release(1)
+            f_v.release(1)
 
         # stage_b (softmax) holds `float srow[T]` on the AIE stack -> bump its stack_size (real T
         # overflows the 1 KB default -> silent hang). stage A (relpos BD-in-belt) / C need no bump.
         wl = []
         for h in range(H):
-            wl += [Worker(stage_a, [of_qh[h].cons(), of_kh[h].cons(), of_ach[h].prod(), scores]),
+            wl += [Worker(stage_a, [q_subs[h].cons(), k_subs[h].cons(), of_ach[h].prod(), scores]),
                    Worker(stage_b, [of_ach[h].cons(), of_ph[h].prod(), softmax], stack_size=0x1000),
                    Worker(stage_c, [of_ph[h].cons(), of_vh[h].cons(), ctx_subs[h].prod(), ctx_k])]
 
-        # ONE big buffer per role [H * per-head]; per-head fills index in with an offset tap. The flat
-        # [N_QT,1,1,QELEM] query tap works for plain (QELEM=TQ*DK) and relpos (QELEM=TQ*DK+TQ*T) alike.
-        # ctx comes out JOINED: one [H*TQ*DK] object per query-tile step -> drained layout is
-        # [N_QT, H, TQ, DK] (the host de-interleaves H<->N_QT to recover per-head ctx).
-        QT, KT, VT = N_QT * QELEM, T * DK, T * DK
-        q_all_ty = np.ndarray[(H * QT,), np.dtype[bfloat16]]
+        # q GROUP-MAJOR (split): per group [N_QT, gsz, QELEM]. k/v head-major, filled ONCE (acquire-once).
+        KT, VT = T * DK, T * DK
+        q_all_ty = np.ndarray[(N_QT * H * QELEM,), np.dtype[bfloat16]]
         k_all_ty = np.ndarray[(H * KT,), np.dtype[bfloat16]]
         v_all_ty = np.ndarray[(H * VT,), np.dtype[bfloat16]]
         c_all_ty = np.ndarray[(N_QT * H * TQ * DK,), np.dtype[bfloat16]]
         with rt.sequence(q_all_ty, k_all_ty, v_all_ty, c_all_ty) as (Q, K, V, CTX):
             rt.start(*wl)
-            for h in range(H):
-                qh = TensorAccessPattern([H * QT], h * QT, [N_QT, 1, 1, QELEM], [QELEM, 0, 0, 1])
-                kh = TensorAccessPattern([H * KT], h * KT, [N_QT, 1, T, DK], [0, 0, DK, 1])
-                vh = TensorAccessPattern([H * VT], h * VT, [N_QT, 1, T, DK], [0, 0, DK, 1])
-                rt.fill(of_qh[h].prod(), Q, tap=qh)
-                rt.fill(of_kh[h].prod(), K, tap=kh)
+            for h in range(H):   # v stays per-head direct, filled ONCE (acquire-once)
+                vh = TensorAccessPattern([H * VT], h * VT, [1, 1, T, DK], [0, 0, DK, 1])
                 rt.fill(of_vh[h].prod(), V, tap=vh)
+            qoff = koff = 0
+            for (ofq, hs), (ofk, _) in zip(of_q_bigs, of_k_bigs):
+                gsz = len(hs)
+                qtap = TensorAccessPattern([N_QT * H * QELEM], qoff, [N_QT, 1, 1, gsz * QELEM], [gsz * QELEM, 0, 0, 1])
+                ktap = TensorAccessPattern([H * KT], koff, [1, 1, 1, gsz * T * DK], [0, 0, 0, 1])  # k once, group slice
+                rt.fill(ofq.prod(), Q, tap=qtap)
+                rt.fill(ofk.prod(), K, tap=ktap)
+                qoff += N_QT * gsz * QELEM; koff += gsz * T * DK
             coff = 0   # per-group ctx drain (each group -> its own shim drain, contiguous slice of C_all)
             for ofb, hs in of_ctx_bigs:
                 gsz = len(hs)
