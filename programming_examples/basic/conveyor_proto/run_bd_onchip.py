@@ -56,8 +56,15 @@ bo_c = pyxrt.bo(d, H * NQ * DK * 2, pyxrt.bo.host_only, kern.group_id(7))
 for bo, arr in ((bo_instr, instr), (bo_qpv, qpv_all), (bo_p, p_all), (bo_k, k_all), (bo_v, v_all)):
     bo.write(arr.tobytes(), 0); bo.sync(TO)
 
+import time
 r = kern(3, bo_instr, instr.size, bo_qpv, bo_p, bo_k, bo_v, bo_c); r.wait()
 bo_c.sync(FROM)
+# timing: mean ms/dispatch over 200 iters (device only; mask-independent)
+_t0 = time.perf_counter()
+for _ in range(200):
+    r = kern(3, bo_instr, instr.size, bo_qpv, bo_p, bo_k, bo_v, bo_c); r.wait()
+_dt = (time.perf_counter() - _t0) / 200 * 1e3
+print(f"[bd_onchip] {N_QT} tiles/dispatch, H={H} -> {_dt:.4f} ms/dispatch")
 ctx_dev = np.frombuffer(bo_c.read(H * NQ * DK * 2, 0), dtype=np.uint16).view(bfloat16).astype(np.float32).reshape(H * NQ, DK)
 
 rel = np.linalg.norm(ctx_dev - ctx_ref) / (np.linalg.norm(ctx_ref) + 1e-12)
