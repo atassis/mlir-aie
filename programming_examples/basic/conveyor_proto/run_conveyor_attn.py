@@ -20,18 +20,24 @@ q = rng.standard_normal((NQ, DK)).astype(bfloat16)
 k = rng.standard_normal((T, DK)).astype(bfloat16)
 v = rng.standard_normal((T, DK)).astype(bfloat16)
 if RELPOS:
-    # fused relpos scores: scores[i,j] = (q.k^T + rel_shift(q.p^T))[i,j] * SCALE ; rel_shift
-    # BD_shifted[i,j] = BD[i, (T-1-i)+j], BD = q.p^T [NQ,P]. row_off=0 (N_QT=1 validation).
+    # REAL-DIMS relpos (BD-in-belt): host computes BD = q.p^T THEN rel_shift -> BD_shifted[NQ,T] bf16,
+    # packed after q per tile in the query belt. scores[i,j] = (q.k^T + BD_shifted)[i,j] * SCALE.
+    # rel_shift: BD_shifted[i,j] = BD[i, (T-1-i)+j] (global row i; here NQ rows starting at 0).
     p = rng.standard_normal((P, DK)).astype(bfloat16)
     ac_raw = q.astype(np.float32) @ k.astype(np.float32).T          # [NQ,T]
     BD = q.astype(np.float32) @ p.astype(np.float32).T              # [NQ,P]
-    scores = np.empty((NQ, T), np.float32)
+    BD_shifted = np.empty((NQ, T), np.float32)
     for i in range(NQ):
         base = (T - 1 - i) if i < T else 0
-        scores[i] = (ac_raw[i] + BD[i, base:base + T]) * SCALE
-    kpack = np.concatenate([k, p], axis=0)                          # [(T+P),DK] resident kp
+        BD_shifted[i] = BD[i, base:base + T]
+    bd_bf = BD_shifted.astype(bfloat16)                             # kernel adds bf16 BD_shifted
+    scores = (ac_raw + bd_bf.astype(np.float32)) * SCALE
+    # query belt per tile = [q_tile (TQ*DK) || BD_shifted_tile (TQ*T)] bf16
+    q_belt = np.concatenate([q.reshape(N_QT, TQ * DK), bd_bf.reshape(N_QT, TQ * T)], axis=1).reshape(-1)
+    kpack = k
 else:
     scores = SCALE * (q.astype(np.float32) @ k.astype(np.float32).T)
+    q_belt = q
     kpack = k
 sc = scores - scores.max(axis=1, keepdims=True)
 e = np.exp(sc); probs = e / e.sum(axis=1, keepdims=True)
@@ -46,7 +52,7 @@ kern = pyxrt.kernel(hw, kname)
 TO = pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE
 FROM = pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE
 
-qb = q.reshape(-1).view(np.uint16); kb = kpack.reshape(-1).view(np.uint16); vb = v.reshape(-1).view(np.uint16)
+qb = q_belt.reshape(-1).view(np.uint16); kb = kpack.reshape(-1).view(np.uint16); vb = v.reshape(-1).view(np.uint16)
 bo_instr = pyxrt.bo(d, instr.nbytes, pyxrt.bo.cacheable, kern.group_id(1))
 bo_q = pyxrt.bo(d, qb.nbytes, pyxrt.bo.host_only, kern.group_id(3))
 bo_k = pyxrt.bo(d, kb.nbytes, pyxrt.bo.host_only, kern.group_id(4))
