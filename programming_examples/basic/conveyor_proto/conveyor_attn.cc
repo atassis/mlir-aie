@@ -374,3 +374,14 @@ extern "C" void stage_bd(const bfloat16 *__restrict qv, const bfloat16 *__restri
   bd_stream_emit(q_pass, out, q0);
   event1();
 }
+
+// Zero-scalar-arg BD bake for the N_QT=1 arithmetic gate (q0=0, single query tile rows [0,TQ)). Belt
+// input packs q_pass[TQ,DK] then qv[TQ,DK] (2*TQ*DK, ONE streamed object); p is the 2nd input (resident).
+// Out = q_pass || BD_hi [|| BD_lo] -- exactly the belt stage_scores_relpos_bd consumes. N_QT>1 needs an
+// advancing q0 (the follow-up the generator flags) -> do NOT use this bake for N_QT>1.
+extern "C" void stage_bd_bake(const bfloat16 *__restrict qpv, const bfloat16 *__restrict p,
+                              bfloat16 *__restrict out) {
+  const bfloat16 *q_pass = qpv;
+  const bfloat16 *qv = qpv + ATTN_TQ * ATTN_DK;
+  stage_bd(qv, q_pass, p, out, 0);
+}
