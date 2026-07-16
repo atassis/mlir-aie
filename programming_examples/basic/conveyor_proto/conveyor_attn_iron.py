@@ -117,10 +117,15 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False):
             ofv = ObjectFifo(np.ndarray[(gsz * T * DK,), np.dtype[bfloat16]], name=f"vbig{gi}", depth=2)
             qs = ofq.cons().split([i * QELEM for i in range(gsz)], obj_types=[qbelt_ty] * gsz,
                                   depths=[qd] * gsz, names=[f"qs{gi}_{i}" for i in range(gsz)])
+            # k/v are RESIDENT weights: fill the MemTile ONCE (below), then the split REPLAYS each head's
+            # slice N_QT times on-chip (repeat_counts) -- no LPDDR re-read, and no stride-0 replay FILL tap
+            # feeding the split (that combination deadlocked).
             ks = ofk.cons().split([i * T * DK for i in range(gsz)], obj_types=[k_ty] * gsz,
-                                  depths=[1] * gsz, names=[f"ks{gi}_{i}" for i in range(gsz)])
+                                  depths=[1] * gsz, names=[f"ks{gi}_{i}" for i in range(gsz)],
+                                  repeat_counts=[N_QT] * gsz)
             vs = ofv.cons().split([i * T * DK for i in range(gsz)], obj_types=[v_ty] * gsz,
-                                  depths=[1] * gsz, names=[f"vs{gi}_{i}" for i in range(gsz)])
+                                  depths=[1] * gsz, names=[f"vs{gi}_{i}" for i in range(gsz)],
+                                  repeat_counts=[N_QT] * gsz)
             ofc = ObjectFifo(np.ndarray[(gsz * TQ * DK,), np.dtype[bfloat16]], name=f"ctxbig{gi}", depth=2)
             cs = ofc.prod().join([i * TQ * DK for i in range(gsz)], obj_types=[ctx_ty] * gsz,
                                  names=[f"ctxj{gi}_{i}" for i in range(gsz)])
@@ -170,8 +175,9 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False):
             for ofq, ofk, ofv, hs in in_bigs:
                 gsz = len(hs)
                 qtap = TensorAccessPattern([N_QT * H * QELEM], qoff, [N_QT, 1, 1, gsz * QELEM], [gsz * QELEM, 0, 0, 1])
-                ktap = TensorAccessPattern([H * T * DK], koff, [N_QT, 1, 1, gsz * T * DK], [0, 0, 0, 1])
-                vtap = TensorAccessPattern([H * T * DK], koff, [N_QT, 1, 1, gsz * T * DK], [0, 0, 0, 1])
+                # k/v filled ONCE (split replays via repeat_counts) -> outer dim 1, not N_QT.
+                ktap = TensorAccessPattern([H * T * DK], koff, [1, 1, 1, gsz * T * DK], [0, 0, 0, 1])
+                vtap = TensorAccessPattern([H * T * DK], koff, [1, 1, 1, gsz * T * DK], [0, 0, 0, 1])
                 rt.fill(ofq.prod(), Q, tap=qtap)
                 rt.fill(ofk.prod(), K, tap=ktap)
                 rt.fill(ofv.prod(), V, tap=vtap)
