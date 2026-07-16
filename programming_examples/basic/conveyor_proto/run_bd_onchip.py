@@ -73,6 +73,10 @@ bo_c.sync(FROM)
 ctx_dev = np.frombuffer(bo_c.read(NQ * DK * 2, 0), dtype=np.uint16).view(bfloat16).astype(np.float32).reshape(NQ, DK)
 
 rel = np.linalg.norm(ctx_dev - ctx_ref) / (np.linalg.norm(ctx_ref) + 1e-12)
+if N_QT > 1:
+    pt = [np.linalg.norm(ctx_dev[t*TQ:(t+1)*TQ] - ctx_ref[t*TQ:(t+1)*TQ]) /
+          (np.linalg.norm(ctx_ref[t*TQ:(t+1)*TQ]) + 1e-12) for t in range(N_QT)]
+    print(f"[bd_onchip] per-tile rel-L2 (q0=0,{TQ},..): " + " ".join(f"{x:.3e}" for x in pt))
 print(f"[bd_onchip] T={T} TQ={TQ} DK={DK} N_QT={N_QT} P={P} BD_SPLIT={BD_SPLIT} kernel='{kname}'")
 print(f"[bd_onchip] ctx_dev[0,:3]={ctx_dev[0,:3]}  ctx_ref[0,:3]={ctx_ref[0,:3]}")
 print(f"[bd_onchip] rel-L2={rel:.5e}  gate<=5e-3  {'PASS' if rel <= 5e-3 else 'FAIL'}")
