@@ -375,13 +375,20 @@ extern "C" void stage_bd(const bfloat16 *__restrict qv, const bfloat16 *__restri
   event1();
 }
 
-// Zero-scalar-arg BD bake for the N_QT=1 arithmetic gate (q0=0, single query tile rows [0,TQ)). Belt
-// input packs q_pass[TQ,DK] then qv[TQ,DK] (2*TQ*DK, ONE streamed object); p is the 2nd input (resident).
-// Out = q_pass || BD_hi [|| BD_lo] -- exactly the belt stage_scores_relpos_bd consumes. N_QT>1 needs an
-// advancing q0 (the follow-up the generator flags) -> do NOT use this bake for N_QT>1.
+// Zero-scalar-arg BD bake. Belt input packs q_pass[TQ,DK] then qv[TQ,DK] (2*TQ*DK, ONE streamed object);
+// p is the 2nd input (resident). Out = q_pass || BD_hi [|| BD_lo] -- the belt stage_scores_relpos_bd
+// consumes. ADVANCING q0: the BD worker calls this once per query tile, in order, on one core -> a static
+// counter advances q0 = tile_idx*TQ; wrap % N_QT resets it per dispatch (N_QT tiles each). Solves the
+// row-offset without a scalar arg / belt header. ATTN_NQT MUST be baked (-DATTN_NQT) to match the build.
+#ifndef ATTN_NQT
+#define ATTN_NQT 1
+#endif
 extern "C" void stage_bd_bake(const bfloat16 *__restrict qpv, const bfloat16 *__restrict p,
                               bfloat16 *__restrict out) {
+  static int tile_idx = 0;
+  const int q0 = tile_idx * ATTN_TQ;
+  tile_idx = (tile_idx + 1) % ATTN_NQT;   // wrap per dispatch
   const bfloat16 *q_pass = qpv;
   const bfloat16 *qv = qpv + ATTN_TQ * ATTN_DK;
-  stage_bd(qv, q_pass, p, out, 0);
+  stage_bd(qv, q_pass, p, out, q0);
 }
