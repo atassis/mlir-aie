@@ -94,28 +94,57 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False):
             rt.fill(of_kv.prod(), KV, tap=kv_replay)
             rt.drain(of_ctx.cons(), CTX, tap=ctx_tap, wait=True)
     elif bd_onchip:
-        # BD-ON-CHIP 4-stage column (H=1 arithmetic gate): BD -> scores -> softmax -> ctx.
-        # BD tile: g_bd = qv @ p^T (f32 accfloat) then rel_shift(q0=0)+split -> q_pass||BD_hi belt.
-        # 2-input budget per tile respected: BD gets {qpv streamed, p resident}; scores gets {q||BD belt,
-        # k resident}. N_QT=1 bakes q0=0 (stage_bd_bake); N_QT>1 needs an advancing q0 (the follow-up).
+        # BD-ON-CHIP 4-stage column (H=1): BD -> scores -> softmax -> ctx. BD tile computes
+        # g_bd = qv @ p^T (f32 accfloat) then rel_shift+split -> q_pass||BD_hi belt. q0 advances via a
+        # static tile-counter in the kernel (no scalar arg). p residency: fits L1 (small T) -> resident
+        # acquire-once; else STREAM in BD_KB-row blocks (real T=176, p=88KB > L1), replayed per query tile
+        # (movement opt = MemTile-resident-read-once is a follow-up; this re-reads p, correctness first).
         qpv_ty = np.ndarray[(2 * TQ * DK,), np.dtype[bfloat16]]   # q_pass[TQ,DK] || qv[TQ,DK]
-        p_ty = np.ndarray[(P * DK,), np.dtype[bfloat16]]          # resident p (fits L1 at the gate T)
-        bd_k = Kernel("stage_bd_bake", "kernels.a", [qpv_ty, p_ty, qbd_ty])
+        BD_KB = int(os.environ.get("BD_KB", 39))
+        stream_p = (P * DK * 2) > 60000                          # p doesn't fit L1 -> block-stream
         of_qpv = ObjectFifo(qpv_ty, name="qpv", depth=2)
-        of_p = ObjectFifo(p_ty, name="p", depth=1)
         of_bd = ObjectFifo(qbd_ty, name="bd", depth=1)           # BD -> scores belt (q||BD_hi)
         of_k = ObjectFifo(k_ty, name="k", depth=1)
         of_v = ObjectFifo(v_ty, name="v", depth=1)
         of_ac = ObjectFifo(ac_ty, name="ac", depth=2)
         of_pr = ObjectFifo(probs_ty, name="probs", depth=2)
+        p_full_ty = np.ndarray[(P * DK,), np.dtype[bfloat16]]
 
-        def stage_bd_w(f_qpv, f_p, f_bd, k_bd):
-            ep = f_p.acquire(1)                     # p resident (acquire-once)
-            for _ in range_(N_QT):
-                eqpv = f_qpv.acquire(1); ebd = f_bd.acquire(1)
-                k_bd(eqpv, ep, ebd)
-                f_qpv.release(1); f_bd.release(1)
-            f_p.release(1)
+        if stream_p:
+            assert P % BD_KB == 0, f"streaming needs P({P}) %% BD_KB({BD_KB}) == 0"
+            NBLK = P // BD_KB
+            pblk_ty = np.ndarray[(BD_KB * DK,), np.dtype[bfloat16]]
+            of_p = ObjectFifo(pblk_ty, name="p", depth=2)
+            block_k = Kernel("bd_block_bake", "kernels.a", [qpv_ty, pblk_ty])
+            emit_k = Kernel("bd_emit_bake", "kernels.a", [qpv_ty, qbd_ty])
+
+            def stage_bd_w(f_qpv, f_p, f_bd, k_block, k_emit):
+                for _ in range_(N_QT):
+                    eqpv = f_qpv.acquire(1)
+                    for _ in range_(NBLK):
+                        epb = f_p.acquire(1)
+                        k_block(eqpv, epb)
+                        f_p.release(1)
+                    ebd = f_bd.acquire(1)
+                    k_emit(eqpv, ebd)
+                    f_qpv.release(1); f_bd.release(1)
+
+            w_bd = Worker(stage_bd_w, [of_qpv.cons(), of_p.cons(), of_bd.prod(), block_k, emit_k], stack_size=0x1000)
+            p_tap = TensorAccessPattern([P * DK], 0, [N_QT, NBLK, BD_KB, DK], [0, BD_KB * DK, DK, 1])
+        else:
+            of_p = ObjectFifo(p_full_ty, name="p", depth=1)
+            bd_k = Kernel("stage_bd_bake", "kernels.a", [qpv_ty, p_full_ty, qbd_ty])
+
+            def stage_bd_w(f_qpv, f_p, f_bd, k_bd):
+                ep = f_p.acquire(1)                     # p resident (acquire-once)
+                for _ in range_(N_QT):
+                    eqpv = f_qpv.acquire(1); ebd = f_bd.acquire(1)
+                    k_bd(eqpv, ep, ebd)
+                    f_qpv.release(1); f_bd.release(1)
+                f_p.release(1)
+
+            w_bd = Worker(stage_bd_w, [of_qpv.cons(), of_p.cons(), of_bd.prod(), bd_k], stack_size=0x1000)
+            p_tap = TensorAccessPattern([P * DK], 0, [N_QT, 1, P, DK], [0, 0, DK, 1])
 
         def bd_stage_a(f_bd, f_k, f_ac, k_sc):
             ek = f_k.acquire(1)                     # k resident (acquire-once)
@@ -139,18 +168,16 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False):
                 f_probs.release(1); f_ctx.release(1)
             f_v.release(1)
 
-        w_bd = Worker(stage_bd_w, [of_qpv.cons(), of_p.cons(), of_bd.prod(), bd_k], stack_size=0x1000)
         w_a = Worker(bd_stage_a, [of_bd.cons(), of_k.cons(), of_ac.prod(), scores])
         w_b = Worker(bd_stage_b, [of_ac.cons(), of_pr.prod(), softmax], stack_size=0x1000)
         w_c = Worker(bd_stage_c, [of_pr.cons(), of_v.cons(), of_ctx.prod(), ctx_k])
 
         qpv_full_ty = np.ndarray[(N_QT * 2 * TQ * DK,), np.dtype[bfloat16]]
         qpv_tap = TensorAccessPattern([N_QT * 2 * TQ * DK], 0, [N_QT, 1, 1, 2 * TQ * DK], [2 * TQ * DK, 0, 0, 1])
-        p_replay = TensorAccessPattern([P * DK], 0, [N_QT, 1, P, DK], [0, 0, DK, 1])
-        with rt.sequence(qpv_full_ty, p_ty, k_ty, v_ty, ctx_full_ty) as (QPV, PP, K, V, CTX):
+        with rt.sequence(qpv_full_ty, p_full_ty, k_ty, v_ty, ctx_full_ty) as (QPV, PP, K, V, CTX):
             rt.start(w_bd, w_a, w_b, w_c)
             rt.fill(of_qpv.prod(), QPV, tap=qpv_tap)
-            rt.fill(of_p.prod(), PP, tap=p_replay)
+            rt.fill(of_p.prod(), PP, tap=p_tap)
             rt.fill(of_k.prod(), K, tap=replay_tap)
             rt.fill(of_v.prod(), V, tap=replay_tap)
             rt.drain(of_ctx.cons(), CTX, tap=ctx_tap, wait=True)
