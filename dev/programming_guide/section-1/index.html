@@ -25,7 +25,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.svg">
-      <meta name="generator" content="mkdocs-ProperDocs 1.6.7, mkdocs-material-9.7.6">
+      <meta name="generator" content="mkdocs-ProperDocs 1.6.7, mkdocs-material-9.7.7">
     
     
       
@@ -33,7 +33,7 @@
       
     
     
-      <link rel="stylesheet" href="../../assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
       
         
         <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
@@ -2141,6 +2141,8 @@
       
         
       
+        
+      
     
     
     
@@ -2301,6 +2303,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../runtime_sequence_reference/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Runtime Sequence Reference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -2327,6 +2357,8 @@
       
         
           
+        
+      
         
       
         
@@ -2871,6 +2903,34 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../aiecc/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    aiecc Compiler Driver
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -3252,7 +3312,7 @@ Finally we wrap everything in a <code>Program</code>. The program emits <code>ai
 <p><strong>NOTE:</strong> Every IRON component above inherits from the <code>resolvable</code> interface, which defers the creation of MLIR operations until <code>resolve()</code> is called. The <code>Program.resolve_program()</code> call ties them together and raises if anything is under-specified.</p>
 </blockquote>
 <p>By default the <code>--aie-place-tiles</code> pass uses a sequential placer that assigns tiles in column-major order. For larger designs with memory or routing constraints, the simulated annealing (SA) placer can potentially find better placements by passing <code>--placer=sa_placer --sa-seed=&lt;N&gt;</code> through to <code>aiecc</code> (via the design's <code>aiecc_flags</code>):</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>aiecc.py<span class="w"> </span>--placer<span class="o">=</span>sa_placer<span class="w"> </span>--sa-seed<span class="o">=</span><span class="m">3</span><span class="w"> </span>...
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>aiecc<span class="w"> </span>--placer<span class="o">=</span>sa_placer<span class="w"> </span>--sa-seed<span class="o">=</span><span class="m">3</span><span class="w"> </span>...
 </code></pre></div>
 <p>The SA placer optimizes wire length while respecting memory capacity, DMA channel limits, and cascade adjacency constraints. Not all seeds produce legal placements for every design — if compilation fails with a buffer overflow or routing error, try different seed values (e.g. sweep seeds 1–10) to find one that works. See <a href="https://github.com/Xilinx/mlir-aie/tree/main/programming_examples/vision/color_detect">color_detect</a> for an example that wires this up as <code>make use_sa_placer=1</code>.</p>
 <h2 id="other-tile-types">Other Tile Types<a class="headerlink" href="#other-tile-types" title="Permanent link">&para;</a></h2>
@@ -3428,7 +3488,7 @@ Finally we wrap everything in a <code>Program</code>. The program emits <code>ai
       <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.indexes", "navigation.path", "navigation.top", "navigation.footer", "search.suggest", "search.highlight", "content.tabs.link", "content.code.copy", "content.code.annotate", "toc.follow"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"alias": true, "default": "latest", "provider": "mike"}}</script>
     
     
-      <script src="../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
       
     
   </body>
