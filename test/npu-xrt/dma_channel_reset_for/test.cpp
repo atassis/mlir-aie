@@ -80,7 +80,14 @@ int main(int argc, char **argv) {
     outputBo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
     auto run = kernel(3, instructionBo, instructions.size(), inputBo, outputBo);
-    const auto state = run.wait(kDispatchTimeoutMs);
+    ert_cmd_state state;
+    try {
+      state = run.wait(kDispatchTimeoutMs);
+    } catch (const std::exception &error) {
+      std::cerr << "WAIT ERROR at dispatch " << dispatch << ": "
+                << error.what() << "\n";
+      return 2;
+    }
     if (state == ERT_CMD_STATE_TIMEOUT) {
       run.abort();
       std::cerr << "TIMEOUT at dispatch " << dispatch << "\n";
