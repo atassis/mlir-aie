@@ -86,7 +86,7 @@ int main(int argc, char **argv) {
     } catch (const std::exception &error) {
       std::cerr << "WAIT ERROR at dispatch " << dispatch << ": "
                 << error.what() << "\n";
-      return 2;
+      return 1;
     }
     if (state == ERT_CMD_STATE_TIMEOUT) {
       run.abort();
