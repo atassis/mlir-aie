@@ -2041,6 +2041,8 @@
       
         
       
+        
+      
     
     
     
@@ -2101,6 +2103,34 @@
     
   
     IRON Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../programming_guide/hrx_runtime/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    HRX Runtime (amdxdna)
   
 
     
@@ -2338,6 +2368,8 @@
       
         
       
+        
+      
     
     
     
@@ -2485,6 +2517,34 @@
     
   
     Python Kernel Library
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/hostruntime/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Host Runtime
   
 
     
@@ -2837,6 +2897,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#-aie-decompose-large-dma-bd" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        -aie-decompose-large-dma-bd
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#-aie-dma-tasks-to-npu" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2913,6 +2984,17 @@
     <span class="md-ellipsis">
       
         -aie-lower-broadcast-packet
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-aie-lower-core-reset" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        -aie-lower-core-reset
       
     </span>
   </a>
@@ -3498,6 +3580,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#-aie-decompose-large-dma-bd" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        -aie-decompose-large-dma-bd
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#-aie-dma-tasks-to-npu" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -3574,6 +3667,17 @@
     <span class="md-ellipsis">
       
         -aie-lower-broadcast-packet
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-aie-lower-core-reset" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        -aie-lower-core-reset
       
     </span>
   </a>
@@ -3914,6 +4018,21 @@ operations.</p>
 <p><em>Infer aie.tile ops from aiex.control_packet addresses</em></p>
 <h3 id="-aie-ctrl-packet-to-dma"><code>-aie-ctrl-packet-to-dma</code><a class="headerlink" href="#-aie-ctrl-packet-to-dma" title="Permanent link">&para;</a></h3>
 <p><em>Lowers npu.control_packet op to npu.dma_memcpy_nd op</em></p>
+<h3 id="-aie-decompose-large-dma-bd"><code>-aie-decompose-large-dma-bd</code><a class="headerlink" href="#-aie-decompose-large-dma-bd" title="Permanent link">&para;</a></h3>
+<p><em>Decompose oversized non-contiguous ND DMA transfers</em></p>
+<p>Splits <code>aiex.npu.dma_memcpy_nd</code> ops and task-path <code>aie.dma_bd</code> ops (inside
+<code>aiex.dma_configure_task</code> / <code>aiex.dma_configure_task_for</code>) whose constant
+ND wrap/stride encoding exceeds the hardware buffer-descriptor field limits
+(and that cannot be linearized because the access is non-contiguous) into
+one or more hardware-legal ND transfers that move exactly the same data.</p>
+<p>On the task path, multiple sub-patterns are linked with <code>aie.next_bd</code>
+blocks inside the configure region; <code>bd_id</code> / <code>next_bd_id</code> are left for
+later passes to assign.</p>
+<p>Two techniques are used: dimension factoring (split an oversized dimension
+of size N=a*b across a free dimension slot) is preferred, falling back to
+slicing an oversized dimension into ceil(N/limit) sub-transfers with
+adjusted offsets. Contiguous oversized patterns are left untouched; they are
+handled by canonicalization to linear mode.</p>
 <h3 id="-aie-dma-tasks-to-npu"><code>-aie-dma-tasks-to-npu</code><a class="headerlink" href="#-aie-dma-tasks-to-npu" title="Permanent link">&para;</a></h3>
 <p><em>Lower configured DMA tasks to NPU instructions</em></p>
 <h3 id="-aie-dma-to-npu"><code>-aie-dma-to-npu</code><a class="headerlink" href="#-aie-dma-to-npu" title="Permanent link">&para;</a></h3>
@@ -3952,6 +4071,8 @@ into MLIR operations.</p>
 <h3 id="-aie-lower-broadcast-packet"><code>-aie-lower-broadcast-packet</code><a class="headerlink" href="#-aie-lower-broadcast-packet" title="Permanent link">&para;</a></h3>
 <p><em>Replace combination of broadcast and packet-switch by packet-flow</em></p>
 <p>Replace combination of broadcast and packet-switch by packet-flow</p>
+<h3 id="-aie-lower-core-reset"><code>-aie-lower-core-reset</code><a class="headerlink" href="#-aie-lower-core-reset" title="Permanent link">&para;</a></h3>
+<p><em>Lowers all aiex.core_reset operations to npu.maskwrite32</em></p>
 <h3 id="-aie-lower-dma-channel-reset"><code>-aie-lower-dma-channel-reset</code><a class="headerlink" href="#-aie-lower-dma-channel-reset" title="Permanent link">&para;</a></h3>
 <p><em>Lowers all aiex.dma_channel_reset operations to npu.maskwrite32</em></p>
 <h3 id="-aie-lower-dynamic-bd-pool"><code>-aie-lower-dynamic-bd-pool</code><a class="headerlink" href="#-aie-lower-dynamic-bd-pool" title="Permanent link">&para;</a></h3>
