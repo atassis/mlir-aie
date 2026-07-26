@@ -72,7 +72,23 @@ runtime-op family (the thing `aiex.core_reset`/`aiex.dma_channel_reset` belong t
 is fixed at device-configuration (CDO/xclbin build) time and can only change via a fresh configuration
 load. This matches the private-KB red-team finding this task was seeded from
 (`journal/docs/tasks/done/red-team-completeness-map.md`, finding A1) -- I independently re-derived it
-from source rather than trusting the prior note, and it holds.
+from source rather than trusting the prior note, and it holds on the register/call-site facts.
+
+Where I diverge from A1: A1 tags this `LAYER+REGIME, high` and its `next:` field says to promote it
+straight to a candidate. The register facts are LAYER (the mechanism exists a layer down and was never
+promoted); the priority call is not, once you ask whether anything needs it -- see the regime analysis
+below. This verdict supersedes A1's priority tag with a REGIME-only, non-gap classification. I've closed
+the loop on the originating task (`journal/docs/tasks/done/aiex-cascade-reconfigure-op.md`, now
+`state: done` with a Resolution section) and on `red-team-completeness-map.md`'s own `next:` field and A1
+bullet, rather than leaving this doc as the only record of the decision.
+
+One more scoping note: the originating task doc justifies its high priority/capture by citing "the brick
+catalog independently rates fused cascade-accumulator the #1 toolchain-capture item"
+(`reference/aie2p-brick-catalog.md:183`). That citation is about a different mechanism -- the in-datapath
+cascade-ADD lowering (`npu_cascade` doing buffer-copy + software-add instead of `get_scd()+local ->
+put_mcd`, tracked in `upstream-cascade-accumulator-rfc.md`), not about retargeting cascade routing
+direction between dispatches (`ACCUMULATOR_CONTROL`, what this doc evaluates). It is a misattribution for
+this specific op; don't read it as a live high-capture argument for building `cascade_reconfigure`.
 
 ## Regime question: does any planned dataflow need this without a full reconfigure?
 
