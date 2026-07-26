@@ -12,6 +12,8 @@ test/python/npu-xrt/test_iron_jit_e2e.py (requires xrt_python_bindings).
 """
 
 import json
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -312,6 +314,97 @@ def test_hash_keys_on_the_aiecc_the_compile_uses(monkeypatch):
     monkeypatch.setattr(config, "aiecc_path", fake_aiecc_path)
     CompilableDesign(_gemm_gen())._compute_cache_hash()
     assert seen, "artifact hash did not consult config.aiecc_path()"
+
+
+def test_hash_is_stable_for_a_generator_with_a_nested_function(tmp_path):
+    """A design's key must not move between processes.
+
+    Every design defines its worker body inline, so the generator's co_consts
+    holds a code object. repr() of one embeds its address, which would make the
+    key differ on every interpreter and the on-disk cache never hit.
+    """
+    script = tmp_path / "probe.py"
+    script.write_text(
+        "from aie.utils.compile.jit._hash import _compute_recipe_hash\n"
+        "def make():\n"
+        "    def design(a, b):\n"
+        "        def core(x):\n"
+        "            return x + 1\n"
+        "        return core\n"
+        "    return design\n"
+        "print(_compute_recipe_hash(make(), {}, (), ()))\n"
+    )
+    seen = {
+        subprocess.run(
+            [sys.executable, str(script)], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        for _ in range(3)
+    }
+    assert len(seen) == 1, f"recipe hash differed between processes: {seen}"
+
+
+def test_hash_distinguishes_designs_differing_only_in_a_nested_body():
+    """Making the key stable must not make it blind.
+
+    The two outer functions are byte-identical -- asserted, because if they were
+    not, the outer bytecode alone would discriminate and this would pass with a
+    broken constants walk. Only the nested body differs, so only recursion into
+    the code object can tell them apart.
+    """
+
+    def make_a():
+        def design(a, b):
+            def core(x):
+                return x + 1
+
+            return core
+
+        return design
+
+    def make_b():
+        def design(a, b):
+            def core(x):
+                return x + 2
+
+            return core
+
+        return design
+
+    outer_a, outer_b = make_a(), make_b()
+    assert (
+        outer_a.__code__.co_code == outer_b.__code__.co_code
+    ), "outer bytecode differs; this test would not exercise the nested walk"
+    assert _compute_hash(outer_a, {}, [], [], [], []) != _compute_hash(
+        outer_b, {}, [], [], [], []
+    )
+
+
+def test_hash_distinguishes_bodies_nested_past_any_fixed_depth():
+    """A bound on the walk would silently collide designs differing past it."""
+
+    def build(leaf):
+        src = f"def f0():\n    return {leaf}\n"
+        for i in range(1, 40):
+            body = "\n".join("    " + line for line in src.splitlines())
+            src = f"def f{i}():\n{body}\n    return f{i - 1}\n"
+        ns = {"__name__": "deepnest"}
+        exec(src, ns)  # noqa: S102 -- building a deep nest is the point
+        return ns["f39"]
+
+    assert _compute_hash(build(1), {}, [], [], [], []) != _compute_hash(
+        build(2), {}, [], [], [], []
+    )
+
+
+def test_hash_handles_deeply_nested_functions():
+    """Recursion into code objects must terminate on pathological nesting."""
+    src = "def f0():\n    pass\n"
+    for i in range(1, 40):
+        body = "\n".join("    " + line for line in src.splitlines())
+        src = f"def f{i}():\n{body}\n    return f{i - 1}\n"
+    ns = {"__name__": "deepnest"}
+    exec(src, ns)  # noqa: S102 -- building a deep nest is the point
+    assert len(_compute_hash(ns["f39"], {}, [], [], [], [])) == 24
 
 
 def test_hash_is_24_hex_chars():

@@ -26,6 +26,7 @@ import hashlib
 import json
 import logging
 from pathlib import Path
+from types import CodeType
 from typing import Any, Callable, Mapping
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,52 @@ def _device_identity_key(device) -> tuple[str, str, str, str]:
         str(getattr(device, "cols", "")),
         str(getattr(device, "rows", "")),
     )
+
+
+def _consts_identity(consts: tuple) -> str:
+    """Stable text for a code object's constants.
+
+    ``repr()`` of a code object embeds its memory address::
+
+        (<code object core at 0x7fd184538570, file "...", line 4>,)
+
+    so hashing it makes the recipe differ between processes for any generator
+    that defines a nested function -- which every design does, since the worker
+    body is written inline. Describe code objects by their own bytecode and
+    constants instead; every other value admitted to ``co_consts`` is a literal
+    whose ``repr`` is already stable.
+
+    Iterative rather than recursive: nesting is bounded only by what the caller
+    wrote, and a depth cap would have to truncate, which is a silent collision
+    between two generators that differ only past the cap. ``CodeType`` is
+    immutable through the public API, so the walk cannot cycle.
+    """
+    out: list[str] = ["("]
+    # (iterator, closing token, whether this frame has emitted an item yet)
+    stack: list[list] = [[iter(consts), ")", False]]
+    while stack:
+        frame = stack[-1]
+        try:
+            const = next(frame[0])
+        except StopIteration:
+            stack.pop()
+            out.append(frame[1])
+            continue
+        if frame[2]:
+            out.append(",")
+        frame[2] = True
+        if isinstance(const, CodeType):
+            out.append(f"code({const.co_name}:{const.co_code.hex()}:(")
+            stack.append([iter(const.co_consts), "))", False])
+        elif isinstance(const, tuple):
+            out.append("tuple(")
+            stack.append([iter(const), "))", False])
+        elif isinstance(const, frozenset):
+            out.append("frozenset(")
+            stack.append([iter(sorted(const, key=repr)), "))", False])
+        else:
+            out.append(repr(const))
+    return "".join(out)
 
 
 def _compute_recipe_hash(
@@ -71,7 +118,7 @@ def _compute_recipe_hash(
     else:
         code = generator.__code__
         h.update(code.co_code)
-        h.update(repr(code.co_consts).encode())
+        h.update(_consts_identity(code.co_consts).encode())
         h.update(getattr(generator, "__qualname__", "").encode())
         h.update(getattr(generator, "__module__", "").encode())
 
@@ -88,7 +135,7 @@ def _compute_recipe_hash(
             return (
                 "fn:",
                 bytes(code.co_code).hex(),
-                repr(code.co_consts),
+                _consts_identity(code.co_consts),
                 repr(getattr(v, "__defaults__", None)),
                 closure_repr,
             )
