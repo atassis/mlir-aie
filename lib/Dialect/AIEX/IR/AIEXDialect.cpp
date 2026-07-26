@@ -1366,6 +1366,68 @@ LogicalResult AIEX::CoreResetOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// BufferClearOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult AIEX::BufferClearOp::verify() {
+  const auto &targetModel = AIE::getTargetModel(*this);
+
+  // The op lowers to an npu.blockwrite; the runtime sequence has no meaning on
+  // AIE1. Reject it explicitly, as CoreResetOp and SetLockOp do.
+  if (targetModel.getTargetArch() == AIE::AIEArch::AIE1)
+    return emitOpError("aiex.buffer_clear is not supported on AIE1.");
+
+  auto tile = dyn_cast_or_null<AIE::TileOp>(getTile().getDefiningOp());
+  if (!tile)
+    return emitOpError() << "tile operand must be produced by an aie.tile op";
+  int col = tile.getCol();
+  int row = tile.getRow();
+  // The tile coordinates are bounded by aie.tile's own verifier, so this op
+  // does not re-check them for range.
+
+  // Only core and mem tiles have a local data memory module to clear. Shim
+  // tiles have none; this matches aie-rt's XAie_DataMemBlockWrite, which only
+  // accepts AIETILE and MEMTILE tile types (driver/src/memory/xaie_mem.c).
+  bool isCoreTile = targetModel.isCoreTile(col, row);
+  bool isMemTile = targetModel.isMemTile(col, row);
+  if (!isCoreTile && !isMemTile)
+    return emitOpError() << "tile (" << col << ", " << row
+                         << ") has no local data memory to clear (only core "
+                            "and mem tiles do)";
+
+  if (getLength() == 0)
+    return emitOpError() << "length must be nonzero";
+
+  // The op lowers to a single npu.blockwrite, which writes whole 32-bit words;
+  // there is no read-modify-write path for a partial leading/trailing word
+  // (unlike aie-rt's XAie_DataMemBlockWrite, which is byte-granular). Requiring
+  // a word-aligned address keeps the lowering a single, unconditional
+  // blockwrite instead of needing a maskwrite32 for a partial edge word.
+  if (getAddress() % 4 != 0)
+    return emitOpError() << "address " << getAddress()
+                         << " is not 4-byte (word) aligned";
+
+  // Bound the region against the tile's local data memory size. Core tile:
+  // getLocalMemorySize() (0x10000 bytes on AIE2P, matching aie-rt's
+  // Aie2PTileMemMod.Size in xaie2pgbl_reginit.c). Mem tile: getMemTileSize()
+  // (0x80000 bytes on AIE2P, matching Aie2PMemTileMemMod.Size). Both memories
+  // sit at local offset 0 (XAIE2PGBL_MEMORY_MODULE_DATAMEMORY and
+  // XAIE2PGBL_MEM_TILE_MODULE_DATAMEMORY are both 0 in
+  // driver/src/global/xaie2pgbl_params.h), so `address` is already a direct
+  // data-memory offset with no base to add.
+  uint64_t memSize = isCoreTile ? targetModel.getLocalMemorySize()
+                                : targetModel.getMemTileSize();
+  uint64_t regionEnd = (uint64_t)getAddress() + (uint64_t)getLength() * 4;
+  if (regionEnd > memSize)
+    return emitOpError() << "region [" << getAddress() << ", " << regionEnd
+                         << ") exceeds tile (" << col << ", " << row
+                         << ")'s local data memory size (" << memSize
+                         << " bytes)";
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // BlockFloatingPointType
 //===----------------------------------------------------------------------===//
 uint64_t AIEX::BlockFloatType::getTotalSizeInBits() const {
