@@ -12,9 +12,9 @@ Zeros a core tile's resident accumulator from the runtime sequence with the
 reloading and without re-running the compute core.
 
 The core on tile `(0, 2)` runs once and fills an 8-word accumulator `acc`
-(pinned at local address `0`) with `[1, 2, ..., 8]`. Batch 1 reads it back
-unchanged. `aiex.buffer_clear(%tile_0_2, 0, 8)` then zeros it directly from the
-sequence; I re-trigger the readback DMA with `aiex.set_lock` rather than
+(pinned at local address `0x400`) with `[1, 2, ..., 8]`. Batch 1 reads it back
+unchanged. `aiex.buffer_clear(%tile_0_2, 0x400, 8)` then zeros it directly from
+the sequence; I re-trigger the readback DMA with `aiex.set_lock` rather than
 running the core again, so the only thing that could have zeroed the
 accumulator between batch 1 and batch 2 is the op itself. Batch 2 reads back
 `[0, 0, ..., 0]`.
@@ -60,10 +60,22 @@ here, and where it would be).
 
 ## A note on this test's buffer address
 
-`acc` is pinned at local address `0` with the `address` attribute on
+`acc` is pinned at local address `0x400` with the `address` attribute on
 `aie.buffer` so `aiex.buffer_clear` (which addresses tile-local memory by
-offset, not by symbol) has a known target. I could not build this design in
-the environment I wrote it in, so I have not confirmed on a real allocator run
-that address `0` does not collide with the core's own stack or other
-compiler-placed state for this particular design; verify this on the first
-real build alongside the rest of the suite.
+offset, not by symbol) has a known target. It is not pinned at `0`: `aie.core`
+takes the ODS default `stack_size` of `0x400` when left unset, and
+`--alloc-scheme=basic-sequential` (what `run.lit` passes to `aiecc`) rejects
+any manually-pinned buffer whose address falls inside `[0, stack_size)` as
+overlapping the stack (`AIEAssignBuffers.cpp`'s
+`checkAndPrintOverlapStackframe`), so a buffer pinned at `0` on a tile with a
+core fails to compile before an xclbin is ever produced. `0x400` is the first
+word-aligned address past the default stack.
+
+This is also the sharpest argument for giving `aiex.buffer_clear` an
+`aie.buffer` symbol-addressing mode, mirroring `aiex.npu.blockwrite` /
+`aiex.npu.rtp_write`'s optional `buffer` `FlatSymbolRefAttr`: with one, this
+test (and any real caller) could target `acc` by name and let the compiler's
+own allocator place it, instead of a hand-pinned raw offset that a stack-size
+change or an added buffer earlier in the file can silently break again. Not
+implemented in this op yet; tracked as a follow-up, not a blocker for what
+this test demonstrates.
