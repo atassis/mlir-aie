@@ -16,12 +16,15 @@ module {
     %prod_lock = aie.lock(%tile_0_2, 0) {init = 1 : i32, sym_name = "prod_lock"}
     %cons_lock = aie.lock(%tile_0_2, 1) {init = 0 : i32, sym_name = "cons_lock"}
 
-    // Pinned at local address 0 (the low end of the tile's data memory, same
-    // address the compiler's own allocator would give the first buffer of a
-    // design) so the runtime sequence can target it directly with
-    // aiex.buffer_clear, which addresses tile-local data memory by offset
-    // (like aiex.npu.blockwrite's column/row form), not by symbol.
-    %acc = aie.buffer(%tile_0_2) {sym_name = "acc", address = 0 : i32} : memref<8xi32>
+    // Pinned at local address 0x400 (1024) so the runtime sequence can target
+    // it directly with aiex.buffer_clear, which addresses tile-local data
+    // memory by offset (like aiex.npu.blockwrite's column/row form), not by
+    // symbol. Address 0 is NOT safe to use here: aie.core below takes the ODS
+    // default stack_size of 0x400, and --alloc-scheme=basic-sequential (what
+    // run.lit passes to aiecc) rejects any manually-pinned buffer whose
+    // address falls inside [0, stack_size) as overlapping the stack. 0x400 is
+    // the first word-aligned address past the default stack.
+    %acc = aie.buffer(%tile_0_2) {sym_name = "acc", address = 1024 : i32} : memref<8xi32>
 
     aie.flow(%tile_0_2, DMA : 0, %tile_0_0, DMA : 0)
 
@@ -65,9 +68,9 @@ module {
       aiex.npu.dma_wait {symbol = @out0}
 
       // Clear the accumulator directly from the runtime sequence: 8 words at
-      // its pinned local offset 0. No core re-run is needed -- unlike
+      // its pinned local offset 0x400. No core re-run is needed -- unlike
       // aiex.core_reset, this op clears data memory in place.
-      aiex.buffer_clear(%tile_0_2, 0, 8)
+      aiex.buffer_clear(%tile_0_2, 1024, 8)
 
       // The mem-side DMA loop (^bb1 above) is back waiting on
       // cons_lock >= 1 after batch 1. Signal it directly from the sequence to
