@@ -1613,7 +1613,12 @@ def AIEX_DmaChannelResetOp: AIEX_Op<"dma_channel_reset", [HasParent<"AIE::Runtim
     `driver/src/dma/xaie_dma.c` for the reference loop. Resetting a channel that
     was never configured is safe: aie-rt does not gate the reset on
     configuration state, only on the channel index being in range for the tile
-    and direction.
+    and direction. A channel that *was* configured for a resident objectFIFO is
+    a different story: the reset freezes that channel's bound lock counters, so
+    each bound lock needs an `aiex.set_lock` re-arm afterward or its peer
+    deadlocks on acquire; `AIEVerifyRuntimeRearmPass` (experimental, opt-in)
+    catches the missing re-arm for a single reset and applies the same way in a
+    loop.
 
     Example:
     ```
