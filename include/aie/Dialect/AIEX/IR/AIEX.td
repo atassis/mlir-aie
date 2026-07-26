@@ -1599,6 +1599,22 @@ def AIEX_DmaChannelResetOp: AIEX_Op<"dma_channel_reset", [HasParent<"AIE::Runtim
     `tile` is an SSA `aie.tile` value, so the target is named the same way as
     `aiex.dma_configure_task`.
 
+    To reset every DMA channel on a tile, emit one `aiex.dma_channel_reset` per
+    channel in each direction: MM2S channels 0..N-1 first, then S2MM channels
+    0..N-1, where N is the tile's channel count in that direction
+    (`AIETargetModel::getNumSourceSwitchboxConnections`/
+    `getNumDestSwitchboxConnections` with `WireBundle::DMA`, the same query this
+    op's verifier uses to bound `channel`). This is exactly what aie-rt's
+    `XAie_DmaChannelResetAll` does: it is a bare loop over
+    `XAie_DmaChannelReset` for every channel, MM2S then S2MM, with no
+    additional register knowledge and no tile-wide reset-all bit underneath it.
+    A dedicated `aiex` op for this would only unroll a loop a caller can already
+    write with this op, so there isn't one; see aie-rt's
+    `driver/src/dma/xaie_dma.c` for the reference loop. Resetting a channel that
+    was never configured is safe: aie-rt does not gate the reset on
+    configuration state, only on the channel index being in range for the tile
+    and direction.
+
     Example:
     ```
       %tile = aie.tile(2, 3)
