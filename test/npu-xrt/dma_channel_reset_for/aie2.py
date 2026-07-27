@@ -54,6 +54,7 @@ def build_design():
 
             @runtime_sequence(vector_ty, vector_ty)
             def sequence(input_vector, output_vector):
+                core_reset(0, 2)
                 dma_channel_reset_for("weights")
                 npu_dma_memcpy_nd(
                     metadata=inputs,

@@ -42,7 +42,8 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  const auto instructions = loadInstructions("insts.bin");
+  const auto firstInstructions = loadInstructions("first_insts.bin");
+  const auto reuseInstructions = loadInstructions("insts.bin");
   auto device = xrt::device(0);
   auto xclbin = xrt::xclbin(std::string("final.xclbin"));
   auto kernels = xclbin.get_kernels();
@@ -58,16 +59,23 @@ int main(int argc, char **argv) {
   device.register_xclbin(xclbin);
   auto context = xrt::hw_context(device, xclbin.get_uuid());
   auto kernel = xrt::kernel(context, kernelIt->get_name());
-  auto instructionBo = xrt::bo(device, instructions.size() * sizeof(uint32_t),
-                               XCL_BO_FLAGS_CACHEABLE, kernel.group_id(1));
+  auto firstInstructionBo =
+      xrt::bo(device, firstInstructions.size() * sizeof(uint32_t),
+              XCL_BO_FLAGS_CACHEABLE, kernel.group_id(1));
+  auto reuseInstructionBo =
+      xrt::bo(device, reuseInstructions.size() * sizeof(uint32_t),
+              XCL_BO_FLAGS_CACHEABLE, kernel.group_id(1));
   auto inputBo = xrt::bo(device, kLength * sizeof(int32_t),
                          XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(3));
   auto outputBo = xrt::bo(device, kLength * sizeof(int32_t),
                           XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(4));
 
-  std::memcpy(instructionBo.map<void *>(), instructions.data(),
-              instructions.size() * sizeof(uint32_t));
-  instructionBo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  std::memcpy(firstInstructionBo.map<void *>(), firstInstructions.data(),
+              firstInstructions.size() * sizeof(uint32_t));
+  firstInstructionBo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  std::memcpy(reuseInstructionBo.map<void *>(), reuseInstructions.data(),
+              reuseInstructions.size() * sizeof(uint32_t));
+  reuseInstructionBo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   auto *input = inputBo.map<int32_t *>();
   auto *output = outputBo.map<int32_t *>();
 
@@ -79,7 +87,10 @@ int main(int argc, char **argv) {
     inputBo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     outputBo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-    auto run = kernel(3, instructionBo, instructions.size(), inputBo, outputBo);
+    auto &instructionBo = dispatch == 0 ? firstInstructionBo : reuseInstructionBo;
+    const auto instructionCount =
+        dispatch == 0 ? firstInstructions.size() : reuseInstructions.size();
+    auto run = kernel(3, instructionBo, instructionCount, inputBo, outputBo);
     ert_cmd_state state;
     try {
       state = run.wait(kDispatchTimeoutMs);
