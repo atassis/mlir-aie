@@ -9,8 +9,9 @@ import sys
 import argparse
 import numpy as np
 
-from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, Worker
-from aie.iron.device import NPU1, NPU2
+from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, Worker, WorkerRuntimeBarrier
+from aie.iron.dataflow import ObjectFifoLink
+from aie.iron.device import NPU1, NPU2, AnyMemTile
 from aie.helpers.taplib import TensorAccessPattern
 from aie.iron.controlflow import range_
 
@@ -26,12 +27,21 @@ T = int(os.environ.get("ATTN_T", 64))
 DK = int(os.environ.get("ATTN_DK", 64))
 N_QT = int(os.environ.get("ATTN_NQT", 16))  # query tiles streamed through the pipeline
 N_HEADS = int(os.environ.get("ATTN_HEADS", 1))  # data-parallel heads, one 3-tile conveyor per column
+# STREAM-IO (--stream-io) geometry: the resident modal-GEMM output shape the taps stride over.
+# SD = model hidden D (row stride of the row-major [PAD_M, SD] q/k/v/ctx buffers), PAD_M = its padded
+# row count. Parakeet: SD=1024 (8 heads x DK=128), PAD_M=512. Unused unless --stream-io is passed.
+SD = int(os.environ.get("ATTN_SD", 1024))
+PAD_M = int(os.environ.get("ATTN_PAD_M", 512))
 
 
 P = 2 * T - 1  # relative-position length (NeMo/Parakeet rel-pos)
 
 
-def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False):
+def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive_mask=False,
+          trace_size=0, trace_worker=0,
+          p_resident=False, stream_io=False, mmul=False):
+    if stream_io and not bd_onchip:
+        raise SystemExit("--stream-io is a bd_onchip-path option (device-in/out taps on the 4-stage column)")
     if bd_onchip:
         relpos = True   # BD-on-chip reuses the relpos scores kernel (q||BD belt -> stage_scores_relpos_bd)
     q_ty = np.ndarray[(TQ * DK,), np.dtype[bfloat16]]      # one query tile (fifo object)
@@ -56,8 +66,19 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False):
     sm_sfx = "_t" if TRIVIAL in (1, 2) else ""
     cx_sfx = "_t" if TRIVIAL == 1 else ""
     qbelt_ty = qbd_ty if relpos else q_ty  # query belt object: q+BD_shifted (relpos) or q (plain)
-    scores = (Kernel("stage_scores_relpos_bd", "kernels.a", [qbd_ty, k_ty, ac_ty]) if relpos
-              else Kernel("stage_scores" + sc_sfx, "kernels.a", [q_ty, k_ty, ac_ty]))
+    # t_active RTP register (int32[16], use_write_rtp) -- the scores stage reads rtp[0] at runtime to mask
+    # pad keys j>=t_active (BD-on-chip has no host belt-sentinel, so the mask must live in the kernel).
+    # Only wired for the bd_onchip path (BD-onchip attention design). One MAX-T xclbin serves
+    # any t_active<=T; t_active==T is unmasked passthrough (== stage_scores_relpos_bd byte-for-byte).
+    rtp_ty = np.ndarray[(16,), np.dtype[np.int32]]
+    if bd_onchip and tactive_mask:
+        scores = Kernel("stage_scores_relpos_bd_mask_mmul" if mmul else "stage_scores_relpos_bd_mask",
+                        "kernels.a", [qbd_ty, k_ty, ac_ty, rtp_ty])
+    elif relpos:
+        scores = Kernel("stage_scores_relpos_bd_mmul" if mmul else "stage_scores_relpos_bd",
+                        "kernels.a", [qbd_ty, k_ty, ac_ty])
+    else:
+        scores = Kernel("stage_scores" + sc_sfx, "kernels.a", [q_ty, k_ty, ac_ty])
     softmax = Kernel("stage_softmax" + sm_sfx, "kernels.a", [ac_ty, probs_ty])
     ctx_k = Kernel("stage_ctx" + cx_sfx, "kernels.a", [probs_ty, v_ty, ctx_ty])
 
@@ -110,18 +131,93 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False):
             assert P % BD_KB == 0, f"streaming needs P({P}) %% BD_KB({BD_KB}) == 0"
             pblk_ty = np.ndarray[(BD_KB * DK,), np.dtype[bfloat16]]
             block_k = Kernel("bd_block_bake", "kernels.a", [qpv_ty, pblk_ty])
-            emit_k = Kernel("bd_emit_bake", "kernels.a", [qpv_ty, qbd_ty])
+            # t_active-aware emit (bd_emit_bake_ta) when masking: rel_shift base uses t_active (rtp[0]),
+            # matching relpos_mha.cc, so short clips get the correct rel-pos alignment (not the BUILT_T base).
+            emit_k = (Kernel("bd_emit_bake_ta", "kernels.a", [qpv_ty, qbd_ty, rtp_ty]) if tactive_mask
+                      else Kernel("bd_emit_bake", "kernels.a", [qpv_ty, qbd_ty]))
         else:
+            assert not tactive_mask, "t_active mask targets the real-dims streaming p path (stream_p)"
             bd_k = Kernel("stage_bd_bake", "kernels.a", [qpv_ty, p_full_ty, qbd_ty])
 
+        # ---- TASK 2 (p-resident-read-once) HOOK -------------------------------------------------------
+        # Today (default, KNOWN-GOOD) the p fill is STREAM-A: ONE shim BD re-reads p from L3 N_QT times
+        # (the ptap outer dim = N_QT at stride 0, below). That is the 22x p re-read the spec (sec 2c) wants
+        # to kill by staging p ONCE in a MemTile (L2, 512 KB; p=88 KB fits) and re-forwarding on-chip.
+        # WARNING (banked device evidence, relpos_rowtiled_stream_iron.py KPV-REPLAY note): the naive
+        # L2->L1 `.forward(repeat_count=N_QT)` was BUILT but FAILED parity on device (corr 0.65, rel-L2
+        # 0.82) -- the MemTile replay did NOT restart per query tile, so tile q saw the wrong p-blocks. The
+        # per-query-tile rt.fill loop (N_QT calls) is correct-in-principle but emits N_QT shim BDs > the
+        # 16-BD tile budget. So p_resident is a DEVICE-ITERATED step, not a drop-in: it needs a MemTile
+        # replay that restarts its L2 read per tile (candidate: split the p MemTile fifo so the L2->L1 hop
+        # re-anchors at p offset 0 each tile; verify with run_bd_onchip.py rel-L2<=5e-3 at H=1 BEFORE H=4).
+        # Guarded off so the default build stays the validated STREAM-A path; flip via --p-resident once
+        # the topology below is proven on device.
+        # RESOLUTION of the hook above. The failed attempt used `.forward(repeat_count=N_QT)` on a
+        # fifo whose OBJECT was one BD_KB block: the MemTile then replayed a block-sized BD, so the
+        # replay resumed wherever the read pointer happened to sit instead of re-anchoring at p row 0
+        # -- query tile q saw the wrong blocks (corr 0.65, rel-L2 0.82).
+        #
+        # The fix is to make the replayed unit the WHOLE p table rather than a block, using asymmetric
+        # transfer granularity: the producer (L3 -> MemTile) sends one P-row object, the consumer
+        # (MemTile -> L1) receives it as NBLK BD_KB-row objects (consumer_obj_type), and repeat_count
+        # replays that whole-table BD N_QT times "without a new DMA transfer from L3". Re-anchoring at
+        # row 0 each tile is then structural -- it is the start of the replayed BD -- rather than
+        # something the block-sized replay had to be coaxed into. p is read from L3 ONCE per dispatch
+        # instead of N_QT=22 times, which is the movement this whole step exists to kill.
+        # The worker is UNCHANGED: it still acquires NBLK block objects per query tile.
+        # STILL GUARDED, but the blocker is now IDENTIFIED rather than guessed. The old note framed it
+        # as "the replay did not restart", implying a coaxing problem. It is structural:
+        #
+        #   aie.objectfifo verifier: "`repeat_count` unavailable for shim tiles"
+        #
+        # The p fifo's producer IS the shim (L3), so the replay cannot live on it at all -- no amount of
+        # tap or depth tuning on the current one-hop fifo can work. It needs TWO hops, L3 -> MemTile ->
+        # L1, with BOTH of these on the second hop:
+        #   * consumer_obj_type=pblk_ty  -- producer holds the whole P-row table, consumer takes BD_KB
+        #     blocks, so the replayed unit is the TABLE and re-anchoring at row 0 is structural (this is
+        #     what the block-sized replay could never give: it resumed wherever the read pointer sat,
+        #     hence corr 0.65).
+        #   * repeat_count=N_QT          -- replays that whole-table BD "without a new DMA transfer from
+        #     L3", which is the 22x read-once win.
+        # ObjectFifoHandle.forward() CANNOT express this: it delegates to split(), which forwards
+        # obj_types/depths/repeat_counts but has no consumer_obj_type parameter. So the second hop has to
+        # be built explicitly (candidate: construct the L2 fifo with both kwargs and join the hops with
+        # an ObjectFifoLink on AnyMemTile) -- verify at H=1 with run_bd_onchip.py rel-L2<=5e-3 BEFORE H=4.
         of_qpv = [ObjectFifo(qpv_ty, name=f"qpv{h}", depth=2) for h in range(H)]
-        of_p = [ObjectFifo(pblk_ty if stream_p else p_full_ty, name=f"p{h}", depth=2 if stream_p else 1) for h in range(H)]
+        of_p_l3 = None
+        if p_resident:
+            if not stream_p:
+                raise SystemExit("--p-resident targets the streaming-p real-dims path (p > L1)")
+            assert P % BD_KB == 0, f"p-resident needs P({P}) % BD_KB({BD_KB}) == 0"
+            # Hop 1: L3 -> MemTile, the WHOLE P-row table, ONCE per dispatch (no N_QT outer replay).
+            of_p_l3 = [ObjectFifo(p_full_ty, name=f"pL3{h}", depth=1) for h in range(H)]
+            # Hop 2: MemTile -> L1. The fifo's OBJECT is the whole table (so the replayed BD spans the
+            # table and re-anchors at row 0 every replay), while the CONSUMER takes BD_KB-row blocks --
+            # that asymmetry is the whole trick, and it is why forward() could not express this.
+            of_p = [ObjectFifo(p_full_ty, name=f"p{h}", depth=1,
+                               consumer_obj_type=pblk_ty, repeat_count=N_QT) for h in range(H)]
+            # Join the hops on a MemTile (mirrors what split() does internally: build the link and drop
+            # it -- it registers itself as the endpoints' link).
+            for h in range(H):
+                _ = ObjectFifoLink(of_p_l3[h].cons(), [of_p[h].prod()], AnyMemTile, [], [0])
+        else:
+            of_p = [ObjectFifo(pblk_ty if stream_p else p_full_ty, name=f"p{h}", depth=2 if stream_p else 1) for h in range(H)]
         of_bd = [ObjectFifo(qbd_ty, name=f"bd{h}", depth=1) for h in range(H)]
         of_k = [ObjectFifo(k_ty, name=f"k{h}", depth=1) for h in range(H)]
         of_v = [ObjectFifo(v_ty, name=f"v{h}", depth=1) for h in range(H)]
         of_ac = [ObjectFifo(ac_ty, name=f"ac{h}", depth=2) for h in range(H)]
         of_pr = [ObjectFifo(probs_ty, name=f"probs{h}", depth=2) for h in range(H)]
         of_ctxh = [ObjectFifo(ctx_ty, name=f"ctx{h}", depth=2) for h in range(H)]
+        # TASK 1 (t_active in-kernel key-mask): per-head RTP register + runtime barrier. The scores worker
+        # reads rtp[0]=t_active and masks pad keys j>=t_active. One rtp buffer per head column (each head's
+        # scores stage is its own core); all set to the same t_active per dispatch. Mirrors the proven
+        # relpos_rowtiled_stream_iron.py STEP-C rtp barrier. Inert when --tactive-mask is off.
+        tactive_rtp = [Buffer(rtp_ty, name=f"tactive_rtp{h}", use_write_rtp=True) for h in range(H)] if tactive_mask else None
+        rtp_bar = [WorkerRuntimeBarrier() for h in range(H)] if tactive_mask else None
+        # separate rtp for the BD (emit) stage core -- use_write_rtp is per-core, so the scores core and
+        # the BD core each need their own t_active register (both set to the same value per dispatch).
+        tactive_bd_rtp = [Buffer(rtp_ty, name=f"tactive_bd_rtp{h}", use_write_rtp=True) for h in range(H)] if tactive_mask else None
+        rtp_bd_bar = [WorkerRuntimeBarrier() for h in range(H)] if tactive_mask else None
 
         def bd_stream_w(f_qpv, f_p, f_bd, k_block, k_emit):
             for _ in range_(N_QT):
@@ -131,6 +227,16 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False):
                 ebd = f_bd.acquire(1); k_emit(eqpv, ebd)
                 f_qpv.release(1); f_bd.release(1)
 
+        # t_active-aware BD worker: waits for the runtime rtp write, then passes rtp into the emit kernel.
+        def bd_stream_w_ta(f_qpv, f_p, f_bd, k_block, k_emit, rtp, bar):
+            bar.wait_for_value(1)
+            for _ in range_(N_QT):
+                eqpv = f_qpv.acquire(1)
+                for _ in range_(NBLK):
+                    epb = f_p.acquire(1); k_block(eqpv, epb); f_p.release(1)
+                ebd = f_bd.acquire(1); k_emit(eqpv, ebd, rtp)
+                f_qpv.release(1); f_bd.release(1)
+
         def bd_res_w(f_qpv, f_p, f_bd, k_bd):
             ep = f_p.acquire(1)
             for _ in range_(N_QT):
@@ -138,12 +244,45 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False):
                 f_qpv.release(1); f_bd.release(1)
             f_p.release(1)
 
-        def stg_a(f_bd, f_k, f_ac, k_sc):
+        # MMUL variant: k is filled ONCE per dispatch (the tiling tap spent the 4th dim, so the
+        # N_QT stride-0 replay is gone), so acquire it ONCE and hold. This is the pairing the old
+        # comment below warns about -- acquire-once was only broken while the FILL still had N_QT
+        # replays pending. Both sides move together here, which is what makes it consistent.
+        def stg_a_mmul(f_bd, f_k, f_ac, k_sc):
             ek = f_k.acquire(1)
             for _ in range_(N_QT):
                 ebd = f_bd.acquire(1); eac = f_ac.acquire(1); k_sc(ebd, ek, eac)
                 f_bd.release(1); f_ac.release(1)
             f_k.release(1)
+
+        def stg_a_mask_mmul(f_bd, f_k, f_ac, k_sc, rtp, bar):
+            bar.wait_for_value(1)
+            ek = f_k.acquire(1)
+            for _ in range_(N_QT):
+                ebd = f_bd.acquire(1); eac = f_ac.acquire(1); k_sc(ebd, ek, eac, rtp)
+                f_bd.release(1); f_ac.release(1)
+            f_k.release(1)
+
+        def stg_a(f_bd, f_k, f_ac, k_sc):
+            # RELOAD FIX: re-acquire k PER TILE to match the stride-0 replay fill (kvtap outer dim
+            # N_QT). Acquire-once-and-hold left N_QT-1 replayed fills pending -> corrupted the next
+            # dispatch's fifo state (only the first dispatch per hw-context activation was correct).
+            # Per-tile acquire re-reads the SAME on-chip k (stride 0) but cycles the lock cleanly, so
+            # every dispatch reloads its own weights -- the shipped relpos + host-BD conveyor pattern.
+            for _ in range_(N_QT):
+                ek = f_k.acquire(1)
+                ebd = f_bd.acquire(1); eac = f_ac.acquire(1); k_sc(ebd, ek, eac)
+                f_bd.release(1); f_ac.release(1); f_k.release(1)
+
+        # t_active-masked scores worker: waits for the runtime to write rtp[0]=t_active, then passes rtp
+        # into the mask kernel each tile so pad keys j>=t_active are nulled in the softmax.
+        def stg_a_mask(f_bd, f_k, f_ac, k_sc, rtp, bar):
+            bar.wait_for_value(1)
+            # RELOAD FIX: per-tile k acquire (see stg_a) so each dispatch reloads its own k.
+            for _ in range_(N_QT):
+                ek = f_k.acquire(1)
+                ebd = f_bd.acquire(1); eac = f_ac.acquire(1); k_sc(ebd, ek, eac, rtp)
+                f_bd.release(1); f_ac.release(1); f_k.release(1)
 
         def stg_b(f_ac, f_probs, k_sm):
             for _ in range_(N_QT):
@@ -151,41 +290,149 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False):
                 f_ac.release(1); f_probs.release(1)
 
         def stg_c(f_probs, f_v, f_ctx, k_cx):
-            ev = f_v.acquire(1)
+            # RELOAD FIX: per-tile v acquire (see stg_a) so each dispatch reloads its own v.
             for _ in range_(N_QT):
+                ev = f_v.acquire(1)
                 ep2 = f_probs.acquire(1); ec = f_ctx.acquire(1); k_cx(ep2, ev, ec)
-                f_probs.release(1); f_ctx.release(1)
-            f_v.release(1)
+                f_probs.release(1); f_ctx.release(1); f_v.release(1)
 
         wl = []
         for h in range(H):
-            if stream_p:
+            if stream_p and tactive_mask:
+                wl.append(Worker(bd_stream_w_ta, [of_qpv[h].cons(), of_p[h].cons(), of_bd[h].prod(),
+                                                  block_k, emit_k, tactive_bd_rtp[h], rtp_bd_bar[h]], stack_size=0x1000))
+            elif stream_p:
                 wl.append(Worker(bd_stream_w, [of_qpv[h].cons(), of_p[h].cons(), of_bd[h].prod(), block_k, emit_k], stack_size=0x1000))
             else:
                 wl.append(Worker(bd_res_w, [of_qpv[h].cons(), of_p[h].cons(), of_bd[h].prod(), bd_k], stack_size=0x1000))
-            wl.append(Worker(stg_a, [of_bd[h].cons(), of_k[h].cons(), of_ac[h].prod(), scores]))
+            if tactive_mask:
+                wl.append(Worker(stg_a_mask_mmul if mmul else stg_a_mask,
+                                 [of_bd[h].cons(), of_k[h].cons(), of_ac[h].prod(), scores,
+                                  tactive_rtp[h], rtp_bar[h]]))
+            else:
+                wl.append(Worker(stg_a_mmul if mmul else stg_a,
+                                 [of_bd[h].cons(), of_k[h].cons(), of_ac[h].prod(), scores]))
             wl.append(Worker(stg_b, [of_ac[h].cons(), of_pr[h].prod(), softmax], stack_size=0x1000))
             wl.append(Worker(stg_c, [of_pr[h].cons(), of_v[h].cons(), of_ctxh[h].prod(), ctx_k]))
 
         QPVE = N_QT * 2 * TQ * DK
-        qpv_all_ty = np.ndarray[(H * QPVE,), np.dtype[bfloat16]]
+        # ---- STREAM-IO (device-in/device-out) -------------------------------------------------------
+        # DEFAULT (host-packed): every runtime buffer is head-major and pre-packed by the host --
+        # q+bias into an interleaved qu||qv belt, k/v gathered per head, ctx drained head-major and
+        # re-uploaded for linear_out. That host pack IS the round-trip this seam deletes.
+        #
+        # STREAM-IO instead reads q/k/v straight out of the resident modal-GEMM outputs, which are
+        # row-major bf16 [PAD_M, SD] (SD = model hidden D; head h occupies columns h*DK..(h+1)*DK).
+        # Every per-head gather is then just a STRIDE on the existing fill: the row step becomes SD
+        # instead of DK and the base becomes h*DK. Identical bytes moved, no repack, no kernel change.
+        #   qu/qv: ONE buffer holding two [PAD_M, SD] planes (qu then qv). The 4-D tap walks
+        #          (tile, plane, row, col), so it reproduces the interleaved qu||qv belt object the
+        #          BD stage already consumes -- the 5-BO ABI and every kernel signature are untouched.
+        #          The two planes are what lets the host fold pos_bias_u/v in as the affine-cast BETA
+        #          (gamma=1, beta=bias) rather than adding the bias on host or in-kernel.
+        #   ctx:   drains directly into a [PAD_M, SD] bf16 buffer = linear_out's A input.
+        # p stays host-packed head-major: pos_enc is not on the resident stream (it is a function of
+        # clip length, not of x), so it is genuinely outside the fused frontier.
+        # A group of H<SD/DK heads reads its slice via a host-side sub-buffer (shim_bo_subbuffer),
+        # so H=4x2 needs no second xclbin and H=8-in-1 later needs no host change.
+        if stream_io:
+            assert SD % DK == 0, f"stream-io: SD({SD}) must be a multiple of DK({DK})"
+            assert H * DK <= SD, f"stream-io: H({H})*DK({DK}) exceeds SD({SD})"
+            assert PAD_M >= N_QT * TQ, f"stream-io: PAD_M({PAD_M}) < N_QT*TQ({N_QT * TQ})"
+            qpv_all_ty = np.ndarray[(2 * PAD_M * SD,), np.dtype[bfloat16]]  # qu plane | qv plane
+            k_all_ty = np.ndarray[(PAD_M * SD,), np.dtype[bfloat16]]
+            v_all_ty = np.ndarray[(PAD_M * SD,), np.dtype[bfloat16]]
+            c_all_ty = np.ndarray[(PAD_M * SD,), np.dtype[bfloat16]]
+        else:
+            qpv_all_ty = np.ndarray[(H * QPVE,), np.dtype[bfloat16]]
+            k_all_ty = np.ndarray[(H * T * DK,), np.dtype[bfloat16]]
+            v_all_ty = np.ndarray[(H * T * DK,), np.dtype[bfloat16]]
+            c_all_ty = np.ndarray[(H * N_QT * TQ * DK,), np.dtype[bfloat16]]
         p_all_ty = np.ndarray[(H * P * DK,), np.dtype[bfloat16]]
-        k_all_ty = np.ndarray[(H * T * DK,), np.dtype[bfloat16]]
-        v_all_ty = np.ndarray[(H * T * DK,), np.dtype[bfloat16]]
-        c_all_ty = np.ndarray[(H * N_QT * TQ * DK,), np.dtype[bfloat16]]
         with rt.sequence(qpv_all_ty, p_all_ty, k_all_ty, v_all_ty, c_all_ty) as (QPV, PP, K, V, CTX):
             rt.start(*wl)
+            if tactive_mask:
+                # Bake t_active = T (full length) as the DEFAULT immediate; the host patches this word in
+                # insts.bin per dispatch for shorter clips (mirrors RELPOS_TACTIVE_WORD). Unpatched = T =
+                # unmasked passthrough (correct for T==BUILT_T + the run_bd_onchip.py standalone gate).
+                def _mk_set(val):
+                    def _set(p):
+                        p[0] = val
+                    return _set
+                for h in range(H):
+                    rt.inline_ops(_mk_set(T), [tactive_rtp[h]])
+                    rt.set_barrier(rtp_bar[h], 1)
+                    rt.inline_ops(_mk_set(T), [tactive_bd_rtp[h]])   # BD-stage core: same t_active
+                    rt.set_barrier(rtp_bd_bar[h], 1)
             for h in range(H):
-                rt.fill(of_qpv[h].prod(), QPV, tap=TensorAccessPattern([H * QPVE], h * QPVE, [N_QT, 1, 1, 2 * TQ * DK], [2 * TQ * DK, 0, 0, 1]))
-                if stream_p:
-                    ptap = TensorAccessPattern([H * P * DK], h * P * DK, [N_QT, NBLK, BD_KB, DK], [0, BD_KB * DK, DK, 1])
+                if stream_io:
+                    # (tile, plane, row, col) over [2, PAD_M, SD]: plane 0 = qu, plane 1 = qv, so one
+                    # tap emits the qu||qv belt object. Tile step = TQ rows; plane step = one PAD_M*SD
+                    # plane; row step = SD (the row-major GEMM stride); col step = 1.
+                    qtap = TensorAccessPattern([2 * PAD_M * SD], h * DK,
+                                               [N_QT, 2, TQ, DK], [TQ * SD, PAD_M * SD, SD, 1])
+                    # k/v: whole [T, DK] head slice, stride-0 replayed per query tile (as before).
+                    # MMUL: hand the scores core a PRE-TILED k. The mmul tile order is only a 4-D
+                    # strided read of the same L3 bytes -- sizes [T/t, DK/s, t, s], strides
+                    # [t*SD, s, SD, 1] -- so the shim does the tiling for free. It costs the N_QT
+                    # stride-0 replay (4 dims is the shim's limit), which is a WIN not a price: k is
+                    # then read from L3 ONCE per dispatch instead of 22x. Worker acquires once to match.
+                    kvtap = (TensorAccessPattern([PAD_M * SD], h * DK,
+                                                 [T // 8, DK // 8, 8, 8], [8 * SD, 8, SD, 1])
+                             if mmul else
+                             TensorAccessPattern([PAD_M * SD], h * DK, [N_QT, 1, T, DK], [0, 0, SD, 1]))
+                    vtap = TensorAccessPattern([PAD_M * SD], h * DK, [N_QT, 1, T, DK], [0, 0, SD, 1])
+                    ctap = TensorAccessPattern([PAD_M * SD], h * DK,
+                                               [N_QT, 1, TQ, DK], [TQ * SD, 0, SD, 1])
                 else:
-                    ptap = TensorAccessPattern([H * P * DK], h * P * DK, [N_QT, 1, P, DK], [0, 0, DK, 1])
-                rt.fill(of_p[h].prod(), PP, tap=ptap)
-                kvtap = TensorAccessPattern([H * T * DK], h * T * DK, [N_QT, 1, T, DK], [0, 0, DK, 1])
+                    qtap = TensorAccessPattern([H * QPVE], h * QPVE, [N_QT, 1, 1, 2 * TQ * DK], [2 * TQ * DK, 0, 0, 1])
+                    kvtap = (TensorAccessPattern([H * T * DK], h * T * DK,
+                                                 [T // 8, DK // 8, 8, 8], [8 * DK, 8, DK, 1])
+                             if mmul else
+                             TensorAccessPattern([H * T * DK], h * T * DK, [N_QT, 1, T, DK], [0, 0, DK, 1]))
+                    vtap = TensorAccessPattern([H * T * DK], h * T * DK, [N_QT, 1, T, DK], [0, 0, DK, 1])
+                    ctap = TensorAccessPattern([H * N_QT * TQ * DK], h * N_QT * TQ * DK, [N_QT, 1, TQ, DK], [TQ * DK, 0, DK, 1])
+                rt.fill(of_qpv[h].prod(), QPV, tap=qtap)
+                if p_resident:
+                    # ONE pass over p straight into hop 1: no N_QT outer replay from L3. The MemTile
+                    # does the replaying, so the shim fill is a single table read per dispatch.
+                    ptap = TensorAccessPattern([H * P * DK], h * P * DK, [1, 1, P, DK], [0, 0, DK, 1])
+                    rt.fill(of_p_l3[h].prod(), PP, tap=ptap)
+                else:
+                    if stream_p:
+                        ptap = TensorAccessPattern([H * P * DK], h * P * DK, [N_QT, NBLK, BD_KB, DK], [0, BD_KB * DK, DK, 1])
+                    else:
+                        ptap = TensorAccessPattern([H * P * DK], h * P * DK, [N_QT, 1, P, DK], [0, 0, DK, 1])
+                    rt.fill(of_p[h].prod(), PP, tap=ptap)
                 rt.fill(of_k[h].prod(), K, tap=kvtap)
-                rt.fill(of_v[h].prod(), V, tap=kvtap)
-                rt.drain(of_ctxh[h].cons(), CTX, tap=TensorAccessPattern([H * N_QT * TQ * DK], h * N_QT * TQ * DK, [N_QT, 1, TQ, DK], [TQ * DK, 0, DK, 1]), wait=True)
+                rt.fill(of_v[h].prod(), V, tap=vtap)
+                rt.drain(of_ctxh[h].cons(), CTX, tap=ctap, wait=True)
+            # Per-stage occupancy instrument. `trace_size=0` (production) leaves the design
+            # byte-identical; non-zero appends a dedicated trace buffer at the TAIL of the
+            # runtime_sequence so QPV/PP/K/V/CTX keep their group ids and the Rust ABI is untouched.
+            #
+            # Traces head 0's FOUR stages (bd -> scores -> softmax -> ctx), which is the whole point:
+            # conveyor_bd_dev is the encoder's most expensive op at 3.93 ms/command and we have never
+            # measured WHICH of its four pipeline stages rate-limits it. A pipeline runs at its slowest
+            # stage; the MAC-count argument says BD (8*351*128) is ~2x the scores stage (8*176*128) but
+            # that is arithmetic, not a measurement.
+            #
+            # Build this at ATTN_HEADS=1: trace egress needs a free shim channel and the production H=4
+            # build spends 4 in-streams per head, so the traced variant must shrink (the recipe in
+            # method-profile-a-brick-with-enable-trace, gotcha 1). Every head runs the identical
+            # 4-stage pipeline, so H=1 is representative of the STAGE BALANCE -- it is NOT
+            # representative of production wall time, where 4 heads share the shim.
+            if trace_size:
+                # ONE WORKER PER BUILD by default (`trace_worker`, 0=BD 1=scores 2=softmax 3=ctx).
+                # Tracing all four into a SHARED ring does not work here: the BD core emits ~10x the
+                # events of the others (22 tiles x 9 blocks = 198 bd_block_bake calls vs 22 calls per
+                # other stage), so it floods the ring, the other stages capture only 16-17 of their 22
+                # invocations, and BD itself yields ZERO complete event pairs. Measured, not guessed:
+                # at 64 KB the whole ring came back full with 0 decodable invocations on every core,
+                # and at 1 MB three stages decoded partially while BD still decoded nothing.
+                # trace_worker=-1 restores the all-four shared ring for comparison.
+                sel = wl[:4] if trace_worker < 0 else [wl[trace_worker]]
+                rt.enable_trace(trace_size=trace_size, workers=sel, egress_shim_col=1)
     else:
         # k, V are read-only weights. At real dims (T*DK bf16 = 44 KB) a depth-2 weight fifo blows the
         # 64 KB L1, so depth-1. Structure = the validated per-tile-acquire + stride-0 replay tap (the
@@ -287,6 +534,25 @@ ap.add_argument("--trivial", type=int, default=0, help="0=real; 1=all trivial; 2
 ap.add_argument("--relpos", action="store_true", help="fused relpos scores stage (on-chip AC+BD+rel_shift)")
 ap.add_argument("--relpos-bd-onchip", dest="bd_onchip", action="store_true",
                 help="BD on-chip as a 4th stage (BD->scores->softmax->ctx); H=1 N_QT=1 arithmetic gate")
+ap.add_argument("--tactive-mask", dest="tactive_mask", action="store_true",
+                help="in-kernel t_active RTP key-mask on the bd_onchip scores stage (variable-length clips)")
+ap.add_argument("--p-resident", dest="p_resident", action="store_true",
+                help="[device-iterated] stage p once in a MemTile, re-stream on-chip (kills the 22x L3 re-read)")
+ap.add_argument("--trace-worker", type=int, default=0, dest="trace_worker",
+                help="which head-0 stage to trace: 0=BD 1=scores 2=softmax 3=ctx, -1=all four "
+                     "(shared ring; BD floods it -- see the note at the enable_trace call)")
+ap.add_argument("-t", "--trace_size", type=int, default=0, dest="trace_size",
+                help="non-zero enables per-stage IRON trace on head 0 (build with ATTN_HEADS=1; "
+                     "trace egress needs a free shim channel). 0 = production, byte-identical.")
+ap.add_argument("--mmul", dest="mmul", action="store_true",
+                help="scores stage via the vendored aie::mmul 2x2 register block (r,s,t)=(4,8,8); "
+                     "k is DMA-tiled and read once per dispatch instead of replayed 22x")
+ap.add_argument("--stream-io", dest="stream_io", action="store_true",
+                help="device-in/out taps: read q/k/v from row-major [PAD_M,SD] bf16 GEMM outputs and "
+                     "drain ctx into one, deleting the host pack (ATTN_SD / ATTN_PAD_M set the geometry)")
 opts = ap.parse_args(sys.argv[1:])
 dev = NPU2() if opts.device == "npu2" else NPU1()
-print(build(dev, mono=opts.mono, TRIVIAL=opts.trivial, relpos=opts.relpos, bd_onchip=opts.bd_onchip))
+print(build(dev, mono=opts.mono, TRIVIAL=opts.trivial, relpos=opts.relpos, bd_onchip=opts.bd_onchip,
+            tactive_mask=opts.tactive_mask, p_resident=opts.p_resident, stream_io=opts.stream_io,
+            mmul=opts.mmul,
+            trace_size=opts.trace_size, trace_worker=opts.trace_worker))
