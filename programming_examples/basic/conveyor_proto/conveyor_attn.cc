@@ -22,9 +22,131 @@
 #ifndef ATTN_P
 #define ATTN_P (2 * ATTN_T - 1) // relative-position length (NeMo/Parakeet rel-pos)
 #endif
+#ifndef ATTN_NQT
+// Query tiles per dispatch. Hoisted HERE from ~700 lines down, where it sat BELOW its first use in
+// bd_emit_bake: a clean build then only worked if -DATTN_NQT was passed, and conveyor_prebuild.sh
+// does not pass it. The staged xclbin survived only because that script early-exits when the file
+// already exists, so the breakage stayed invisible until the first real rebuild.
+#define ATTN_NQT 1
+#endif
 
 static constexpr float LOG2E = 1.4426950408889634f;
 static constexpr int VL = 16;
+
+// ============================ aie::mmul PATH (scores + BD) ============================
+// Both matmul stages were `aie::mac` + `aie::reduce_add` PER OUTPUT ELEMENT -- a horizontal
+// reduce for every scalar of C. Traced on device: scores 279,093 cyc/query-tile and BD 226,152
+// against ~180k/359k MACs, i.e. ~18x fewer MAC/cycle than the vendored mm.cc GEMM. The internal
+// control was the ctx stage: identical MAC count to scores, 4x the throughput, purely because its
+// contraction axis vectorizes along the output. This replaces the horizontal reduce with the
+// vendored 2x2-register-block mmul kernel (aie_kernels/aie2p/mm.cc:78-211).
+//
+// SHAPE: (r,s,t) = (4,8,8), NOT (8,8,8). mm.cc's 2x2 expansion consumes TWO block-rows and TWO
+// block-cols per iteration and asserts `m % (2*r) == 0` / `n % (2*t) == 0`. With TQ=8 and r=8 the
+// A side is rowA=1, so the kernel would read block-row 1 out of bounds -- it does not compile,
+// let alone run. r=4 gives rowA = 8/4 = 2, the minimum the 2x2 block admits. colA = DK/s = 16,
+// colB = T/t = 22. mmul_bf16_bf16<4,8,8> is a real aie2p shape (aie_api mmul_bf16_bf16.hpp) and
+// matmul_vectorized_4x8x8_bf16_f32 is already a vendored instantiation. The 2x2 register block
+// itself is copied UNWIDENED -- 4x4 was measured ~10x slower on aie2p (accumulator spill).
+#ifndef ATTN_MMUL
+#define ATTN_MMUL 1
+#endif
+#if ATTN_MMUL
+static constexpr int MM_R = 4, MM_S = 8, MM_T = 8;
+
+// WHERE THE TILING HAPPENS, and why it is not here.
+// mm.cc wants A as r x s tiles and (with b_row_maj=false) B as t x s tiles, the tiles themselves in
+// row-major order. Ours arrive plain row-major. Tiling them ON THIS CORE was costed and REJECTED:
+// the permutation is a scalar/short-vector shuffle, so tiling k[176,128] costs ~2816 8-wide vector
+// ops against the 704 mmul instructions the whole query tile needs -- 4x the matmul it feeds. The
+// same arithmetic kills per-block tiling of BD's p.
+//
+// So neither operand is tiled on-core:
+//   * k  -- tiled by the SHIM DMA. The tile order is just a 4-D strided read of the same L3 bytes
+//           (sizes [T/t, DK/s, t, s], strides [t*SD, s, SD, 1]), which is exactly what a
+//           TensorAccessPattern expresses. Free, and it forces the k fill to lose its N_QT
+//           stride-0 replay -- 4 dims are all the shim has -- which is itself the 22x-read-once win.
+//   * q  -- tiled by the BD core, which already copies q_pass into the belt head byte-for-byte
+//           (bd_emit_bake). Reordering that copy costs nothing it was not already paying.
+// Kept here only as the reference definition of the layout both producers must match:
+//   A_tiled[((z*colA + c)*r + rr)*s + ss] = A[(z*r + rr)*K + (c*s + ss)]
+//   B_tiled[((j*colA + c)*t + tt)*s + ss] = Bt[(j*t + tt)*K + (c*s + ss)]   (Bt = k, p: [n,K])
+// The permutation is confined within each group of R rows, which is what lets the q producer do it
+// with a single R*K scratch and no second buffer.
+template <int R, int S, int K>
+static inline void mm_tile_rows(const bfloat16 *__restrict src, bfloat16 *__restrict dst, int rows) {
+  constexpr int CA = K / S;
+  for (int g = 0; g < rows / R; g++) {
+    const bfloat16 *sblk = src + g * R * K;
+    bfloat16 *dblk = dst + g * R * K;
+    for (int c = 0; c < CA; c++)
+      for (int rr = 0; rr < R; rr++)
+        for (int ss = 0; ss < S; ss++)
+          dblk[(c * R + rr) * S + ss] = sblk[rr * K + c * S + ss];
+  }
+}
+
+// The vendored 2x2 register block, transcribed from mm.cc:78-211 with b_row_maj=false /
+// c_row_maj=true (our B^T -- k[T,DK] / p[pb,DK] row-major -- is exactly the [n,k] tiled layout
+// that path expects, loaded with an in-register aie::transpose). Accumulators start at ZERO here
+// rather than loading C: every call computes a complete K reduction, so there is no partial to
+// carry, and skipping the load also skips needing C initialised.
+template <unsigned rowA, unsigned colA, unsigned colB>
+static inline void mm_2x2_bf16_f32(const bfloat16 *__restrict pA,
+                                   const bfloat16 *__restrict pB,
+                                   float *__restrict pC) {
+  using MMUL = aie::mmul<MM_R, MM_S, MM_T, bfloat16, bfloat16, accauto>;
+  static_assert(rowA % 2 == 0, "2x2 block needs an even rowA");
+  static_assert(colB % 2 == 0, "2x2 block needs an even colB");
+
+  for (unsigned z = 0; z < rowA; z += 2)
+    chess_prepare_for_pipelining chess_loop_range(1, ) {
+      float *__restrict pC1 = pC + (z * colB) * MMUL::size_C;
+      float *__restrict pC2 = pC + ((z + 1) * colB) * MMUL::size_C;
+
+      for (unsigned j = 0; j < colB; j += 2) {
+        const bfloat16 *__restrict pA1 = pA + (z * colA) * MMUL::size_A;
+        const bfloat16 *__restrict pA2 = pA + ((z + 1) * colA) * MMUL::size_A;
+        const bfloat16 *__restrict pB1 = pB + (j * colA) * MMUL::size_B;
+        const bfloat16 *__restrict pB2 = pB + ((j + 1) * colA) * MMUL::size_B;
+
+        aie::vector<bfloat16, MMUL::size_A> A0, A1;
+        aie::vector<bfloat16, MMUL::size_B> B0, B1;
+
+        MMUL C00(aie::zeros<accfloat, MMUL::size_C>());
+        MMUL C01(aie::zeros<accfloat, MMUL::size_C>());
+        MMUL C10(aie::zeros<accfloat, MMUL::size_C>());
+        MMUL C11(aie::zeros<accfloat, MMUL::size_C>());
+
+        for (unsigned i = 0; i < colA; ++i) {
+          A0 = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
+          A1 = aie::load_v<MMUL::size_A>(pA2); pA2 += MMUL::size_A;
+          B0 = aie::transpose(aie::load_v<MMUL::size_B>(pB1), MM_T, MM_S);
+          pB1 += MMUL::size_B;
+          B1 = aie::transpose(aie::load_v<MMUL::size_B>(pB2), MM_T, MM_S);
+          pB2 += MMUL::size_B;
+          C00.mac(A0, B0);
+          C01.mac(A0, B1);
+          C10.mac(A1, B0);
+          C11.mac(A1, B1);
+        }
+
+        aie::store_v(pC1, C00.template to_vector<float>()); pC1 += MMUL::size_C;
+        aie::store_v(pC1, C01.template to_vector<float>()); pC1 += MMUL::size_C;
+        aie::store_v(pC2, C10.template to_vector<float>()); pC2 += MMUL::size_C;
+        aie::store_v(pC2, C11.template to_vector<float>()); pC2 += MMUL::size_C;
+      }
+    }
+}
+
+// C comes back TILED ([rowA][colB] of r x t row-major). It is written straight into the `scores`
+// output buffer and de-tiled IN PLACE, so no second [TQ,T] f32 buffer is needed -- L1 on this core
+// already carries the 44 KB k. Like the input tiling, the C permutation is confined within each
+// group of r rows (r*T floats), so one r*T scratch suffices.
+//   ctile[((z*colB + j)*r + rr)*t + tt]  ->  logical row z*r + rr, col j*t + tt
+// The per-stage epilogue rides the de-tile, which is why the tiled form is never a separate pass.
+#endif // ATTN_MMUL
+
 
 // SOFTWARE f32 2^x (x<=0), device-proven (probe_floor rel-err 8.5e-5). NOINLINE is load-bearing:
 // inlining into the softmax loop makes Peano -O2 miscompile to NaN. Copied from relpos_mha.cc.
@@ -151,6 +273,154 @@ extern "C" void stage_scores_relpos_bd(const bfloat16 *__restrict qbd,
   }
   event1();
 }
+
+// STAGE A (RELPOS-BD, t_active MASKED) -- same math as stage_scores_relpos_bd, plus an in-kernel key
+// mask for variable-length clips. BD is computed ON-CHIP (4th stage), so the host -1e4 belt-sentinel
+// trick (CONV_KEY_MASK) can no longer null pad keys: pad keys kk>=t_active have a REAL (nonzero) BD from
+// rel_shift. Fix = mask here. t_active is read from an RTP register (rtp[0]) at RUNTIME (int32[16],
+// use_write_rtp), so ONE MAX-T=ATTN_T xclbin serves any t_active<=T (mirrors relpos_mha.cc's
+// relpos_stream_softmax rtp[0] contract). A padded clip gets correct attention over its real t_active
+// keys; masked columns j>=t_active are driven to ~0 in the softmax. t_active==T recovers the unmasked
+// behavior byte-for-byte. See the BD-onchip attention design (t_active in-kernel key-mask).
+#ifndef ATTN_KEY_MASK
+#define ATTN_KEY_MASK (-1.0e4f)   // large finite negative; (mask - rowmax)*log2e -> exp2 clamp(-100) ~= 0
+#endif
+extern "C" void stage_scores_relpos_bd_mask(const bfloat16 *__restrict qbd,
+                                            const bfloat16 *__restrict k,
+                                            float *__restrict scores,
+                                            const int32_t *__restrict rtp) {
+  constexpr int TQ = ATTN_TQ, T = ATTN_T, DK = ATTN_DK;
+  constexpr float inv_scale = ATTN_SCALE;
+  const int t_active = rtp[0];                 // active key count (<= T); pad keys j>=t_active -> masked
+  const bfloat16 *q = qbd;
+  const bfloat16 *bdhi = qbd + TQ * DK;
+  const bfloat16 *bdlo = bdhi + (BD_SPLIT ? TQ * T : 0);
+  event0();
+  for (int li = 0; li < TQ; li++) {
+    const bfloat16 *qr = q + li * DK;
+    const bfloat16 *hir = bdhi + li * T;
+    const bfloat16 *lor = bdlo + li * T;
+    float *sc = scores + li * T;
+    // MASK HOISTED OUT OF THE INNER LOOP. This was `for j<T { if (j>=t_active) {...; continue;} ... }`
+    // -- a data-dependent branch on every one of the TQ*T=1408 output elements, which on a VLIW core
+    // blocks software pipelining of the loop it guards. Splitting it into a clean active range plus a
+    // straight tail fill is EXACTLY equivalent (same values, same order, same rounding) and lets the
+    // compiler pipeline the hot loop.
+    //
+    // Measured baseline before this change: 291,668 cycles/query-tile, i.e. 207 cycles per output for
+    // 8 vector MACs of arithmetic (207x off the 128 MAC/cyc/core peak). The internal control is the
+    // ctx stage: identical MAC count (180,224) but 68,713 cycles, because its contraction axis lets it
+    // vectorize along the output instead of doing a horizontal reduce_add per element. This change
+    // separates the BRANCH cost from the reduce_add cost, which decides how much an aie::mmul rewrite
+    // can actually claim.
+    for (int j = 0; j < t_active; j++) {
+      const bfloat16 *kr = k + j * DK;
+      aie::accum<accfloat, VL> acc = aie::zeros<accfloat, VL>();
+      for (int d = 0; d < DK; d += VL)
+        acc = aie::mac(acc, aie::load_v<VL>(qr + d), aie::load_v<VL>(kr + d));
+      const float ac = aie::reduce_add(acc.to_vector<float>());
+      float bd = (float)hir[j];
+#if BD_SPLIT
+      bd += (float)lor[j];
+#endif
+      sc[j] = (ac + bd) * inv_scale;
+    }
+    for (int j = t_active; j < T; j++) sc[j] = ATTN_KEY_MASK;  // pad keys -> softmax ~0
+  }
+  event1();
+}
+
+// STAGE A (RELPOS-BD, t_active MASKED) via aie::mmul. Same math and same ABI as
+// stage_scores_relpos_bd_mask, with the horizontal reduce_add replaced by the vendored 2x2 block.
+// PRECONDITIONS the generator must honour (both are layout-only; get one wrong and the numbers are
+// silently wrong, not a crash):
+//   * k arrives PRE-TILED (t x s blocks, tiles row-major) -- kvtap does this, and must therefore
+//     drop its N_QT stride-0 replay, so the worker acquires k ONCE per dispatch, not per tile.
+//   * the belt head q_pass arrives PRE-TILED (r x s blocks) -- bd_emit_bake* does this.
+#if ATTN_MMUL
+extern "C" void stage_scores_relpos_bd_mask_mmul(const bfloat16 *__restrict qbd,
+                                                 const bfloat16 *__restrict ktiled,
+                                                 float *__restrict scores,
+                                                 const int32_t *__restrict rtp) {
+  constexpr int TQ = ATTN_TQ, T = ATTN_T, DK = ATTN_DK;
+  constexpr float inv_scale = ATTN_SCALE;
+  constexpr unsigned rowA = TQ / MM_R, colA = DK / MM_S, colB = T / MM_T;
+  const int t_active = rtp[0];
+  const bfloat16 *bdhi = qbd + TQ * DK;
+  const bfloat16 *bdlo = bdhi + (BD_SPLIT ? TQ * T : 0);
+  // ONE scratch, aliased. L1 on this core already carries the 44 KB k, and two separate scratches
+  // overflowed .bss by 1568 B. They are never live together: q_tiled is dead the moment mm_2x2
+  // returns, and row_scratch is only touched after it. Sized by the larger of the two.
+  alignas(32) static char mm_scratch[MM_R * ATTN_T * sizeof(float)];
+  static_assert(sizeof(mm_scratch) >= ATTN_TQ * ATTN_DK * sizeof(bfloat16), "scratch too small for q");
+  bfloat16 *__restrict q_tiled = reinterpret_cast<bfloat16 *>(mm_scratch);
+  float *__restrict row_scratch = reinterpret_cast<float *>(mm_scratch);
+
+  event0();
+  // Tile A here rather than at the producer. q is 1024 elements against the 704 mmul instructions
+  // this tile issues, so on-core tiling is affordable for q -- it is only k (22528 elements, ~4x
+  // the matmul) that had to move to the DMA. Doing it here also keeps ONE tiling site: the shipped
+  // 3-stage rail packs the belt host-side and never runs bd_emit_bake, so tiling at the producer
+  // would have been correct on the 4-stage rail and silently wrong on the shipped one.
+  mm_tile_rows<MM_R, MM_S, ATTN_DK>(qbd, q_tiled, TQ);
+#if ATTN_MMUL_REF
+  // BISECT REFERENCE: same tiled A/B layouts, same tiled C layout, but a scalar dot instead of the
+  // 2x2 register block. If this PASSES and mm_2x2 fails, the bug is in the register block; if this
+  // also fails, the bug is upstream in the DMA tiling tap or the acquire-once k pairing.
+  for (unsigned z = 0; z < rowA; z++)
+    for (unsigned j = 0; j < colB; j++)
+      for (int rr = 0; rr < MM_R; rr++)
+        for (int tt = 0; tt < MM_T; tt++) {
+          float acc = 0.f;
+          for (unsigned c = 0; c < colA; c++)
+            for (int ss = 0; ss < MM_S; ss++)
+              acc += (float)q_tiled[((z * colA + c) * MM_R + rr) * MM_S + ss] *
+                     (float)ktiled[((j * colA + c) * MM_T + tt) * MM_S + ss];
+          scores[((z * colB + j) * MM_R + rr) * MM_T + tt] = acc;
+        }
+#else
+  mm_2x2_bf16_f32<rowA, colA, colB>(q_tiled, ktiled, scores);
+#endif
+
+  // De-tile in place, r rows at a time, folding in BD + scale + the t_active key mask. This is the
+  // whole epilogue of the old kernel; it just reads its AC from the tiled C instead of from a
+  // reduce_add. Byte-for-byte the same arithmetic order: (ac + bd) * inv_scale.
+  for (unsigned z = 0; z < rowA; z++) {
+    float *grp = scores + z * MM_R * T;
+    for (int i = 0; i < MM_R * T; i++) row_scratch[i] = grp[i];
+    for (int rr = 0; rr < MM_R; rr++) {
+      const int li = z * MM_R + rr;
+      const bfloat16 *hir = bdhi + li * T;
+      const bfloat16 *lor = bdlo + li * T;
+      float *sc = grp + rr * T;
+      for (unsigned j = 0; j < colB; j++) {
+        const float *ct = row_scratch + (j * MM_R + rr) * MM_T;
+        for (int tt = 0; tt < MM_T; tt++) {
+          const int col = j * MM_T + tt;
+          if (col < t_active) {
+            float bd = (float)hir[col];
+#if BD_SPLIT
+            bd += (float)lor[col];
+#endif
+            sc[col] = (ct[tt] + bd) * inv_scale;
+          } else {
+            sc[col] = ATTN_KEY_MASK;
+          }
+        }
+      }
+    }
+  }
+  event1();
+}
+
+// Unmasked twin (t_active == T), for the no-mask build.
+extern "C" void stage_scores_relpos_bd_mmul(const bfloat16 *__restrict qbd,
+                                            const bfloat16 *__restrict ktiled,
+                                            float *__restrict scores) {
+  const int32_t rtp_full[1] = {ATTN_T};
+  stage_scores_relpos_bd_mask_mmul(qbd, ktiled, scores, rtp_full);
+}
+#endif // ATTN_MMUL
 
 // Zero-scalar-arg bake wrapper (IRON kernels avoid scalar args -> bake constants). N_QT=1 validation:
 // row_off = 0 (the single query tile is rows [0,TQ)). N_QT>1 needs an advancing row_off (tile-offset
@@ -347,6 +617,32 @@ static inline void bd_relshift_emit(int q0, bfloat16 *__restrict bd_hi, bfloat16
   }
 }
 
+// t_active-AWARE rel_shift + emit. For variable-length clips the rel_shift window base must be
+// (t_active-1)-(q0+il), NOT (T-1)-(q0+il) -- this MIRRORS the device-proven relpos_mha.cc
+// (relpos_scores_softmax_rows uses `BD + il*P + (t_active-1-(q0+il))`). With p held as the real
+// [2t-1] table zero-padded to P (the shipped relpos_mha packing), the BUILT_T base would read the
+// WRONG relative positions for t_active<T; using t_active recovers the correct rel-pos alignment.
+// Pairs with stage_scores_relpos_bd_mask (key-mask for j>=t_active). base clamps >=0 for pad query
+// rows i>=t_active (their ctx output is discarded on de-interleave, so the value is a don't-care).
+static inline void bd_relshift_emit_ta(int q0, int t_active, bfloat16 *__restrict bd_hi,
+                                       bfloat16 *__restrict bd_lo) {
+  constexpr int TQ = ATTN_TQ, T = ATTN_T, P = ATTN_P;
+  for (int il = 0; il < TQ; il++) {
+    int base = (t_active - 1) - (q0 + il);
+    if (base < 0) base = 0;                          // pad query row (output discarded) -> clamp, no OOB
+    const float *win = g_bd + il * P + base;
+    bfloat16 *hr = bd_hi + il * T;
+    for (int j = 0; j < T; j++) {
+      float x = win[j];
+      bfloat16 hi = (bfloat16)x;
+      hr[j] = hi;
+#if BD_SPLIT
+      bd_lo[il * T + j] = (bfloat16)(x - (float)hi);
+#endif
+    }
+  }
+}
+
 // STREAMING bricks for the generator Worker loop (int32 scalar ABI). g_bd is the resident scratch.
 extern "C" void bd_stream_block(const bfloat16 *__restrict qv, const bfloat16 *__restrict pblk,
                                 int32_t pb, int32_t j0) {
@@ -361,7 +657,20 @@ extern "C" void bd_block_bake(const bfloat16 *__restrict qpv, const bfloat16 *__
   static int j0 = 0;
   const bfloat16 *qv = qpv + ATTN_TQ * ATTN_DK;       // qpv = q_pass[TQ,DK] || qv[TQ,DK]
   int pb = (ATTN_P - j0 < BD_KB) ? (ATTN_P - j0) : BD_KB;
+  // TRACE MARKERS. The BD core is the ONLY stage of the 4-stage conveyor that decoded zero
+  // invocations, and the reason turned out to be trivial: this bake wrapper and bd_emit_bake_ta are
+  // the two functions the BD core actually calls, and NEITHER carried event0/event1. The instrumented
+  // siblings (bd_stream_block / bd_stream_emit) are different entry points this build never uses. So
+  // the core emitted no core-trace events at all -- not a ring overflow (its dedicated 1 MB ring came
+  // back only 54% full) and not a correctness problem.
+  //
+  // Marked HERE and not in bd_emit_bake_ta on purpose: parse.py pairs event0->event1 without regard to
+  // which function raised them, so instrumenting both would interleave 9 block pairs with 1 emit pair
+  // per query tile and blur the result. This wrapper carries bd_dot_block, which is the matmul we want
+  // to compare against the scores stage; emit is a copy + rel_shift and can be marked separately later.
+  event0();
   bd_dot_block(qv, pblk, pb, j0);
+  event1();
   j0 += BD_KB; if (j0 >= ATTN_P) j0 = 0;              // wrap per query tile (BD_KB blocks each)
 }
 extern "C" void bd_emit_bake(const bfloat16 *__restrict qpv, bfloat16 *__restrict out) {
@@ -372,6 +681,19 @@ extern "C" void bd_emit_bake(const bfloat16 *__restrict qpv, bfloat16 *__restric
   bd_relshift_emit(q0, bd_hi, bd_lo);                  // rel_shift + split emit
   q0 += ATTN_TQ; if (q0 >= ATTN_TQ * ATTN_NQT) q0 = 0; // wrap per dispatch
 }
+// t_active-AWARE emit bake (pairs with stage_scores_relpos_bd_mask). t_active from rtp[0]; the static
+// tile counter advances q0 exactly like bd_emit_bake. Belt out = q_pass || BD_hi[|| BD_lo].
+extern "C" void bd_emit_bake_ta(const bfloat16 *__restrict qpv, bfloat16 *__restrict out,
+                                const int32_t *__restrict rtp) {
+  static int q0 = 0;
+  const int t_active = rtp[0];
+  for (int i = 0; i < ATTN_TQ * ATTN_DK; i++) out[i] = qpv[i];  // forward q_pass into the belt head
+  bfloat16 *bd_hi = out + ATTN_TQ * ATTN_DK;
+  bfloat16 *bd_lo = bd_hi + (BD_SPLIT ? ATTN_TQ * ATTN_T : 0);
+  bd_relshift_emit_ta(q0, t_active, bd_hi, bd_lo);
+  q0 += ATTN_TQ; if (q0 >= ATTN_TQ * ATTN_NQT) q0 = 0;          // wrap per dispatch
+}
+
 extern "C" void bd_stream_emit(const bfloat16 *__restrict q_pass, bfloat16 *__restrict out, int32_t q0) {
   constexpr int TQ = ATTN_TQ, DK = ATTN_DK, T = ATTN_T;
   event0();
@@ -400,9 +722,6 @@ extern "C" void stage_bd(const bfloat16 *__restrict qv, const bfloat16 *__restri
 // consumes. ADVANCING q0: the BD worker calls this once per query tile, in order, on one core -> a static
 // counter advances q0 = tile_idx*TQ; wrap % N_QT resets it per dispatch (N_QT tiles each). Solves the
 // row-offset without a scalar arg / belt header. ATTN_NQT MUST be baked (-DATTN_NQT) to match the build.
-#ifndef ATTN_NQT
-#define ATTN_NQT 1
-#endif
 extern "C" void stage_bd_bake(const bfloat16 *__restrict qpv, const bfloat16 *__restrict p,
                               bfloat16 *__restrict out) {
   static int tile_idx = 0;
