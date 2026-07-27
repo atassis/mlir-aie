@@ -55,6 +55,16 @@ for _g in range(0, H, GJ):
     _qparts.append(np.stack([_qh[_g + i] for i in range(_gsz)], axis=1).reshape(-1))
 q_belt = np.concatenate(_qparts)
 kpack = np.concatenate([hd[1] for hd in heads])           # [H * KT] bf16 head-major
+if os.environ.get("ATTN_MMUL", "0") == "1":
+    # The mmul scores kernel consumes k PRE-TILED into t x s blocks, tiles row-major:
+    #   ktiled[((j*colA + c)*t + tt)*s + ss] = k[(j*t + tt)*DK + (c*s + ss)]
+    # This CANNOT be done by the shim on the H=8 grouped path: it needs 5 DMA dims (head, group,
+    # c, tt, ss) against the shim's 4, and merging head+group gives 88 > the 6-bit (max 64)
+    # iteration field. So the host does it -- free here, and free in npu.rs on the host-packed
+    # rail. The device-in rail (k straight off a GEMM output BO) still needs a device-side answer.
+    _s = _t8 = 8
+    _kt = kpack.reshape(H, T, DK).reshape(H, T // _t8, _t8, DK // _s, _s)   # [H, j, tt, c, ss]
+    kpack = _kt.transpose(0, 1, 3, 2, 4).reshape(-1)                        # [H, j, c, tt, ss]
 v_all = np.concatenate([hd[2] for hd in heads])           # [H * VT] bf16
 ctx_ref = np.concatenate([hd[3] for hd in heads], axis=0)  # [H*NQ, DK] f32
 
