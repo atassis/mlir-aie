@@ -890,18 +890,49 @@ def npu_split_parallelism_group(test):
     """Per-test parallelism group for the compile/execute split.
 
     Importable (module-level) so lit can pickle it to its parallel workers.
-    In AIE_NPU_SPLIT=compile a CONVERTED test (its RUN lines carry the %npu_run%
-    device marker, so it does no device work in the compile phase) runs
-    ungrouped/parallel; every other test -- including all unconverted ones --
-    keeps the capacity-1 ``npu-xrt`` group so its device execution stays
-    serialized. In any other mode all tests use ``npu-xrt``.
+
+    Two different resources want bounding here and they are easy to conflate.
+
+    The DEVICE is serialized by the flock in utils/run_on_npu.py, which is where
+    dispatch actually happens, so no lit group is needed for it.  Where fcntl is
+    unavailable that lock does not exist and the capacity-1 ``npu-xrt`` group is
+    the only serializer left, so it goes back in force -- for every test that
+    still reaches the device, which in AIE_NPU_SPLIT=compile means every
+    unconverted one (with no markers it runs whole in both passes) and any test
+    whose source cannot be read.
+
+    Chess compile MEMORY is a separate resource, and it does not care about the
+    device lock: chess peak RSS is large enough to OOM the runner under parallel
+    compiles, the same reason programming_examples/lit.cfg.py serializes
+    ``atb_chess``.  So a converted chess test joins the capacity-1
+    ``npu-split-chess-compile`` group on every platform.  Every other converted
+    test runs ungrouped.
     """
     import os
 
-    if os.environ.get("AIE_NPU_SPLIT", "") != "compile":
-        return "npu-xrt"
     try:
-        src = open(test.getSourcePath()).read()
+        import fcntl  # noqa: F401
+
+        device_group = None
+    except ImportError:
+        device_group = "npu-xrt"
+
+    if os.environ.get("AIE_NPU_SPLIT", "") != "compile":
+        return device_group
+    try:
+        with open(test.getSourcePath()) as f:
+            src = f.read()
     except Exception:
         return "npu-xrt"
-    return None if "%npu_run%" in src else "npu-xrt"
+
+    # Only a gating RUN line converts a test.  Matching the whole file would let
+    # a bare mention in a comment -- or a half-converted test whose device line
+    # lost its prefix -- leave the serialized lane while still driving the NPU.
+    converted = any("%npu_run%" in line for line in src.splitlines() if "RUN:" in line)
+    if not converted:
+        return "npu-xrt"
+
+    for line in src.splitlines():
+        if "REQUIRES:" in line and "chess" in line:
+            return "npu-split-chess-compile"
+    return None
