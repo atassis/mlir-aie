@@ -204,7 +204,9 @@ lit_config.parallelism_groups["npu-xrt"] = 1
 # on empty input. Redirect/pipe/FileCheck tests must stay whole-test (unconverted).
 _npu_split = os.environ.get("AIE_NPU_SPLIT", "")
 _npu_skip = ":"  # shell no-op; consumes the rest of a redirect/pipe-free line
-config.substitutions.append(("%npu_build%", _npu_skip if _npu_split == "execute" else ""))
+config.substitutions.append(
+    ("%npu_build%", _npu_skip if _npu_split == "execute" else "")
+)
 config.substitutions.append(("%npu_run%", _npu_skip if _npu_split == "compile" else ""))
 
 # shutil.which picks up the platform's executable suffix (.exe on Windows
