@@ -123,21 +123,59 @@ def test_record_captures_depfile_contents(tmp_path):
     assert not _manifest.is_valid(tmp_path)
 
 
-def test_chess_build_records_no_manifest(tmp_path):
-    """Chess reports no inputs, so no entry may claim to be verified."""
+def test_chess_build_records_an_incomplete_manifest(tmp_path):
+    """Chess reports no inputs, so the entry says so instead of claiming a check.
+
+    It stays usable: a Chess design cached fine before manifests existed, and
+    writing nothing would make every later lookup discard the directory and
+    rebuild -- worse than the behaviour this is meant to preserve.
+    """
     shim = tmp_path / "shim.cc"
     shim.write_text("// k")
     _manifest.record(tmp_path, [_Kernel(source_file=str(shim))], (), used_chess=True)
-    assert not (tmp_path / _manifest.MANIFEST_NAME).exists()
-    assert not _manifest.is_valid(tmp_path)
+
+    payload = json.loads((tmp_path / _manifest.MANIFEST_NAME).read_text())
+    assert payload["complete"] is False
+    assert payload["inputs"] == []
+    assert _manifest.is_valid(tmp_path)
+
+    # And it keeps saying so: an edited kernel is genuinely undetectable here,
+    # which is exactly why the manifest does not claim otherwise.
+    time.sleep(0.01)
+    shim.write_text("// k v2")
+    assert _manifest.is_valid(tmp_path)
 
 
-def test_kernel_without_a_depfile_records_no_manifest(tmp_path):
+def test_kernel_without_a_depfile_records_an_incomplete_manifest(tmp_path):
     """A kernel compiled by some other route leaves the set unknowable."""
     shim = tmp_path / "shim.cc"
     shim.write_text("// k")
     _manifest.record(tmp_path, [_Kernel(source_file=str(shim))], ())
-    assert not (tmp_path / _manifest.MANIFEST_NAME).exists()
+
+    payload = json.loads((tmp_path / _manifest.MANIFEST_NAME).read_text())
+    assert payload["complete"] is False
+    assert _manifest.is_valid(tmp_path)
+
+
+def test_incomplete_is_not_the_same_as_no_inputs(tmp_path):
+    """An empty input list still gets checked; an incomplete manifest does not.
+
+    Both record zero inputs, so only the flag separates "this design consumes
+    nothing" from "this build could not tell what it consumed".
+    """
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    _manifest.record(empty, [], ())
+    assert json.loads((empty / _manifest.MANIFEST_NAME).read_text())["complete"] is True
+
+    unknowable = tmp_path / "unknowable"
+    unknowable.mkdir()
+    shim = unknowable / "shim.cc"
+    shim.write_text("// k")
+    _manifest.record(unknowable, [_Kernel(source_file=str(shim))], (), used_chess=True)
+    payload = json.loads((unknowable / _manifest.MANIFEST_NAME).read_text())
+    assert payload["complete"] is False
+    assert payload["inputs"] == []
 
 
 def test_design_without_kernels_records_its_declared_sources(tmp_path):

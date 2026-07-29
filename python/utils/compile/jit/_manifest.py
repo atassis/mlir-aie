@@ -5,17 +5,24 @@ MLIR is generated, which happens after the key is computed and not at all on a
 hit. So instead of predicting inputs, record the ones a build actually consumed
 and check them on the next lookup.
 
-**Peano only.** A manifest is written when every kernel in the design was
-compiled by Peano, because Peano is asked for a depfile and so reports exactly
-which files it opened. The Chess front-end is driven through
-``xchesscc_wrapper`` and emits nothing equivalent, so for a Chess design the
-consumed set is unknowable from here. Rather than record a set that is silently
-short -- which would read as verified and is worse than recording nothing -- no
-manifest is written, and such designs keep exactly the cache behaviour they have
-today.
+**Peano only.** Inputs are recorded when every kernel in the design was compiled
+by Peano, because Peano is asked for a depfile and so reports exactly which files
+it opened. The Chess front-end is driven through ``xchesscc_wrapper`` and emits
+nothing equivalent, so for a Chess design the consumed set is unknowable from
+here. Recording a set that is silently short would read as verified and is worse
+than recording nothing.
 
-Everything here fails closed: an absent, unparsable, partial or unverifiable
-manifest is a miss. The cache never trusts what it cannot check.
+Such a build still writes a manifest, marked ``complete: false``. That is not the
+same as a manifest with no inputs -- a design that genuinely consumes nothing
+records ``complete: true`` and an empty list, and is checked like any other. The
+distinction matters because the two must behave differently: an unverifiable
+design has to keep the cache behaviour it had before this file existed, whereas
+writing nothing at all would make every lookup discard the entry and rebuild,
+which is strictly worse than the status quo it is meant to preserve.
+
+Everything here fails closed: an absent, unparsable or partial manifest is a
+miss. Where a build path cannot report its inputs, the manifest says so rather
+than claiming a check it did not perform.
 """
 
 from __future__ import annotations
@@ -63,10 +70,9 @@ def record(kernel_dir, external_kernels, source_files, used_chess=False) -> None
     Every kernel compiled through Peano leaves a depfile naming what the
     compiler actually opened.  A kernel compiled any other way -- today, the
     Chess path, which takes no -MD -- leaves none, and its includes are
-    therefore unknown.  Rather than record a set that is silently short, no
-    manifest is written at all: a missing manifest reads as a miss, so such a
-    design keeps exactly the behaviour it has now instead of gaining a cache
-    entry nobody can validate.
+    therefore unknown.  Rather than record a set that is silently short, mark
+    the manifest ``complete: false``: the entry stays usable, so such a design
+    keeps exactly the behaviour it has now, but nothing claims it was checked.
     """
     kernel_dir = Path(kernel_dir)
     compiled = [
@@ -77,10 +83,11 @@ def record(kernel_dir, external_kernels, source_files, used_chess=False) -> None
     depfiles = list(kernel_dir.glob("*.d"))
     if used_chess or (compiled and not depfiles):
         logger.debug(
-            "cache manifest: %d kernel(s) compiled without a depfile; not "
-            "recording an unverifiable input set",
+            "cache manifest: %d kernel(s) compiled without a depfile; recording "
+            "an incomplete manifest, inputs will not be checked",
             len(compiled),
         )
+        _write(kernel_dir, [], complete=False)
         return
 
     found: set[Path] = set()
@@ -96,8 +103,8 @@ def record(kernel_dir, external_kernels, source_files, used_chess=False) -> None
     _write(kernel_dir, sorted({p for p in found if p.is_file()}, key=str))
 
 
-def _write(kernel_dir: Path, inputs: list[Path]) -> None:
-    payload = {"version": _VERSION, "inputs": []}
+def _write(kernel_dir: Path, inputs: list[Path], complete: bool = True) -> None:
+    payload = {"version": _VERSION, "complete": complete, "inputs": []}
     for path in inputs:
         try:
             payload["inputs"].append(_entry(path))
@@ -121,6 +128,14 @@ def is_valid(kernel_dir: Path) -> bool:
 
     Fails closed: a missing, unparsable or partial manifest is a miss, never a
     hit.  Anything this cannot verify, it does not trust.
+
+    The one exception is a manifest that declares itself incomplete, which is
+    how a build path that cannot report its inputs (today, Chess) records
+    itself.  There is nothing to check, so this reports the entry usable and
+    leaves it exactly as cacheable as it was before manifests existed.  Treating
+    it as a miss would be worse than the status quo, not safer: the caller
+    discards the directory on a miss, so every lookup would wipe a valid entry
+    and rebuild it.
     """
     path = Path(kernel_dir) / MANIFEST_NAME
     try:
@@ -129,6 +144,11 @@ def is_valid(kernel_dir: Path) -> bool:
         return False
     if payload.get("version") != _VERSION:
         return False
+    if not payload.get("complete", True):
+        logger.debug(
+            "cache manifest: %s records no verifiable inputs; not checking", path
+        )
+        return True
     for rec in payload.get("inputs", ()):
         f = Path(rec["path"])
         try:
