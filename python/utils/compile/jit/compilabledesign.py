@@ -113,8 +113,9 @@ class CompilableDesign:
         compile_kwargs: Values for the ``CompileTime[T]``-annotated parameters.
             Validated against the generator signature via ``inspect.Signature.bind``.
         compile_flags: Extra flags forwarded to the Peano C++ compiler.
-        source_files: Paths to C++ kernel source files.  Their mtimes are
-            included in the cache key so that edits correctly invalidate the cache.
+        source_files: Paths to C++ kernel source files.  Their mtimes, and
+            those of the files they reach via quoted ``#include``, are included
+            in the cache key so that edits correctly invalidate the cache.
         include_paths: Extra ``-I`` paths forwarded to the C++ compiler.
         aiecc_flags: Extra flags forwarded to ``aiecc``.
         object_files: Pre-compiled ``.o`` files to link with.

@@ -475,6 +475,104 @@ def test_hash_handles_deeply_nested_functions():
     assert len(_compute_hash(_nest("pass"), {}, [], [], [], [])) == 24
 
 
+def test_hash_does_not_read_oversized_sources(tmp_path, monkeypatch):
+    """A multi-MB generated table is tracked, but never pulled into memory."""
+    from aie.utils.compile.jit import _hash
+
+    big = tmp_path / "table.h"
+    big.write_bytes(b"// generated\n" + b"0," * (2 << 20))
+    shim = tmp_path / "shim.cc"
+    shim.write_text('#include "table.h"\n')
+
+    real_read_bytes = Path.read_bytes
+
+    def guard(self):
+        assert (
+            self.stat().st_size <= _hash._MAX_INCLUDE_SCAN_BYTES
+        ), f"read {self.name} ({self.stat().st_size} bytes) into memory"
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", guard)
+
+    d1 = CompilableDesign(_gemm_gen(), source_files=[shim])
+    h1 = hash(d1)
+
+    # Still tracked: its own mtime is in the key even though it was not scanned.
+    time.sleep(0.01)
+    big.write_bytes(b"// regenerated\n" + b"1," * (2 << 20))
+    d2 = CompilableDesign(_gemm_gen(), source_files=[shim])
+    assert h1 != hash(d2)
+
+
+def test_hash_include_budget_is_shared_across_sources(tmp_path):
+    """The scan budget must not be drained by whichever source is walked first."""
+    from aie.utils.compile.jit import _hash
+
+    heads = []
+    for chain in ("a", "b"):
+        prev = None
+        for i in reversed(range(_hash._MAX_INCLUDE_SCAN_FILES)):
+            f = tmp_path / f"{chain}{i}.cc"
+            f.write_text(f'#include "{prev.name}"\n' if prev else "// leaf\n")
+            prev = f
+        heads.append(prev)
+
+    forward = _hash._include_closure(heads)
+    reverse = _hash._include_closure(list(reversed(heads)))
+
+    def per_chain(paths):
+        return {c: sum(1 for p in paths if p.name.startswith(c)) for c in ("a", "b")}
+
+    # Both orders must cover both chains comparably -- not 400/112 one way and
+    # 112/400 the other.
+    for counts in (per_chain(forward), per_chain(reverse)):
+        assert min(counts.values()) > 0
+        assert max(counts.values()) - min(counts.values()) <= 1, counts
+
+
+def test_hash_for_included_source_file_includes_mtime(tmp_path):
+    """Editing a kernel body reached through a shim must change the hash."""
+    body = tmp_path / "body.cc"
+    body.write_text("// v1")
+    shim = tmp_path / "shim.cc"
+    shim.write_text('#include "body.cc"\n')
+
+    d1 = CompilableDesign(_gemm_gen(), source_files=[shim])
+    h1 = hash(d1)
+
+    time.sleep(0.01)
+    body.write_text("// v2")
+
+    d2 = CompilableDesign(_gemm_gen(), source_files=[shim])
+    assert h1 != hash(d2)
+
+
+def test_hash_ignores_angle_bracket_and_missing_includes(tmp_path):
+    """Toolchain and unresolvable includes must not break hashing."""
+    shim = tmp_path / "shim.cc"
+    shim.write_text('#include <cstdint>\n#include "nowhere/absent.h"\n')
+
+    d = CompilableDesign(_gemm_gen(), source_files=[shim])
+    assert len(d._compute_cache_hash()) == 24
+
+
+def test_hash_terminates_on_include_cycle(tmp_path):
+    """Mutually including files must not send the include scan into a loop."""
+    a = tmp_path / "a.cc"
+    b = tmp_path / "b.cc"
+    a.write_text('#include "b.cc"\n')
+    b.write_text('#include "a.cc"\n')
+
+    d1 = CompilableDesign(_gemm_gen(), source_files=[a])
+    h1 = hash(d1)
+
+    time.sleep(0.01)
+    b.write_text('#include "a.cc"\n// v2\n')
+
+    d2 = CompilableDesign(_gemm_gen(), source_files=[a])
+    assert h1 != hash(d2)
+
+
 def test_hash_is_24_hex_chars():
     d = CompilableDesign(_gemm_gen())
     hex_str = d._compute_cache_hash()

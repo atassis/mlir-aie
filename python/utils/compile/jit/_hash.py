@@ -26,11 +26,90 @@ import hashlib
 import json
 import logging
 import marshal
+import re
+from collections import deque
 from pathlib import Path
 from types import CodeType
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 logger = logging.getLogger(__name__)
+
+# Quoted #include only.  Angle-bracket includes name toolchain headers, which
+# are already covered by the peano/aiecc mtime components below.
+_QUOTED_INCLUDE_RE = re.compile(rb'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"', re.MULTILINE)
+
+# A kernel .cc that pulls in its whole dependency tree is small; this only
+# bounds pathological cycles-by-symlink and generated-header explosions.
+_MAX_INCLUDE_SCAN_FILES = 512
+
+# Above this, a file is read for its mtime but not scanned for includes.  The
+# generated lookup tables in tree run to megabytes (magika's lut_group1.h is
+# ~8 MB, magika_v3p3_weights.h ~12 MB); pulling those into memory on every
+# cache-key computation costs more than the scan can possibly be worth, and
+# tables do not include anything.
+_MAX_INCLUDE_SCAN_BYTES = 1 << 20
+
+
+def _include_closure(source_files: Iterable[Path]) -> list[Path]:
+    """Return ``source_files`` plus every file they reach via quoted ``#include``.
+
+    Each include is resolved relative to the directory of the file that names
+    it -- the first rule of the quoted-include search path, and the only one
+    resolvable without the compiler's ``-I`` list.  Includes that do not
+    resolve there are skipped: they hash exactly as they do today, so the
+    result is never worse than not scanning at all.
+
+    The scan is textual and therefore approximate; it does not follow includes
+    hidden behind macros or conditional compilation.  It exists so that editing
+    a kernel body reached through a thin ``#include`` shim moves the cache key,
+    which a scan of the named files alone cannot do.
+
+    Paths are emitted as given, so a design whose sources include nothing keeps
+    the cache key it has today; resolution is used only to detect repeats.
+    """
+    seen: set[Path] = set()
+    out: list[Path] = []
+    # Breadth-first, so the file budget below is shared evenly across the
+    # declared sources instead of being drained by whichever one is walked
+    # first.
+    queue = deque(Path(sf) for sf in source_files)
+
+    while queue and len(seen) < _MAX_INCLUDE_SCAN_FILES:
+        current = queue.popleft()
+        try:
+            resolved = current.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        out.append(current)
+
+        try:
+            if resolved.stat().st_size > _MAX_INCLUDE_SCAN_BYTES:
+                continue
+            text = resolved.read_bytes()
+        except (FileNotFoundError, OSError, MemoryError):
+            # Unreadable, a directory, too large to hold, or not yet generated:
+            # nothing to walk into.  The path itself still contributes to the
+            # hash via `out`, so the file remains tracked either way.
+            continue
+
+        for match in _QUOTED_INCLUDE_RE.finditer(text):
+            try:
+                name = match.group(1).decode()
+            except UnicodeDecodeError:
+                continue
+            queue.append(current.parent / name)
+
+    if len(seen) >= _MAX_INCLUDE_SCAN_FILES:
+        logger.warning(
+            "_include_closure: stopped after %d files; the JIT cache key may "
+            "not cover every included source",
+            _MAX_INCLUDE_SCAN_FILES,
+        )
+
+    return out
 
 
 def _device_identity_key(device) -> tuple[str, str, str, str]:
@@ -156,10 +235,13 @@ def _compute_artifact_hash(
     Captures everything that can change the *output* of compilation without
     changing the *recipe*: edited C++ kernels, swapped object files, upgraded
     Peano / aiecc, retargeted device.
+
+    ``source_files`` is expanded to its quoted-``#include`` closure first, so a
+    kernel body reached through a thin shim is covered too.
     """
     h = hashlib.sha256()
 
-    for sf in sorted(source_files, key=str):
+    for sf in sorted(_include_closure(source_files), key=str):
         h.update(str(sf).encode())
         try:
             h.update(str(Path(sf).stat().st_mtime).encode())
