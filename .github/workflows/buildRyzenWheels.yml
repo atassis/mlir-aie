@@ -257,6 +257,10 @@ jobs:
         # are throwaway, so attesting them costs an API call and signs an
         # artifact nothing consumes.
         if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
+        # Only for wheels that can actually be published. Merge-queue builds
+        # are throwaway, so attesting them costs an API call and signs an
+        # artifact nothing consumes.
+        if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
         with:
           subject-path: wheelhouse/repaired_wheel/mlir_aie*whl
@@ -592,6 +596,10 @@ jobs:
           /tmp/smoke-venv/Scripts/python -c 'import aie.ir; import aie.extras; import aie.helpers'
 
       - name: Generate build provenance attestation
+        # Only for wheels that can actually be published. Merge-queue builds
+        # are throwaway, so attesting them costs an API call and signs an
+        # artifact nothing consumes.
+        if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
         # Only for wheels that can actually be published. Merge-queue builds
         # are throwaway, so attesting them costs an API call and signs an
         # artifact nothing consumes.
