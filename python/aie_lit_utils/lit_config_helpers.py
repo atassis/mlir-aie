@@ -936,3 +936,112 @@ def npu_split_parallelism_group(test):
         if "REQUIRES:" in line and "chess" in line:
             return "npu-split-chess-compile"
     return None
+
+
+def _npu_split_logical_run_lines(src):
+    """RUN lines of a lit test, with backslash continuations joined.
+
+    lit joins a continued RUN line into one command before substitution, so a
+    marker on the first physical line governs the whole logical line and that is
+    the unit both split constraints have to be checked against.
+    """
+    lines, pending = [], None
+    for raw in src.splitlines():
+        marker = "RUN:"
+        idx = raw.find(marker)
+        if idx < 0:
+            if pending is not None:
+                lines.append(pending)
+                pending = None
+            continue
+        body = raw[idx + len(marker) :].strip()
+        continued = body.endswith("\\")
+        if continued:
+            body = body[:-1].rstrip()
+        if pending is None:
+            pending = body
+        else:
+            pending += " " + body
+        if not continued:
+            lines.append(pending)
+            pending = None
+    if pending is not None:
+        lines.append(pending)
+    return lines
+
+
+def npu_split_conversion_violations(npu_xrt_dir):
+    """Check every converted npu-xrt test against the compile/execute split's rules.
+
+    Returns a list of human-readable violations; empty means the tree is sound.
+    The point is that the split's preconditions are machine-checked rather than
+    left to a reviewer noticing them, because the failure they guard against --
+    one test executing another test's xclbin -- shows up as a passing test.
+
+    OWNERSHIP: a converted test must own its working directory.  lit's cwd is the
+    test DIRECTORY while test identity is per test FILE, so a bare artifact name
+    like ``aie.xclbin`` belongs to the directory, not to the test that wrote it.
+    A test is therefore either the only ``.lit`` in its directory, or it ``cd``s
+    into a per-test-file directory (``%t.d``) first.  This is checked structurally
+    rather than by looking for shared artifact names: name matching has to know
+    every way a RUN line can name an output, and it already misses one in-tree --
+    matmul_whole_array_dynamic scopes its xclbin and prj to ``%t`` but both its
+    tests still write a bare ``./mm.o``, from different kernel sources.
+
+    LINE SHAPE: the marker expands to ``:``, which only neutralises a plain
+    command.  A redirect on a skipped line would still truncate its target and a
+    pipe would still run the downstream stage on empty input, so a marked line
+    must be a single simple command.
+
+    PHASES: a converted test needs at least one line in each phase; otherwise the
+    execute phase runs against nothing, or the compile phase never yields the
+    device line the split exists to isolate.  And every device-conditional line
+    must state its phase -- an unmarked ``%run_on_npuN%`` line dispatches during
+    the compile phase, which is exactly what the split is for.
+    """
+    import os
+    import re
+
+    # Deliberately blunt: a metacharacter is rejected even where a shell would
+    # read it as literal, inside quotes. Erring this way costs one test staying
+    # whole; erring the other way is a test that skips its own compile and then
+    # passes anyway.
+    unsafe = re.compile(r"[|&;<>]|FileCheck")
+    violations = []
+    for dirpath, _, filenames in os.walk(npu_xrt_dir):
+        tests = sorted(f for f in filenames if f.endswith(".lit"))
+        for name in tests:
+            path = os.path.join(dirpath, name)
+            try:
+                with open(path) as f:
+                    src = f.read()
+            except OSError as e:
+                violations.append(f"{path}: unreadable ({e})")
+                continue
+            runs = _npu_split_logical_run_lines(src)
+            marked = [r for r in runs if "%npu_build%" in r or "%npu_run%" in r]
+            if not marked:
+                continue
+
+            if len(tests) > 1 and not any(re.match(r"cd\s+%t", r) for r in runs):
+                siblings = ", ".join(t for t in tests if t != name)
+                violations.append(
+                    f"{path}: converted but shares its directory with {siblings} "
+                    f"and does not cd into a per-test %t.d"
+                )
+            for r in marked:
+                stripped = r.replace("%npu_build%", "").replace("%npu_run%", "")
+                if unsafe.search(stripped):
+                    violations.append(
+                        f"{path}: marked line is not a simple command: {r}"
+                    )
+            if not any("%npu_build%" in r for r in marked):
+                violations.append(f"{path}: converted with no %npu_build% line")
+            if not any("%npu_run%" in r for r in marked):
+                violations.append(f"{path}: converted with no %npu_run% line")
+            for r in runs:
+                if "%run_on_npu" in r and r not in marked:
+                    violations.append(
+                        f"{path}: device-conditional line has no phase marker: {r}"
+                    )
+    return violations

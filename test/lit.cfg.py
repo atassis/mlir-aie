@@ -199,11 +199,11 @@ lit_config.parallelism_groups["concurrency"] = 1
 # NPU XRT tests should run serially to avoid resource contention
 lit_config.parallelism_groups["npu-xrt"] = 1
 
-# A converted chess test leaves the capacity-1 npu-xrt group in the compile
-# phase, so it needs its own bound: chess peak RSS OOMs the runner under
-# parallel compiles. Capacity 1 matches the atb_chess precedent in
-# programming_examples/lit.cfg.py, so chess compiles stay exactly as serialized
-# as they are today; the split only stops them waiting behind the device lock.
+# Chess compiles need their own bound wherever they run ungrouped: chess peak RSS
+# OOMs the runner under parallel compiles. Capacity 1 matches the atb_chess
+# precedent in programming_examples/lit.cfg.py, so chess compiles stay exactly as
+# serialized as they are today; the split only stops them waiting behind a device
+# they do not use.
 lit_config.parallelism_groups["npu-split-chess-compile"] = 1
 
 # Compile/execute split (opt-in, OFF by default). AIE_NPU_SPLIT selects which
@@ -213,29 +213,29 @@ lit_config.parallelism_groups["npu-split-chess-compile"] = 1
 #                phase's persisted artifacts
 #   unset     -> whole test, unchanged (both prefixes expand to nothing)
 # Build lines touch no device (aiecc/clang only generate MLIR/objects), so the
-# compile phase runs them in parallel (see test/npu-xrt/lit.local.cfg); only the
-# device run stays in the capacity-1 npu-xrt group, which serializes the global
-# XRT hw_context pool that #2737 added the group to protect.
-# CONSTRAINT 1 (line shape) for converting a test: a line tagged with
-# %npu_build%/%npu_run% must be a single simple command with NO redirect (>), pipe
-# (|), &&/;, or a trailing FileCheck -- the ":" skip only neutralises a plain
-# command; a redirect would still truncate its target and a pipe would still run the
-# downstream stage on empty input. Redirect/pipe/FileCheck tests must stay
-# whole-test (unconverted).
-# CONSTRAINT 2 (artifact ownership): a converted test must not write a bare relative
-# artifact name that any OTHER test in its directory also writes. lit's cwd is the
-# directory (dirname(test.getExecPath())) but %t is per test FILE
-# (<execdir>/Output/<name>.tmp), so bare names like aie.xclbin are directory-scoped
-# while test identity is file-scoped. A whole-test run survives that because build
-# and run are adjacent lines and this group is capacity-1; the split is not -- it
-# moves produce->consume into a separate lit invocation and compiles ungrouped, so
-# two tests sharing a name would race in the compile phase and the execute phase
-# could run one test against the other's xclbin. Sibling tests count even when
-# unconverted: with no markers they run whole in BOTH passes. Directories whose
-# tests share names (xrt_handle_lifetime, reconfigure_loadpdi{,_persistent_memtile},
-# matmul_whole_array_dynamic) are therefore left unconverted; scoping their
-# artifacts to %t, as matmul_whole_array_dynamic already does for its xclbin/prj,
-# would make them convertible.
+# compile phase needs no device at all -- which is the point: it can run on a
+# machine that has none, while the execute phase stays on the device runner,
+# serialized by the lock in utils/run_on_npu.py.
+#
+# Converting a test has three rules, and breaking any of them produces a test
+# that PASSES against the wrong artifacts rather than one that errors. They are
+# therefore machine-checked, not left here as prose -- see
+# npu_split_conversion_violations() in python/aie_lit_utils/lit_config_helpers.py,
+# run by test/python/test_npu_split_conversion.py on every leg and again from
+# test/npu-xrt/lit.local.cfg whenever the split is actually switched on:
+#   1. LINE SHAPE. A tagged line must be a single simple command -- no redirect,
+#      pipe, &&/;, or FileCheck. The ":" the marker expands to only neutralises a
+#      plain command; a redirect would still truncate its target and a pipe would
+#      still run the downstream stage on empty input.
+#   2. ARTIFACT OWNERSHIP. lit's cwd is the test DIRECTORY (dirname of
+#      getExecPath()) while %t is per test FILE, so a bare name like aie.xclbin
+#      belongs to the directory rather than to the test that wrote it. A converted
+#      test must own its cwd: either it is the only .lit there, or it cds into its
+#      own %t.d first, as the tests in xrt_handle_lifetime and reconfigure_loadpdi
+#      now do.
+#   3. PHASES. Both halves must be non-empty, and every %run_on_npuN% line must
+#      say which half it belongs to -- an unmarked one dispatches during the
+#      compile phase, which is the thing the split exists to prevent.
 _npu_split = os.environ.get("AIE_NPU_SPLIT", "")
 _npu_skip = ":"  # shell no-op; consumes the rest of a redirect/pipe-free line
 config.substitutions.append(
