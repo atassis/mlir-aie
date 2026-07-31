@@ -8,7 +8,19 @@ permissions:
   packages: read
 
 on:
+  # Presubmit runs only for changes that can actually alter the wheel: the
+  # packaging sources, the pinned requirement sets they install, the LLVM
+  # version the wheel is built against, and this workflow. Every other PR gets
+  # the same coverage one step later, in the merge queue, so nothing reaches
+  # main unbuilt -- see merge_group below.
   pull_request:
+    paths:
+      - 'utils/mlir_aie_wheels/**'
+      - 'utils/clone-llvm.sh'
+      - 'python/requirements*.txt'
+      - 'python/requirements*.lock'
+      - '.github/workflows/buildRyzenWheels.yml'
+  merge_group:
   workflow_dispatch:
     inputs:
       AIE_COMMIT:
@@ -241,7 +253,10 @@ jobs:
           /tmp/smoke-venv/bin/python -c 'import aie.ir; import aie.extras; import aie.helpers'
 
       - name: Generate build provenance attestation
-        if: github.event_name != 'pull_request'
+        # Only for wheels that can actually be published. Merge-queue builds
+        # are throwaway, so attesting them costs an API call and signs an
+        # artifact nothing consumes.
+        if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
         with:
           subject-path: wheelhouse/repaired_wheel/mlir_aie*whl
@@ -259,8 +274,9 @@ jobs:
     # env_install.sh/env_setup.sh and can compile + run basic examples on NPU
     # hardware.
     # The wheel itself is built on ubuntu-latest by build-repo; only this test
-    # job uses the self-hosted NPU runners. PR-only: the merge queue and
-    # nightly still get full from-source NPU coverage via buildAndTestRyzenAI.
+    # job uses the self-hosted NPU runners. It follows build-repo, so it runs
+    # on packaging PRs and in the merge queue, not on every PR; from-source NPU
+    # coverage is unaffected and still runs everywhere via buildAndTestRyzenAI.
     needs: build-repo
     runs-on: ${{ matrix.runner_type }}
     # Normal exec is ~1 min; cap well below the sibling smoke job's 192.6-min hang.
@@ -576,7 +592,10 @@ jobs:
           /tmp/smoke-venv/Scripts/python -c 'import aie.ir; import aie.extras; import aie.helpers'
 
       - name: Generate build provenance attestation
-        if: github.event_name != 'pull_request'
+        # Only for wheels that can actually be published. Merge-queue builds
+        # are throwaway, so attesting them costs an API call and signs an
+        # artifact nothing consumes.
+        if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
         with:
           subject-path: wheelhouse/repaired_wheel/mlir_aie*whl
