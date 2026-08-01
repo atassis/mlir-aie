@@ -504,6 +504,13 @@ xilinx::AIE::AIETranslateToXAIEV2(ModuleOp module, raw_ostream &output,
         // (xaie_elfloader.c:683-729). Chess writes that sidecar, the Peano
         // path does not. XAIE_LOAD_ELF_ALL is the load it performs past it.
         output << "{\n"
+  // XAie_LoadElfPartial, not XAie_LoadElf. Under __AIESIM__ the latter first
+  // opens "<elf>.map" and parses it for a Chess-linker stack line, and returns
+  // WITHOUT loading anything if that fails (xaie_elfloader.c:682-728). Nothing
+  // in this build emits such a file for either backend, so the ELF would
+  // silently never load and the assert below would fire. LoadElfPartial with
+  // XAIE_LOAD_ELF_ALL is exactly what LoadElf does after that block, so this is
+  // behaviour-preserving for the hardware path.
                << "AieRC RC = XAie_LoadElfPartial(" << deviceInstRef << ", "
                << tileLocStr(col, row) << ", "
                << "(const char*)\"" << fileName << "\", XAIE_LOAD_ELF_ALL);\n";
