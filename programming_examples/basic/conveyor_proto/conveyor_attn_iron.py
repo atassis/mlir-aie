@@ -32,6 +32,12 @@ N_HEADS = int(os.environ.get("ATTN_HEADS", 1))  # data-parallel heads, one 3-til
 # row count. Parakeet: SD=1024 (8 heads x DK=128), PAD_M=512. Unused unless --stream-io is passed.
 SD = int(os.environ.get("ATTN_SD", 1024))
 PAD_M = int(os.environ.get("ATTN_PAD_M", 512))
+# Depth of the A->B scores belt. It is depth-2 for pipeline overlap, which costs TQ*T*4 bytes twice.
+# At TQ=16 -- the shape the bfp16 mmul brick requires, since r=8 needs m % (2*r) == 0 -- that is
+# 2 x 11264 against a 64 KB L1 already holding 44 KB of resident k, and the design overflows by 3084
+# bytes. Depth-1 buys back exactly the 11264 that does not fit, at the cost of the scores/softmax
+# overlap; whether that trade is net-positive is the thing to measure, not to assume.
+AC_DEPTH = int(os.environ.get("ATTN_AC_DEPTH", 2))
 
 
 P = 2 * T - 1  # relative-position length (NeMo/Parakeet rel-pos)
@@ -98,7 +104,10 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
     # stride-0 replay taps (deliver the read-only weight N_QT times, one per query tile).
     replay_tap = TensorAccessPattern([T * DK], 0, [N_QT, 1, T, DK], [0, 0, DK, 1])
 
-    rt = Runtime()
+    # Runtime sequence bodies are callbacks (mlir-aie #3387): `Runtime(seq_fn, fn_args)`, fill/drain
+    # on the ObjectFifo handle, workers on Program. Each branch below sets `rt` and `prog_workers`;
+    # `trace_cfg` defers enable_trace to the Program, which now owns it.
+    trace_cfg = None
     if mono:
         # MONOLITH baseline: ONE tile, all 3 ops per query tile; q + packed kv (2 inputs = channel budget).
         kv_ty = np.ndarray[(2 * T * DK,), np.dtype[bfloat16]]
@@ -113,11 +122,15 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
                 f_q.release(1); f_kv.release(1); f_ctx.release(1)
 
         w = Worker(mono_fn, [of_q.cons(), of_kv.cons(), of_ctx.prod(), mono_k])
-        with rt.sequence(q_full_ty, kv_ty, ctx_full_ty) as (Q, KV, CTX):
-            rt.start(w)
-            rt.fill(of_q.prod(), Q, tap=q_tap)
-            rt.fill(of_kv.prod(), KV, tap=kv_replay)
-            rt.drain(of_ctx.cons(), CTX, tap=ctx_tap, wait=True)
+
+        def _seq_mono(Q, KV, CTX, f_q, f_kv, f_ctx):
+            f_q.fill(Q, q_tap)
+            f_kv.fill(KV, kv_replay)
+            f_ctx.drain(CTX, ctx_tap, wait=True)
+
+        rt = Runtime(_seq_mono, [q_full_ty, kv_ty, ctx_full_ty,
+                                 of_q.prod(), of_kv.prod(), of_ctx.cons()])
+        prog_workers = [w]
     elif bd_onchip:
         # BD-ON-CHIP 4-stage column per head (BD -> scores -> softmax -> ctx), H data-parallel columns.
         # BD tile: g_bd = qv @ p^T (f32 accfloat) then rel_shift+split -> q_pass||BD_hi belt. q0 advances
@@ -209,7 +222,7 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
         of_bd = [ObjectFifo(qbd_ty, name=f"bd{h}", depth=1) for h in range(H)]
         of_k = [ObjectFifo(k_ty, name=f"k{h}", depth=1) for h in range(H)]
         of_v = [ObjectFifo(v_ty, name=f"v{h}", depth=1) for h in range(H)]
-        of_ac = [ObjectFifo(ac_ty, name=f"ac{h}", depth=2) for h in range(H)]
+        of_ac = [ObjectFifo(ac_ty, name=f"ac{h}", depth=AC_DEPTH) for h in range(H)]
         of_pr = [ObjectFifo(probs_ty, name=f"probs{h}", depth=2) for h in range(H)]
         of_ctxh = [ObjectFifo(ctx_ty, name=f"ctx{h}", depth=2) for h in range(H)]
         # TASK 1 (t_active in-kernel key-mask): per-head RTP register + runtime barrier. The scores worker
@@ -353,21 +366,16 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
             v_all_ty = np.ndarray[(H * T * DK,), np.dtype[bfloat16]]
             c_all_ty = np.ndarray[(H * N_QT * TQ * DK,), np.dtype[bfloat16]]
         p_all_ty = np.ndarray[(H * P * DK,), np.dtype[bfloat16]]
-        with rt.sequence(qpv_all_ty, p_all_ty, k_all_ty, v_all_ty, c_all_ty) as (QPV, PP, K, V, CTX):
-            rt.start(*wl)
+        def _seq_bd(QPV, PP, K, V, CTX, h_qpv, h_p, h_k, h_v, h_ctx):
             if tactive_mask:
                 # Bake t_active = T (full length) as the DEFAULT immediate; the host patches this word in
                 # insts.bin per dispatch for shorter clips (mirrors RELPOS_TACTIVE_WORD). Unpatched = T =
                 # unmasked passthrough (correct for T==BUILT_T + the run_bd_onchip.py standalone gate).
-                def _mk_set(val):
-                    def _set(p):
-                        p[0] = val
-                    return _set
                 for h in range(H):
-                    rt.inline_ops(_mk_set(T), [tactive_rtp[h]])
-                    rt.set_barrier(rtp_bar[h], 1)
-                    rt.inline_ops(_mk_set(T), [tactive_bd_rtp[h]])   # BD-stage core: same t_active
-                    rt.set_barrier(rtp_bd_bar[h], 1)
+                    tactive_rtp[h][0] = T
+                    rtp_bar[h].set(1)
+                    tactive_bd_rtp[h][0] = T   # BD-stage core: same t_active
+                    rtp_bd_bar[h].set(1)
             for h in range(H):
                 if stream_io:
                     # (tile, plane, row, col) over [2, PAD_M, SD]: plane 0 = qu, plane 1 = qv, so one
@@ -396,21 +404,20 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
                              TensorAccessPattern([H * T * DK], h * T * DK, [N_QT, 1, T, DK], [0, 0, DK, 1]))
                     vtap = TensorAccessPattern([H * T * DK], h * T * DK, [N_QT, 1, T, DK], [0, 0, DK, 1])
                     ctap = TensorAccessPattern([H * N_QT * TQ * DK], h * N_QT * TQ * DK, [N_QT, 1, TQ, DK], [TQ * DK, 0, DK, 1])
-                rt.fill(of_qpv[h].prod(), QPV, tap=qtap)
+                h_qpv[h].fill(QPV, qtap)
                 if p_resident:
                     # ONE pass over p straight into hop 1: no N_QT outer replay from L3. The MemTile
                     # does the replaying, so the shim fill is a single table read per dispatch.
                     ptap = TensorAccessPattern([H * P * DK], h * P * DK, [1, 1, P, DK], [0, 0, DK, 1])
-                    rt.fill(of_p_l3[h].prod(), PP, tap=ptap)
                 else:
                     if stream_p:
                         ptap = TensorAccessPattern([H * P * DK], h * P * DK, [N_QT, NBLK, BD_KB, DK], [0, BD_KB * DK, DK, 1])
                     else:
                         ptap = TensorAccessPattern([H * P * DK], h * P * DK, [N_QT, 1, P, DK], [0, 0, DK, 1])
-                    rt.fill(of_p[h].prod(), PP, tap=ptap)
-                rt.fill(of_k[h].prod(), K, tap=kvtap)
-                rt.fill(of_v[h].prod(), V, tap=vtap)
-                rt.drain(of_ctxh[h].cons(), CTX, tap=ctap, wait=True)
+                h_p[h].fill(PP, ptap)
+                h_k[h].fill(K, kvtap)
+                h_v[h].fill(V, vtap)
+                h_ctx[h].drain(CTX, ctap, wait=True)
             # Per-stage occupancy instrument. `trace_size=0` (production) leaves the design
             # byte-identical; non-zero appends a dedicated trace buffer at the TAIL of the
             # runtime_sequence so QPV/PP/K/V/CTX keep their group ids and the Rust ABI is untouched.
@@ -426,17 +433,25 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
             # method-profile-a-brick-with-enable-trace, gotcha 1). Every head runs the identical
             # 4-stage pipeline, so H=1 is representative of the STAGE BALANCE -- it is NOT
             # representative of production wall time, where 4 heads share the shim.
-            if trace_size:
-                # ONE WORKER PER BUILD by default (`trace_worker`, 0=BD 1=scores 2=softmax 3=ctx).
-                # Tracing all four into a SHARED ring does not work here: the BD core emits ~10x the
-                # events of the others (22 tiles x 9 blocks = 198 bd_block_bake calls vs 22 calls per
-                # other stage), so it floods the ring, the other stages capture only 16-17 of their 22
-                # invocations, and BD itself yields ZERO complete event pairs. Measured, not guessed:
-                # at 64 KB the whole ring came back full with 0 decodable invocations on every core,
-                # and at 1 MB three stages decoded partially while BD still decoded nothing.
-                # trace_worker=-1 restores the all-four shared ring for comparison.
-                sel = wl[:4] if trace_worker < 0 else [wl[trace_worker]]
-                rt.enable_trace(trace_size=trace_size, workers=sel, egress_shim_col=1)
+        if trace_size:
+            # ONE WORKER PER BUILD by default (`trace_worker`, 0=BD 1=scores 2=softmax 3=ctx).
+            # Tracing all four into a SHARED ring does not work here: the BD core emits ~10x the
+            # events of the others (22 tiles x 9 blocks = 198 bd_block_bake calls vs 22 calls per
+            # other stage), so it floods the ring, the other stages capture only 16-17 of their 22
+            # invocations, and BD itself yields ZERO complete event pairs. Measured, not guessed:
+            # at 64 KB the whole ring came back full with 0 decodable invocations on every core,
+            # and at 1 MB three stages decoded partially while BD still decoded nothing.
+            # trace_worker=-1 restores the all-four shared ring for comparison.
+            sel = wl[:4] if trace_worker < 0 else [wl[trace_worker]]
+            trace_cfg = dict(trace_size=trace_size, workers=sel, egress_shim_col=1)
+
+        rt = Runtime(_seq_bd, [qpv_all_ty, p_all_ty, k_all_ty, v_all_ty, c_all_ty,
+                               [of_qpv[h].prod() for h in range(H)],
+                               [(of_p_l3 if p_resident else of_p)[h].prod() for h in range(H)],
+                               [of_k[h].prod() for h in range(H)],
+                               [of_v[h].prod() for h in range(H)],
+                               [of_ctxh[h].cons() for h in range(H)]])
+        prog_workers = wl
     else:
         # k, V are read-only weights. At real dims (T*DK bf16 = 44 KB) a depth-2 weight fifo blows the
         # 64 KB L1, so depth-1. Structure = the validated per-tile-acquire + stride-0 replay tap (the
@@ -457,6 +472,10 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
         # via MM_BLK_OK and fails loudly at link rather than silently.
         if mmul and TQ not in (8, 16):
             raise SystemExit("--mmul blocked scores needs ATTN_TQ in (8, 16) = 2*MM_R; got %d" % TQ)
+        # stage_scores_mmul_block takes the q||BD belt (qbd_ty), which only the relpos path produces.
+        # Without this, --mmul alone fails in the verifier as a bare 2x operand-size mismatch.
+        if mmul and not relpos:
+            raise SystemExit("--mmul consumes the q||BD belt; use it with --relpos")
         scores_blk = (Kernel("stage_scores_mmul_block", "kernels.a", [qbd_ty, kblk_ty, ac_ty])
                       if mmul else None)
         # v is per-head DIRECT normally (8 shim MM2S). Under mmul, k takes those 8 for its per-head
@@ -570,47 +589,62 @@ def build(dev, mono=False, TRIVIAL=False, relpos=False, bd_onchip=False, tactive
         k_all_ty = np.ndarray[(H * KT,), np.dtype[bfloat16]]
         v_all_ty = np.ndarray[(H * VT,), np.dtype[bfloat16]]
         c_all_ty = np.ndarray[(N_QT * H * TQ * DK,), np.dtype[bfloat16]]
-        with rt.sequence(q_all_ty, k_all_ty, v_all_ty, c_all_ty) as (Q, K, V, CTX):
-            rt.start(*wl)
+        # Fill/drain handles, hoisted so the sequence body is a plain callback (see #3387 note above).
+        h_v_list = ([ofv.prod() for (ofv, _) in of_v_bigs] if mmul
+                    else [of_vh[h].prod() for h in range(H)])
+        h_q_list = [ofq.prod() for (ofq, _) in of_q_bigs]
+        h_k_list = ([f_.prod() for (f_, _) in k_fill_srcs] if mmul
+                    else [k_fill_srcs[gi_][0].prod() for gi_ in range(len(of_q_bigs))])
+        h_c_list = [ofb.cons() for (ofb, _) in of_ctx_bigs]
+
+        def _seq_attn(Q, K, V, CTX, hv, hq, hk, hc):
             if mmul:
                 voff = 0
-                for (ofv, hs_) in of_v_bigs:
+                for i_, (_, hs_) in enumerate(of_v_bigs):
                     gszv = len(hs_)
-                    rt.fill(ofv.prod(), V, tap=TensorAccessPattern(
+                    hv[i_].fill(V, TensorAccessPattern(
                         [H * VT], voff, [1, 1, 1, gszv * T * DK], [0, 0, 0, 1]))
                     voff += gszv * T * DK
             else:
                 for h in range(H):   # v stays per-head direct, filled ONCE (acquire-once)
                     vh = TensorAccessPattern([H * VT], h * VT, [1, 1, T, DK], [0, 0, DK, 1])
-                    rt.fill(of_vh[h].prod(), V, tap=vh)
+                    hv[h].fill(V, vh)
             qoff = koff = 0
-            for gi_, ((ofq, hs), (ofk, _)) in enumerate(zip(of_q_bigs, of_k_bigs)):
+            for gi_, ((_, hs), _) in enumerate(zip(of_q_bigs, of_k_bigs)):
                 gsz = len(hs)
                 qtap = TensorAccessPattern([N_QT * H * QELEM], qoff, [N_QT, 1, 1, gsz * QELEM], [gsz * QELEM, 0, 0, 1])
                 ktap = TensorAccessPattern([H * KT], koff, [1, 1, 1, gsz * T * DK], [0, 0, 0, 1])  # k once, group slice
-                rt.fill(ofq.prod(), Q, tap=qtap)
+                hq[gi_].fill(Q, qtap)
                 if mmul:
-                    for (f_, h_) in [x for x in k_fill_srcs if x[1] in hs]:
-                        rt.fill(f_.prod(), K,
-                                tap=TensorAccessPattern([H * KT], h_ * KT, [1, 1, T, DK], [0, 0, DK, 1]))
+                    for ki_, (_, h_) in enumerate(k_fill_srcs):
+                        if h_ in hs:
+                            hk[ki_].fill(K, TensorAccessPattern(
+                                [H * KT], h_ * KT, [1, 1, T, DK], [0, 0, DK, 1]))
                 else:
-                    rt.fill(k_fill_srcs[gi_][0].prod(), K, tap=ktap)
+                    hk[gi_].fill(K, ktap)
                 qoff += N_QT * gsz * QELEM; koff += gsz * T * DK
             coff = 0   # per-group ctx drain (each group -> its own shim drain, contiguous slice of C_all)
-            for ofb, hs in of_ctx_bigs:
+            for ci_, (_, hs) in enumerate(of_ctx_bigs):
                 gsz = len(hs)
                 gtap = TensorAccessPattern([N_QT * H * TQ * DK], coff,
                                            [N_QT, 1, 1, gsz * TQ * DK], [gsz * TQ * DK, 0, 0, 1])
-                rt.drain(ofb.cons(), CTX, tap=gtap, wait=True)
+                hc[ci_].drain(CTX, gtap, wait=True)
                 coff += N_QT * gsz * TQ * DK
-            # Per-stage trace for the 3-STAGE path (this branch had none; enable_trace lived only in
-            # the bd_onchip branch). Worker order per head is [scores, softmax, ctx], so
-            # --trace-worker 0=scores 1=softmax 2=ctx. Build at ATTN_HEADS=1: egress needs a free
-            # shim channel. trace_size=0 leaves the design byte-identical to production.
-            if trace_size:
-                rt.enable_trace(trace_size=trace_size, workers=[wl[trace_worker]], egress_shim_col=1)
 
-    return Program(dev, rt).resolve_program()
+        rt = Runtime(_seq_attn, [q_all_ty, k_all_ty, v_all_ty, c_all_ty,
+                                 h_v_list, h_q_list, h_k_list, h_c_list])
+        prog_workers = wl
+        # Per-stage trace for the 3-STAGE path (this branch had none; enable_trace lived only in
+        # the bd_onchip branch). Worker order per head is [scores, softmax, ctx], so
+        # --trace-worker 0=scores 1=softmax 2=ctx. Build at ATTN_HEADS=1: egress needs a free
+        # shim channel. trace_size=0 leaves the design byte-identical to production.
+        if trace_size:
+            trace_cfg = dict(trace_size=trace_size, workers=[wl[trace_worker]], egress_shim_col=1)
+
+    prog = Program(dev, rt, workers=prog_workers)
+    if trace_cfg:
+        prog.enable_trace(**trace_cfg)
+    return prog.resolve_program()
 
 
 ap = argparse.ArgumentParser()
