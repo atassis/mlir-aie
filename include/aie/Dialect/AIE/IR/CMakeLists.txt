@@ -12,37 +12,32 @@ add_mlir_doc(AIEDocs AIEDialect ./ -gen-dialect-doc -dialect=aie)
 set(LLVM_TARGET_DEFINITIONS AIE.td)
 mlir_tablegen(AIEDialect.h.inc -gen-dialect-decls -dialect=aie)
 mlir_tablegen(AIEDialect.cpp.inc -gen-dialect-defs -dialect=aie)
-add_public_tablegen_target(MLIRAIEIncGen)
-add_dependencies(aie-headers MLIRAIEIncGen)
+add_mlir_dialect_tablegen_target(MLIRAIEIncGen)
 
 # Add AIE Types
 set(LLVM_TARGET_DEFINITIONS AIETypes.td)
 mlir_tablegen(AIETypes.h.inc -gen-typedef-decls -typedefs-dialect=aie)
 mlir_tablegen(AIETypes.cpp.inc -gen-typedef-defs -typedefs-dialect=aie)
-add_public_tablegen_target(MLIRAIETypesIncGen)
-add_dependencies(aie-headers MLIRAIETypesIncGen)
+add_mlir_dialect_tablegen_target(MLIRAIETypesIncGen)
 add_dependencies(MLIRAIETypesIncGen GenerateAIEEventsTD)
 
 # Add AIE interfaces
 set(LLVM_TARGET_DEFINITIONS AIEInterfaces.td)
 mlir_tablegen(AIEInterfaces.h.inc -gen-op-interface-decls)
 mlir_tablegen(AIEInterfaces.cpp.inc -gen-op-interface-defs)
-add_public_tablegen_target(MLIRAIEInterfacesIncGen)
-add_dependencies(aie-headers MLIRAIEInterfacesIncGen)
+add_mlir_dialect_tablegen_target(MLIRAIEInterfacesIncGen)
 
 # Add AIE operations
 set(LLVM_TARGET_DEFINITIONS AIEOps.td)
 mlir_tablegen(AIEOps.h.inc -gen-op-decls)
 mlir_tablegen(AIEOps.cpp.inc -gen-op-defs)
-add_public_tablegen_target(MLIRAIEOpsIncGen)
-add_dependencies(aie-headers MLIRAIEOpsIncGen)
+add_mlir_dialect_tablegen_target(MLIRAIEOpsIncGen)
 
 # Add AIE enums
 set(LLVM_TARGET_DEFINITIONS AIEAttrs.td)
 mlir_tablegen(AIEEnums.h.inc -gen-enum-decls)
 mlir_tablegen(AIEEnums.cpp.inc -gen-enum-defs)
-add_public_tablegen_target(MLIRAIEEnumsIncGen)
-add_dependencies(aie-headers MLIRAIEEnumsIncGen)
+add_mlir_dialect_tablegen_target(MLIRAIEEnumsIncGen)
 add_dependencies(MLIRAIEEnumsIncGen GenerateAIEEventsTD)
 
 # Generate AIE event enums from aie-rt headers
@@ -88,8 +83,7 @@ add_custom_target(GenerateAIEEventsTD
 set(LLVM_TARGET_DEFINITIONS AIEAttrs.td)
 mlir_tablegen(AIEAttrs.h.inc -gen-attrdef-decls)
 mlir_tablegen(AIEAttrs.cpp.inc -gen-attrdef-defs)
-add_public_tablegen_target(MLIRAIEAttrDefsIncGen)
-add_dependencies(aie-headers MLIRAIEAttrDefsIncGen)
+add_mlir_dialect_tablegen_target(MLIRAIEAttrDefsIncGen)
 add_dependencies(MLIRAIEAttrDefsIncGen GenerateAIEEventsTD)
 
 # Ensure generated event enums exist before generating documentation

@@ -338,7 +338,9 @@ endif()
 # Make sure we generate the headers
 add_custom_target(aie-headers)
 set_target_properties(aie-headers PROPERTIES FOLDER "Misc")
-add_dependencies(aie-headers mlir-headers)
+# An in-tree MLIR makes mlir-headers depend on mlir-generic-headers; the standalone
+# stubs in MLIRConfig.cmake leave the two unrelated, so name both.
+add_dependencies(aie-headers mlir-headers mlir-generic-headers)
 
 option(AIE_INCLUDE_DOCS "Generate build targets for the MLIR AIE docs." OFF)
 if(AIE_INCLUDE_DOCS)
@@ -368,6 +370,58 @@ if(AIE_ENABLE_BINDINGS_PYTHON)
 endif()
 
 add_subdirectory(include)
+
+# Collect the tablegen targets declared under dir, recursively. add_public_tablegen_target
+# marks them by folder; add_mlir_doc's targets land in a "Docs" subfolder and are excluded.
+function(_aie_tablegen_targets dir out)
+  get_property(targets DIRECTORY "${dir}" PROPERTY BUILDSYSTEM_TARGETS)
+  get_property(subdirs DIRECTORY "${dir}" PROPERTY SUBDIRECTORIES)
+  set(found "")
+  foreach(target ${targets})
+    get_target_property(folder ${target} FOLDER)
+    if(folder MATCHES "/Tablegenning$")
+      list(APPEND found ${target})
+    endif()
+  endforeach()
+  foreach(subdir ${subdirs})
+    _aie_tablegen_targets("${subdir}" nested)
+    list(APPEND found ${nested})
+  endforeach()
+  set(${out} "${found}" PARENT_SCOPE)
+endfunction()
+
+function(_aie_target_closure root out)
+  set(seen "")
+  set(worklist "${root}")
+  while(worklist)
+    list(POP_FRONT worklist current)
+    if(NOT TARGET ${current} OR current IN_LIST seen)
+      continue()
+    endif()
+    list(APPEND seen ${current})
+    get_target_property(deps ${current} MANUALLY_ADDED_DEPENDENCIES)
+    if(deps)
+      list(APPEND worklist ${deps})
+    endif()
+  endwhile()
+  set(${out} "${seen}" PARENT_SCOPE)
+endfunction()
+
+# aie-headers gates both the install component and every headers-only build, and a bare
+# add_public_tablegen_target reaches neither: its output arrives only through the DEPENDS
+# of a library that happens to consume it.
+_aie_tablegen_targets("${CMAKE_CURRENT_SOURCE_DIR}/include" _aie_tablegen)
+_aie_target_closure(aie-headers _aie_reachable)
+foreach(target ${_aie_tablegen})
+  if(NOT target IN_LIST _aie_reachable)
+    message(FATAL_ERROR
+      "${target} generates headers under include/ but nothing links it to aie-headers, "
+      "so its output is missing from the installed include tree. Declare it with "
+      "add_mlir_dialect_tablegen_target() or add_mlir_generic_tablegen_target() instead "
+      "of add_public_tablegen_target().")
+  endif()
+endforeach()
+
 add_subdirectory(lib)
 add_subdirectory(aie_runtime_lib)
 add_subdirectory(tools)
