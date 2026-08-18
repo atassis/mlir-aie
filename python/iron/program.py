@@ -59,6 +59,7 @@ class Program:
         self._workers = list(workers) if workers is not None else []
         self._trace_size = None
         self._trace_workers = None
+        self._trace_tiles = None
         self._reuse_output_buffer = False
         self._egress_shim_col = 0
         self._coretile_events = None
@@ -71,6 +72,7 @@ class Program:
         self,
         trace_size: int | None = None,
         workers: list | None = None,
+        tiles: list | None = None,
         reuse_output_buffer: bool = False,
         coretile_events: list | None = None,
         coremem_events: list | None = None,
@@ -89,6 +91,10 @@ class Program:
             trace_size (int): Size of the trace buffer in bytes.
             workers (list[Worker] | None, optional): Specific workers to trace. If None,
                 all workers with ``trace`` set will be traced. Defaults to None.
+            tiles (list[Tile] | None, optional): Additional tiles to trace that are not
+                backed by a Worker -- a MemTile or ShimTile carries no Worker, so it is
+                unreachable through ``workers`` and would otherwise be untraceable.
+                Appended to whatever ``workers`` selects. Defaults to None.
             reuse_output_buffer (bool, optional): When False (default), trace
                 lowering appends a dedicated trace-buffer argument to the
                 runtime_sequence; it lands at the tail so enabling trace never
@@ -112,6 +118,7 @@ class Program:
         """
         self._trace_size = trace_size
         self._trace_workers = workers
+        self._trace_tiles = tiles
         self._reuse_output_buffer = reuse_output_buffer
         self._coretile_events = coretile_events
         self._coremem_events = coremem_events
@@ -252,6 +259,9 @@ class Program:
                     for w in self._workers:
                         if w.trace is not None:
                             tiles_to_trace.append(w.tile.op)
+                if self._trace_tiles is not None:
+                    for tl in self._trace_tiles:
+                        tiles_to_trace.append(tl.op)
                 if self._trace_size is not None and self._trace_size > 0:
                     trace_utils.configure_trace(
                         tiles_to_trace,
