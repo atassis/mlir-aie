@@ -1029,12 +1029,18 @@ getNpuDmaLoweringPipeline(mlir::MLIRContext *ctx) {
 // With `ctrlPkt=false` the referenced device's configuration is emitted as
 // `write32`/`blockwrite` ops; with `ctrlPkt=true` it is emitted as
 // `aiex.npu.control_packet` ops (which a later ctrl-packet-to-dma pass streams
-// in), preceded by a `load_pdi @ctrl_pkt_overlay`.
+// in), preceded by a `load_pdi @ctrl_pkt_overlay`. With `registerReset=true`
+// the write32 flow keeps its configuration ops but resets the outgoing device
+// through `aiex.core_reset`/`aiex.dma_channel_reset_for` register writes rather
+// than a `load_pdi @empty_N` firmware partition reset.
 inline std::unique_ptr<mlir::PassManager>
-getExpandLoadPdiPipeline(mlir::MLIRContext *ctx, bool ctrlPkt = false) {
+getExpandLoadPdiPipeline(mlir::MLIRContext *ctx, bool ctrlPkt = false,
+                         bool registerReset = false) {
   auto pm = std::make_unique<mlir::PassManager>(ctx);
-  std::string expandPipeline = std::string("aie-expand-load-pdi{ctrl-pkt=") +
-                               (ctrlPkt ? "true" : "false") + "}";
+  std::string expandPipeline =
+      std::string("aie-expand-load-pdi{ctrl-pkt=") +
+      (ctrlPkt ? "true" : "false") +
+      " register-reset=" + (registerReset ? "true" : "false") + "}";
   if (mlir::failed(mlir::parsePassPipeline(expandPipeline, *pm)))
     return nullptr;
   if (ctrlPkt)
