@@ -128,6 +128,10 @@ def vector_reduce_max(
 
         # A core-resident buffer holds its value across runs of the same design,
         # so the first tile writes the accumulator instead of folding into it.
+
+        # The first tile writes the accumulator outright rather than folding into
+        # it: a core-resident buffer keeps its value from the previous run of the
+        # same design, so a seeded accumulator makes the result depend on run order.
         elem_in = of_in.acquire(1)
         reduce_max_vector(elem_in, nextC_buffer, elems_per_core)
         of_in.release(1)
