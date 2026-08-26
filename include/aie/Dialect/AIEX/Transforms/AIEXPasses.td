@@ -625,6 +625,14 @@ def AIEExpandLoadPdi : Pass<"aie-expand-load-pdi", "mlir::ModuleOp"> {
               "one does not, using reset values from the register database. A "
               "boundary carrying an address the database does not know keeps "
               "its firmware reset.">,
+
+       Option<
+           "clRegisterReset", "register-reset", "bool", /*default=*/"false",
+           "Replace each empty-device firmware reset with writes restoring "
+           "exactly the registers the outgoing device wrote and the incoming "
+           "one does not, using reset values from the register database. A "
+           "boundary carrying an address the database does not know keeps "
+           "its firmware reset.">,
   ];
 }
 
