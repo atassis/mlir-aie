@@ -22,6 +22,33 @@ from .resolvable import Resolvable
 logger = logging.getLogger(__name__)
 
 
+def _include_dir_content_key(d: str) -> str:
+    """Return a content-addressed key for everything under include dir ``d``.
+
+    Hashes every regular file in the tree rather than stat'ing the directory
+    itself: a directory's mtime only moves on create/delete/rename, so a
+    header edited in place (the common editor save is truncate-then-write,
+    not replace-via-rename) leaves it unchanged even though the compiled
+    output does not. A missing directory, or a file that vanishes or refuses
+    to read mid-walk, gets a sentinel that still changes the key -- a stat or
+    read failure can only cause a miss, never silently alias onto a prior
+    digest.
+    """
+    root = Path(d)
+    if not root.is_dir():
+        return f"{d}:missing"
+    entries = []
+    for p in sorted(root.rglob("*")):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(root).as_posix()
+        try:
+            entries.append(f"{rel}:{hashlib.sha256(p.read_bytes()).hexdigest()}")
+        except OSError:
+            entries.append(f"{rel}:unreadable")
+    return f"{d}:" + hashlib.sha256("\n".join(entries).encode()).hexdigest()
+
+
 def _is_contiguous_row_major(mr):
     """Return True iff ``mr`` is fully-static row-major contiguous at offset 0.
 
@@ -519,29 +546,24 @@ class ExternalFunction(Kernel):
         """Return a 64-bit hex SHA-256 digest of this instance's content.
 
         Used by both ``__hash__`` and ``__eq__`` so the two are consistent.
-        Memoised on the instance: source-file reads and stat() calls would
-        otherwise run on every dict lookup and noticeably regress hot
-        compile-cache paths.  Instance state is treated as immutable after
-        construction; mutating ``_source_*`` / ``_include_dirs`` /
-        ``_compile_flags`` / ``_arg_types`` afterwards is not supported.
+        Memoised on the instance: source-file reads and include-directory
+        content hashing would otherwise run on every dict lookup and
+        noticeably regress hot compile-cache paths.  Instance state is
+        treated as immutable after construction; mutating ``_source_*`` /
+        ``_include_dirs`` / ``_compile_flags`` / ``_arg_types`` afterwards is
+        not supported.
         """
         if self._cached_digest is not None:
             return self._cached_digest
 
-        from pathlib import Path as _Path
-
-        include_dir_mtimes = []
-        for d in sorted(self._include_dirs):
-            try:
-                mtime = str(_Path(d).stat().st_mtime)
-            except (FileNotFoundError, OSError):
-                mtime = "missing"
-            include_dir_mtimes.append(f"{d}:{mtime}")
+        include_dir_hashes = [
+            _include_dir_content_key(d) for d in sorted(self._include_dirs)
+        ]
 
         parts = [
             self._name,
             str(self._arg_types),
-            str(include_dir_mtimes),
+            str(include_dir_hashes),
             str(sorted(self._compile_flags)),
             # Toolchain choice (peano vs chess) changes the resulting .o
             # contents even when name + arg_types + flags + source are

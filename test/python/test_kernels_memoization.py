@@ -331,3 +331,75 @@ def test_kernels_mm_object_file_name_is_order_independent():
     reuses by name is identical regardless of registration order."""
     ef = kernels.mm(dim_m=64, dim_k=64, dim_n=32, c_col_maj=True)
     assert ef._object_file_name == f"matmul_i16_i16_{ef._symbol_prefix}.o"
+
+
+# ---------------------------------------------------------------------------
+# _content_digest must see an include dir's CONTENT, not its directory mtime
+#
+# Background: a directory's own mtime only advances on create/delete/rename
+# of an entry, not on an in-place edit of a file already inside it (the
+# common editor save is truncate-then-write). A digest keyed on the include
+# dir's `stat().st_mtime` therefore does not change when a header the design
+# declares as an include dir is edited in place, so a stale compiled object
+# keeps being served.
+# ---------------------------------------------------------------------------
+
+
+def test_content_digest_changes_on_in_place_include_edit(tmp_path):
+    """Editing a header inside a declared include_dirs entry, without adding,
+    removing or renaming any file, must change the digest."""
+    header = tmp_path / "brick.h"
+    header.write_text("#define BRICK_VALUE 1\n")
+    dir_mtime_before = tmp_path.stat().st_mtime
+
+    ef1 = ExternalFunction(
+        "digest_probe",
+        source_string="void digest_probe(int *p) { *p = BRICK_VALUE; }",
+        include_dirs=[str(tmp_path)],
+    )
+    digest_before = ef1._content_digest()
+
+    header.write_text("#define BRICK_VALUE 2\n")
+    assert tmp_path.stat().st_mtime == dir_mtime_before, (
+        "test invalid: the in-place edit moved the directory's own mtime"
+    )
+
+    ef2 = ExternalFunction(
+        "digest_probe",
+        source_string="void digest_probe(int *p) { *p = BRICK_VALUE; }",
+        include_dirs=[str(tmp_path)],
+    )
+    digest_after = ef2._content_digest()
+
+    assert digest_before != digest_after
+
+
+def test_content_digest_stable_when_include_dir_untouched(tmp_path):
+    """Two instances over an unchanged include dir get the same digest, so
+    the content-hash fix does not turn every lookup into a miss."""
+    (tmp_path / "brick.h").write_text("#define BRICK_VALUE 1\n")
+
+    ef1 = ExternalFunction(
+        "digest_probe",
+        source_string="void digest_probe(int *p) { *p = BRICK_VALUE; }",
+        include_dirs=[str(tmp_path)],
+    )
+    ef2 = ExternalFunction(
+        "digest_probe",
+        source_string="void digest_probe(int *p) { *p = BRICK_VALUE; }",
+        include_dirs=[str(tmp_path)],
+    )
+    assert ef1._content_digest() == ef2._content_digest()
+    assert ef1 == ef2
+
+
+def test_content_digest_handles_missing_include_dir():
+    """A nonexistent include dir must fail closed (a stable sentinel), not
+    raise, so a design that references a not-yet-created dir can still be
+    constructed and hashed."""
+    ef = ExternalFunction(
+        "digest_probe_missing",
+        source_string="void digest_probe_missing() {}",
+        include_dirs=["/nonexistent/does-not-exist"],
+    )
+    assert ef._content_digest()  # does not raise
