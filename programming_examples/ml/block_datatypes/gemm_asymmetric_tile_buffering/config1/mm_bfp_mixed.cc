@@ -53,7 +53,16 @@ void matmul_vectorized_different_datatypes(bfloat16 *__restrict pA,
     g_counter = g_counter + 1;
   }
   // convert pA from bfloat16 to bfp16ebs8
-  alignas(aie::vector_decl_align) bfp16ebs8 converted_A[M * K / 8];
+  // Size by memory_bytes(), not sizeof(bfp16ebs8)*count: the type is a 0/1-byte
+  // empty tag under Peano vs 9 bytes under Chess (aie_api/types.hpp,
+  // __AIE_API_SCALAR_BFP_TYPES__), so the old `bfp16ebs8[M*K/8]` declaration
+  // under-allocated by 2048 B on Peano while the stream below still writes
+  // it 32 blocks x memory_bytes() (llvm-aie#1232).
+  using ConvertedABlock = aie::block_vector<bfp16ebs8, 64>;
+  constexpr int kConvertedANumBlocks = (M / 8 / 2) * (K / 8) * 2;
+  alignas(aie::vector_decl_align) uint8_t
+      converted_A_storage[kConvertedANumBlocks * ConvertedABlock::memory_bytes()];
+  bfp16ebs8 *converted_A = reinterpret_cast<bfp16ebs8 *>(converted_A_storage);
   aie::block_vector_output_buffer_stream<bfp16ebs8, 64> pA_bfp16_stream(
       converted_A);
   pA_bfp16_stream.seek(0);

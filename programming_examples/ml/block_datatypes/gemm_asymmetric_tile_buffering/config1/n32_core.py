@@ -79,14 +79,14 @@ def n32_core_gemm(
         source_file=str(_KERNEL_SRC),
         arg_types=[C_l1_ty],
         compile_flags=kernel_flags + ["-DZERO_ONLY"],
-        use_chess=True,
+        use_chess=False,
     )
     matmul_kernel = ExternalFunction(
         "matmul_vectorized_different_datatypes",
         source_file=str(_KERNEL_SRC),
         arg_types=[A_l1_ty, B_l1_ty, C_l1_ty],
         compile_flags=kernel_flags + ["-DMATMUL_ONLY"],
-        use_chess=True,
+        use_chess=False,
     )
 
     A_l3l2_fifos: list[ObjectFifo] = []
@@ -186,7 +186,13 @@ def n32_core_gemm(
                 zero_kernel,
                 matmul_kernel,
             ],
-            stack_size=0xD00,
+            # matmul_vectorized_different_datatypes needs 0x1640 (disassembled
+            # `paddxm [sp], #0x1640` after the converted_A byte-size fix,
+            # llvm-aie#1232) -- 0xD00 silently underprovisions it. 0x1800
+            # overflows the core's data region by 4 B (measured); 0x1700
+            # (96 B margin over the bare 0x1640) is the largest round value
+            # that still links.
+            stack_size=0x1700,
         ),
     )
 
