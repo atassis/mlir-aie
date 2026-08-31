@@ -2300,6 +2300,14 @@ def AIE_ObjectFifoCreateOp: AIE_Op<"objectfifo", [HasParent<"DeviceOp">, Symbol]
       // stream_len_decoupled.
       UnitAttr:$stream_len_decoupled);
 
+      // Allocation group, propagated onto every buffer this objectFifo lowers
+      // to -- a fifo's depth slots are live together, which is what one group
+      // asserts. Two fifos in DIFFERENT groups are asserted never to be live
+      // at the same time, so the allocator overlays them and they share one
+      // region sized at the larger fifo's total. See aie.buffer's alloc_group
+      // for what is asserted and what is checked.
+      OptionalAttr<StrAttr>:$alloc_group);
+
   let assemblyFormat = [{
     $sym_name
     `(`
@@ -2536,7 +2544,11 @@ def AIE_ObjectFifoPoolOp
       UnitAttr:$streamLenDecoupled,
       // If lowered from a high-level ObjectFifo, the name of that fifo.
       // Used to group ops lowered by the same ObjectFifo.
-      OptionalAttr<StrAttr>:$fifoName, InitValuesArrayAttr:$initValues);
+      OptionalAttr<StrAttr>:$fifoName, InitValuesArrayAttr:$initValues,
+      // Allocation group carried down from the objectFifo, stamped onto every
+      // buffer `--aie-objectfifo-allocate` creates here. See aie.buffer's
+      // alloc_group for what it asserts.
+      OptionalAttr<StrAttr>:$allocGroup);
 
   let regions = (region SizedRegion<1>:$segments);
 
