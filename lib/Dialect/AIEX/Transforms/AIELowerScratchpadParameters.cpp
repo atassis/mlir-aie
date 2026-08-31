@@ -124,7 +124,9 @@ struct AIELowerScratchpadParametersPass
       auto buf =
           BufferOp::create(builder, readOp.getLoc(), bufType, tile,
                            builder.getStringAttr(bufName), /*address=*/nullptr,
-                           /*initial_value=*/nullptr, /*mem_bank=*/nullptr);
+                           /*initial_value=*/nullptr, /*mem_bank=*/nullptr,
+                           /*core_data=*/nullptr, /*aligned=*/nullptr,
+                           /*alloc_group=*/nullptr);
       seen[key] = buf;
 
       readOp.setBufferAttr(
