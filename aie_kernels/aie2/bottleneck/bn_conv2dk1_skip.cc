@@ -231,8 +231,6 @@ void conv2dk1_ui8_i8_i8_scalar_input_split_partial_width_get_new(
 }
 #endif
 
-#if defined(BN13_1_INPUT_SPLIT_PARTIAL_GET_UI8_I8_I8_CAS_WIDTH) ||             \
-
 #if defineddefined(BN13_1_INPUT_SPLIT_PARTIAL_GET_UI8_I8_I8_CAS_WIDTH) ||             \
     defined(BN14_1_INPUT_SPLIT_PARTIAL_GET_UI8_I8_I8_CAS_WIDTH)
 // 8 Pixels Width Processing Approach: Processes 8 spatial pixels (x_start to
@@ -652,10 +650,6 @@ void conv2dk1_skip_ui8_i8_i8_scalar_cascade_get(
   event1();
 }
 #endif
-
-#if defined(REGULAR) || defined(BN0) || defined(BN2) || defined(BN4) ||        \
-    defined(BN5) || defined(BN7) || defined(BN8) || defined(BN9) ||            \
-    defined(BN11)
 
 #if defined(REGULAR) || defined(BN0) || defined(BN2) || defined(BN4) || defined(BN5) || defined(BN7) || defined(BN8) ||  \
     defined(BN9) || defined(BN11)
