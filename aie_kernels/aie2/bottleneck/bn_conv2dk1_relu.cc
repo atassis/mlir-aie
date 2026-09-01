@@ -213,10 +213,6 @@ void conv2dk1_ui8_ui8_scalar_input_split_partial_width_get(
 }
 #endif
 
-#if defined(PARTIAL_GET_I8_CAS_WIDTH_NEW) ||                                   \
-    defined(BN13_2_PARTIAL_GET_I8_CAS_WIDTH_NEW) ||                            \
-    defined(BN13_1_PARTIAL_GET_I8_CAS_WIDTH_NEW) ||                            \
-
 #if defineddefined(PARTIAL_GET_I8_CAS_WIDTH_NEW) ||                                   \
     defined(BN13_2_PARTIAL_GET_I8_CAS_WIDTH_NEW) ||                                   \
     defined(BN13_1_PARTIAL_GET_I8_CAS_WIDTH_NEW) ||                                   \
@@ -299,11 +295,6 @@ void conv2dk1_i8_ui8_scalar_partial_width_get_new(
   event1();
 }
 #endif
-
-#if defined(PARTIAL_GET_I8_CAS_WIDTH) ||                                       \
-    defined(BN13_2_PARTIAL_GET_I8_CAS_WIDTH) ||                                \
-    defined(BN13_1_PARTIAL_GET_I8_CAS_WIDTH) ||                                \
-    defined(BN14_1_PARTIAL_GET_I8_CAS_WIDTH)
 
 #if defineddefined(PARTIAL_GET_I8_CAS_WIDTH) || defined(BN13_2_PARTIAL_GET_I8_CAS_WIDTH) ||  \
     defined(BN13_1_PARTIAL_GET_I8_CAS_WIDTH) || defined(BN14_1_PARTIAL_GET_I8_CAS_WIDTH)
@@ -944,7 +935,7 @@ void conv2dk1_i8_ui8_scalar_cascade_get(
 // #endif
 // #endif
 
-#if defined(POSTL2_PARTIAL)
+#if (POSTL2_PARTIAL)
 #ifdef UINT16_ACT
 
 //*****************************************************************************
@@ -1001,7 +992,7 @@ conv2dk1_ui16_partial_scalar(uint16_t *input, int8_t *kernels, int32_t *output,
 #endif
 #endif
 
-#if defined(POSTL2_PARTIAL_ACC)
+#if (POSTL2_PARTIAL_ACC)
 #ifdef UINT16_ACT
 
 //*****************************************************************************
@@ -1190,7 +1181,7 @@ static void conv2dk1_ui16_partial_acc_scalar(
 //   event1();
 // }
 
-#if defined(POSTL2_PAD)
+#if (POSTL2_PAD)
 #ifdef UINT16_ACT
 
 //*****************************************************************************
@@ -1240,7 +1231,7 @@ static void conv2dk1_ui16_scalar_pad(uint16_t *input, int8_t *kernels,
 #endif
 #endif
 
-#if defined(POSTL2)
+#if (POSTL2)
 #ifdef UINT16_ACT
 
 //*****************************************************************************
@@ -1335,7 +1326,7 @@ static void conv2dk1_i8_scalar(int8_t *input, int8_t *kernels, uint8_t *output,
 #endif
 #endif
 
-#if defined(CONV_XPOOL_FUSED)
+#if (CONV_XPOOL_FUSED)
 #ifdef INT8_ACT
 
 //*****************************************************************************
@@ -1379,7 +1370,7 @@ void fused_conv2dk1_x_pool_i8_scalar(int8_t *input, int8_t *kernels,
 #endif
 #endif
 
-#if defined(CONV_XYPOOL_FUSED)
+#if (CONV_XYPOOL_FUSED)
 #ifdef INT8_ACT
 
 //*****************************************************************************
@@ -1431,7 +1422,7 @@ void fused_conv2dk1_xy_pool_i8_scalar(int8_t *input, int8_t *kernels,
 #endif
 #endif
 
-#if defined(CONV_XYPOOL_FUSED_LARGE_OUTPUT_CHANNEL_SPLIT)
+#if (CONV_XYPOOL_FUSED_LARGE_OUTPUT_CHANNEL_SPLIT)
 #ifdef INT8_ACT
 
 //*****************************************************************************
@@ -1492,7 +1483,7 @@ void fused_conv2dk1_xy_pool_i8_large_output_channel_split_scalar(
 #endif
 #endif
 
-#if defined(CONV_XYPOOL_FUSED_LARGE_PADDED)
+#if (CONV_XYPOOL_FUSED_LARGE_PADDED)
 #ifdef INT8_ACT
 
 //*****************************************************************************
@@ -1561,7 +1552,7 @@ void fused_conv2dk1_xy_pool_i8_large_padded_scalar(
 #endif
 #endif
 
-#if defined(CONV_XYPOOL_FUSED_LARGE)
+#if (CONV_XYPOOL_FUSED_LARGE)
 #ifdef INT8_ACT
 
 //*****************************************************************************
