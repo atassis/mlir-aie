@@ -19,6 +19,7 @@ from ...dialects._aie_ops_gen import (  # pyright: ignore[reportMissingImports]
     ObjectFifoCreateOp,
 )
 from ...dialects.aie import object_fifo, object_fifo_link
+from ...helpers.taplib import TensorAccessPattern
 from ...helpers.util import (
     NpuDType,
     np_ndarray_type_get_dtype,
@@ -737,6 +738,62 @@ class ObjectFifoHandle(Resolvable):
             )
         self._endpoint = endpoint
 
+    def _object_count_tap(self, rt_data, objects: int, object_offset: int):
+        """Build a contiguous access pattern covering ``objects`` of the fifo's objects.
+
+        A runtime buffer's access pattern is expressed in that buffer's element
+        type, while what the stream carries is objects. Where the two element
+        types differ - a host buffer viewing the bytes of a differently-typed
+        stream - the caller otherwise converts by hand at every call site, which
+        is where a units mistake goes unnoticed. Given the count, the conversion
+        is done here from the fifo's own geometry.
+        """
+        if rt_data.is_scalar:
+            raise ValueError("objects= needs an array RuntimeData, not a scalar")
+        if objects < 1 or object_offset < 0:
+            raise ValueError(
+                f"objects= must be at least 1 and object_offset= non-negative, "
+                f"got objects={objects}, object_offset={object_offset}"
+            )
+
+        fifo_obj_type = self._object_fifo.obj_type
+        if not self._is_prod and self._object_fifo._consumer_obj_type is not None:
+            fifo_obj_type = self._object_fifo._consumer_obj_type
+        buf_elem = np_ndarray_type_to_memref_type(rt_data.arr_type).element_type
+        fifo_elem = np_ndarray_type_to_memref_type(fifo_obj_type).element_type
+        weights = transfer_element_weights(buf_elem, fifo_elem)
+        if weights is None:
+            raise ValueError(
+                f"objects= cannot size a transfer between {buf_elem} and "
+                f"{fifo_elem}: neither reports a width both can be measured in. "
+                f"Pass an explicit tap instead."
+            )
+        buf_weight, fifo_weight = weights
+        obj_elems = int(np.prod(np_ndarray_type_get_shape(fifo_obj_type)))
+        span = obj_elems * fifo_weight
+        if span % buf_weight:
+            raise ValueError(
+                f"objects= cannot size a transfer on ObjectFifo "
+                f"{self._object_fifo.name!r}: one {obj_elems}x{fifo_elem} object "
+                f"is not a whole number of {buf_elem} elements. Pass an explicit "
+                f"tap instead."
+            )
+        per_object = span // buf_weight
+
+        shape = np_ndarray_type_get_shape(rt_data.arr_type)
+        total = int(np.prod(shape))
+        start, length = object_offset * per_object, objects * per_object
+        if start + length > total:
+            raise ValueError(
+                f"{'fill' if self._is_prod else 'drain'}() on ObjectFifo "
+                f"{self._object_fifo.name!r}: {objects} object(s) at object "
+                f"offset {object_offset} runs to element {start + length} of a "
+                f"buffer holding {total}."
+            )
+        return TensorAccessPattern(
+            (total,), offset=start, sizes=[1, 1, 1, length], strides=[0, 0, 0, 1]
+        )
+
     def _check_covers_whole_objects(self, rt_data, tap, sizes, transfer_len):
         """Reject a transfer that stops part-way through an objectFIFO object.
 
@@ -807,6 +864,8 @@ class ObjectFifoHandle(Resolvable):
         offset=None,
         transfer_len=None,
         managed=True,
+        objects=None,
+        object_offset=0,
     ):
         """Shared body for fill()/drain().
 
@@ -819,7 +878,9 @@ class ObjectFifoHandle(Resolvable):
         ``sizes``/``strides``/``offset``/``transfer_len`` whose entries may be
         runtime SSA values (the dynamic path). The two forms are mutually
         exclusive; when neither is given, a linear transfer of the whole buffer
-        is used.
+        is used. ``objects`` is a third form: a count of the fifo's own objects,
+        which spares the caller converting stream geometry into buffer elements
+        by hand.
 
         When ``managed`` is True (default), the transfer is enrolled in a
         TaskGroup (explicit ``group`` or the sequence's implicit one), which
@@ -848,11 +909,18 @@ class ObjectFifoHandle(Resolvable):
             )
 
         explicit = any(v is not None for v in (sizes, strides, offset, transfer_len))
+        if objects is not None and (tap is not None or explicit):
+            raise ValueError(
+                "Pass either objects=, tap, or sizes/strides/offset/transfer_len, "
+                "not more than one."
+            )
         if tap is not None and explicit:
             raise ValueError(
                 "Pass either tap or sizes/strides/offset/transfer_len, not both."
             )
-        if tap is None and not explicit:
+        if objects is not None:
+            tap = self._object_count_tap(rt_data, objects, object_offset)
+        elif tap is None and not explicit:
             tap = rt_data.default_tap()
 
         self._check_covers_whole_objects(rt_data, tap, sizes, transfer_len)
@@ -914,6 +982,8 @@ class ObjectFifoHandle(Resolvable):
         offset=None,
         transfer_len=None,
         managed: bool = True,
+        objects: int | None = None,
+        object_offset: int = 0,
     ):
         """Fill this producer ObjectFifo with data from the ``source`` runtime buffer.
 
@@ -936,6 +1006,8 @@ class ObjectFifoHandle(Resolvable):
             offset,
             transfer_len,
             managed,
+            objects,
+            object_offset,
         )
 
     def drain(
@@ -951,6 +1023,8 @@ class ObjectFifoHandle(Resolvable):
         offset=None,
         transfer_len=None,
         managed: bool = True,
+        objects: int | None = None,
+        object_offset: int = 0,
     ):
         """Drain this consumer ObjectFifo, writing data to the ``dest`` runtime buffer.
 
@@ -973,6 +1047,8 @@ class ObjectFifoHandle(Resolvable):
             offset,
             transfer_len,
             managed,
+            objects,
+            object_offset,
         )
 
     def all_of_endpoints(self) -> list[ObjectFifoEndpoint]:
