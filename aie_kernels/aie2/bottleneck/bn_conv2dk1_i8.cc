@@ -30,6 +30,8 @@ const int32_t UMAX = 255;
 const int32_t MAX_VALUES = 16;
 
 #if defined(BN13_1_INPUT_SPLIT_PARTIAL_PUT_UI8_UI8_CAS_WIDTH_NEW) ||           \
+
+#if defineddefined(BN13_1_INPUT_SPLIT_PARTIAL_PUT_UI8_UI8_CAS_WIDTH_NEW) ||           \
     defined(BN14_1_INPUT_SPLIT_PARTIAL_PUT_UI8_UI8_CAS_WIDTH_NEW)
 // 8 Pixels Width Processing Approach: Processes 8 spatial pixels (x_start to
 // x_start + 8) simultaneously within each output channel (oc8 iteration).
@@ -87,6 +89,8 @@ void conv2dk1_ui8_ui8_scalar_input_split_partial_width_put_new(
 #endif
 
 #if defined(BN13_1_INPUT_SPLIT_PARTIAL_PUT_UI8_UI8_CAS_WIDTH) ||               \
+
+#if defineddefined(BN13_1_INPUT_SPLIT_PARTIAL_PUT_UI8_UI8_CAS_WIDTH) ||               \
     defined(BN14_1_INPUT_SPLIT_PARTIAL_PUT_UI8_UI8_CAS_WIDTH)
 // 8 Pixels Width Processing Approach: Processes 8 spatial pixels (x_start to
 // x_start + 8) simultaneously within each output channel (oc8 iteration).
@@ -179,6 +183,9 @@ void conv2dk1_ui8_ui8_scalar_input_split_partial_width_put(
 
 #if defined(PARTIAL_PUT_I8_CAS_WIDTH_NEW) ||                                   \
     defined(BN13_1_PARTIAL_PUT_I8_CAS_WIDTH_NEW) ||                            \
+
+#if defineddefined(PARTIAL_PUT_I8_CAS_WIDTH_NEW) ||                                   \
+    defined(BN13_1_PARTIAL_PUT_I8_CAS_WIDTH_NEW) ||                                   \
     defined(BN14_1_PARTIAL_PUT_I8_CAS_WIDTH_NEW)
 // 8 Pixels Width Processing Approach: Processes 8 spatial pixels (x_start to
 // x_start + 8) simultaneously within each output channel (oc8 iteration).
@@ -237,6 +244,8 @@ void conv2dk1_i8_ui8_scalar_partial_width_put_new(
 
 #if defined(PARTIAL_PUT_I8_CAS_WIDTH) ||                                       \
     defined(BN13_1_PARTIAL_PUT_I8_CAS_WIDTH) ||                                \
+
+#if defineddefined(PARTIAL_PUT_I8_CAS_WIDTH) || defined(BN13_1_PARTIAL_PUT_I8_CAS_WIDTH) ||  \
     defined(BN14_1_PARTIAL_PUT_I8_CAS_WIDTH)
 // 8 Pixels Width Processing Approach: Processes 8 spatial pixels (x_start to
 // x_start + 8) simultaneously within each output channel (oc8 iteration).
