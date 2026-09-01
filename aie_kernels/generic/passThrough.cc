@@ -36,9 +36,6 @@ __attribute__((noinline)) void passThrough_aie(T *restrict in, T *restrict out,
 extern "C" {
 
 #ifndef BIT_WIDTH
-#error                                                                         \
-    "passThrough.cc: BIT_WIDTH selects the element type of the exported wrappers and has no safe default. Pass -DBIT_WIDTH=8, 16 or 32."
-
 #error "passThrough.cc: BIT_WIDTH selects the element type of the exported wrappers and has no safe default. Pass -DBIT_WIDTH=8, 16 or 32."
 #endif
 
@@ -76,9 +73,6 @@ void passThroughTile(int32_t *in, int32_t *out, int32_t tileHeight,
 }
 
 #else
-#error                                                                         \
-    "passThrough.cc: BIT_WIDTH selects the element type of the exported wrappers and has no safe default -- an unset BIT_WIDTH expands to 0 and would silently select the widest branch. Pass -DBIT_WIDTH=8, 16 or 32."
-
 #error "passThrough.cc: BIT_WIDTH selects the element type of the exported wrappers and has no safe default -- an unset BIT_WIDTH expands to 0 and would silently select the widest branch. Pass -DBIT_WIDTH=8, 16 or 32."
 #endif
 
