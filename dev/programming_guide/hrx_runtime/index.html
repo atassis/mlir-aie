@@ -15,10 +15,10 @@
         <link rel="canonical" href="https://xilinx.github.io/mlir-aie/dev/programming_guide/hrx_runtime/">
       
       
-        <link rel="prev" href="../iron_configuration/">
+        <link rel="prev" href="../core_data_memory/">
       
       
-        <link rel="next" href="../compilation_stages/">
+        <link rel="next" href="../hsa_runtime/">
       
       
         
@@ -2076,6 +2076,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -2139,6 +2143,34 @@
     
   
     IRON Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../core_data_memory/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Core Data Memory
   
 
     
@@ -2294,6 +2326,34 @@
   
 </nav>
       
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../hsa_runtime/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    HSA Runtime (ROCR)
+  
+
+    
+  </span>
+  
+  
+
+      </a>
     </li>
   
 
@@ -2990,6 +3050,8 @@
       
         
       
+        
+      
     
     
     
@@ -3034,6 +3096,34 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../ObjectFifoLowering/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    ObjectFifo Lowering
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -3687,9 +3777,13 @@ values and every HRX environment variable
 <code>IRON_HRX_TIMEOUT</code>) is documented in
 <a href="../iron_configuration/#host-runtime-backend-selection-npu_runtime">IRON Configuration</a>.</p>
 <h2 id="provisioning-libhrx">Provisioning <code>libhrx</code><a class="headerlink" href="#provisioning-libhrx" title="Permanent link">&para;</a></h2>
-<p>Fetch, checksum-verify, and extract the pinned HRX release (coordinates in
-<code>utils/hrx-release.env</code>) with the helper script, then source the environment it
-prints:</p>
+<p>A pip-installed package that ships <code>libhrx</code> in the conventional layout
+(<code>&lt;package&gt;/lib/libhrx.so*</code> on Linux, <code>&lt;package&gt;/bin/hrx.dll</code> on Windows) is
+enough for the Python host. Discovery finds it without importing the package and
+without <code>HRX_*</code> variables. CMake does not search site-packages.</p>
+<p>For a source/release tree, fetch, checksum-verify, and extract the pinned HRX
+release (coordinates in <code>utils/hrx-release.env</code>) with the helper script, then
+source the environment it prints:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nb">source</span><span class="w"> </span><span class="s2">&quot;</span><span class="k">$(</span>utils/fetch-hrx-release.sh<span class="k">)</span><span class="s2">&quot;</span>
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="c1"># or, in one step:  eval &quot;$(utils/fetch-hrx-release.sh --print-env)&quot;</span>
 </code></pre></div>
@@ -3793,7 +3887,7 @@ dispatch on a single context — the same expectation the XRT Python runtime has
       <nav class="md-footer__inner md-grid" aria-label="Footer" >
         
           
-          <a href="../iron_configuration/" class="md-footer__link md-footer__link--prev" aria-label="Previous: IRON Configuration">
+          <a href="../core_data_memory/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Core Data Memory">
             <div class="md-footer__button md-icon">
               
               <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
@@ -3803,20 +3897,20 @@ dispatch on a single context — the same expectation the XRT Python runtime has
                 Previous
               </span>
               <div class="md-ellipsis">
-                IRON Configuration
+                Core Data Memory
               </div>
             </div>
           </a>
         
         
           
-          <a href="../compilation_stages/" class="md-footer__link md-footer__link--next" aria-label="Next: Compilation Stages">
+          <a href="../hsa_runtime/" class="md-footer__link md-footer__link--next" aria-label="Next: HSA Runtime (ROCR)">
             <div class="md-footer__title">
               <span class="md-footer__direction">
                 Next
               </span>
               <div class="md-ellipsis">
-                Compilation Stages
+                HSA Runtime (ROCR)
               </div>
             </div>
             <div class="md-footer__button md-icon">
