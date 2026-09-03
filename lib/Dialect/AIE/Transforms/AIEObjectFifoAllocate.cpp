@@ -891,15 +891,23 @@ struct AIEObjectFifoAllocatePass
     return success();
   }
 
-  /// The object the far end of `endpoint`'s route receives, or null when that
-  /// is not one unambiguous type. A broadcast to endpoints holding different
-  /// object types, and an endpoint that pads into its object - which receives
-  /// more than the shim sends - are both the null case: neither can be
-  /// compared against a shim transfer's extent.
+  /// What a shim allocation records about the fifo on the far side.
+  struct PeerObject {
+    TypeAttr elemType;
+    UnitAttr streamLenDecoupled;
+  };
+
+  /// What the far end of `endpoint`'s route receives: the object type, and
+  /// whether that fifo declares its wire bytes decoupled from its objects.
+  ///
+  /// The type is null when it is not one unambiguous answer. A broadcast to
+  /// endpoints holding different object types, and an endpoint that pads into
+  /// its object - which receives more than the shim sends - are both the null
+  /// case: neither can be compared against a shim transfer's extent.
   ///
   /// Resolved through the route rather than through the `fifoName` the two ends
   /// share: that attribute is optional, and hand-written IR routinely omits it.
-  TypeAttr peerObjectType(RouteEndpoint endpoint) {
+  PeerObject peerObject(RouteEndpoint endpoint) {
     auto self = FlatSymbolRefAttr::get(
         builder.getContext(),
         cast<SymbolOpInterface>(endpoint.getOperation()).getName());
@@ -913,6 +921,7 @@ struct AIEObjectFifoAllocatePass
       }
     }
 
+    PeerObject result;
     TypeAttr found;
     for (FlatSymbolRefAttr peerName : peers) {
       auto dma = dyn_cast_or_null<ObjectFifoDmaEndpointOp>(
@@ -920,13 +929,18 @@ struct AIEObjectFifoAllocatePass
       if (!dma || dma.getPadDimensions()) {
         return {};
       }
-      TypeAttr elemType = dma.getPoolOp().getElemTypeAttr();
+      ObjectFifoPoolOp pool = dma.getPoolOp();
+      if (pool.getStreamLenDecoupled()) {
+        result.streamLenDecoupled = builder.getUnitAttr();
+      }
+      TypeAttr elemType = pool.getElemTypeAttr();
       if (found && found != elemType) {
-        return {};
+        return result;
       }
       found = elemType;
     }
-    return found;
+    result.elemType = found;
+    return result;
   }
 
   /// A shim endpoint has no memory of its own, so the runtime needs its channel
@@ -942,6 +956,7 @@ struct AIEObjectFifoAllocatePass
       std::string name = (*fifoName + "_shim_alloc").str();
       if (!SymbolTable::lookupNearestSymbolFrom<ShimDMAAllocationOp>(
               device, builder.getStringAttr(name))) {
+        PeerObject peer = peerObject(endpoint);
         ShimDMAAllocationOp::create(
             builder, endpoint.getLoc(), builder.getStringAttr(name),
             endpoint.getTile(),
@@ -949,8 +964,8 @@ struct AIEObjectFifoAllocatePass
                                    endpoint.getRouteDirection()),
             builder.getI64IntegerAttr(*channel),
             builder.getBoolAttr(endpoint.getRouteBundle() == WireBundle::PLIO),
-            endpoint->getAttrOfType<PacketInfoAttr>("packet"),
-            peerObjectType(endpoint));
+            endpoint->getAttrOfType<PacketInfoAttr>("packet"), peer.elemType,
+            peer.streamLenDecoupled);
       }
       // The runtime sequence reaches the fifo through this record.
       (void)SymbolTable::replaceAllSymbolUses(
