@@ -546,6 +546,10 @@ void AIEObjectFifoSplitPass::createLinkPools() {
 
     // The pool is shared by every participant, but `owner` is only one of them:
     // a decoupled stream on any of the others would be dropped here.
+
+    // The pool is shared by both sides of the link, but `owner` is only one of
+    // them: a decoupled stream on the other side would be dropped here, and the
+    // shim allocation built from this pool would then reject its own transfer.
     auto declaresDecoupled = [](ObjectFifoCreateOp fifo) {
       return fifo.getStreamLenDecoupled();
     };
