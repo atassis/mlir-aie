@@ -90,6 +90,7 @@ class ObjectFifo(Resolvable):
         aie_stream: tuple[int, int] | None = None,
         packet: bool = False,
         packet_id: int | None = None,
+        stream_len_decoupled: bool = False,
     ):
         """Construct an ObjectFifo.
 
@@ -156,6 +157,10 @@ class ObjectFifo(Resolvable):
                 designs that route on the id (e.g. a MemTile dispatching to one of several
                 cores). Requires ``packet``; when absent, allocation picks an id no other
                 flow is using. Defaults to None.
+            stream_len_decoupled (bool, optional): Declare that the bytes crossing this
+                fifo's shim channel are not a count of its objects, so no transfer extent
+                can be checked against the object size. Set it for a channel whose DMA
+                (de)compresses. Defaults to False.
 
         Raises:
             ValueError: If ``depth`` is provided and is less than 1.
@@ -192,6 +197,7 @@ class ObjectFifo(Resolvable):
         self._aie_stream: tuple[int, int] | None = aie_stream
         self._packet: bool = packet
         self._packet_id: int | None = packet_id
+        self._stream_len_decoupled: bool = stream_len_decoupled
 
     @property
     def depth(self) -> int | None:
@@ -476,6 +482,7 @@ class ObjectFifo(Resolvable):
                 consumer_datatype=consumer_datatype,
                 packet=self._packet or None,
                 packet_id=self._packet_id,
+                stream_len_decoupled=self._stream_len_decoupled or None,
             )
             self._op = op
 
@@ -934,6 +941,7 @@ class ObjectFifoHandle(Resolvable):
         pad_dimensions: list[PadDims | None] | None = None,
         pad_value: list[int] | None = None,
         channels: list[int | None] | None = None,
+        stream_len_decoupled: bool = False,
     ) -> list[ObjectFifo]:
         """Split the data from an ObjectFifoConsumer handle by sending it to producers in N newly constructed ObjectFifos.
 
@@ -951,6 +959,7 @@ class ObjectFifoHandle(Resolvable):
             repeat_counts (list[int | None] | None, optional): Per-sub-fifo MemTile DMA repeat count (see ObjectFifo.repeat_count). Defaults to None.
             pad_dimensions (list[PadDims | None] | None, optional): Per-sub-fifo (before, after) pad counts (see ObjectFifo.pad_dimensions). Defaults to None.
             pad_value (list[int] | None, optional): Per-sub-fifo per-element pad fill value (see ObjectFifo.pad_value). Defaults to None.
+            stream_len_decoupled (bool, optional): Set stream_len_decoupled on each new ObjectFifo (see ObjectFifo.stream_len_decoupled). Defaults to False.
 
             channels (list[int | None] | None, optional): Pin the hardware DMA
                 channel each output ObjectFifo produces on, one per output.
@@ -1026,6 +1035,7 @@ class ObjectFifoHandle(Resolvable):
                     repeat_count=repeat_counts[i],
                     pad_dimensions=pad_dimensions[i],
                     pad_value=pad_value[i],
+                    stream_len_decoupled=stream_len_decoupled,
                 )
             )
 
@@ -1057,6 +1067,7 @@ class ObjectFifoHandle(Resolvable):
         pad_dimensions: PadDims | None = None,
         pad_value: int = 0,
         channel: int | None = None,
+        stream_len_decoupled: bool = False,
     ) -> ObjectFifo:
         """Forward an ObjectFifoHandle of type consumer to a newly-constructed ObjectFifo.
 
@@ -1080,6 +1091,8 @@ class ObjectFifoHandle(Resolvable):
                 forwarded ObjectFifo produces on. forward() builds that
                 producer handle itself, so this is the only place to say it.
                 Defaults to None (assigned by the compiler).
+            stream_len_decoupled (bool, optional): Set stream_len_decoupled on the new ObjectFifo
+                (see ObjectFifo.stream_len_decoupled). Defaults to False.
 
         Raises:
             ValueError: Arguments are Validated
@@ -1108,6 +1121,7 @@ class ObjectFifoHandle(Resolvable):
             pad_dimensions=[pad_dimensions] if pad_dimensions is not None else None,
             pad_value=[pad_value] if pad_value else None,
             channels=[channel] if channel is not None else None,
+            stream_len_decoupled=stream_len_decoupled,
         )
         return forward_fifo[0]
 
