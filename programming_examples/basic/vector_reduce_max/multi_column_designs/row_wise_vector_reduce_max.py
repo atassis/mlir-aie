@@ -51,6 +51,11 @@ ELEMS_PER_CORE = 256
 N_CORES = 8
 
 
+# Per-core tile and core count; the CLI validator and the design share them.
+ELEMS_PER_CORE = 256
+N_CORES = 8
+
+
 @iron.jit
 def vector_reduce_max(
     a_in: In,

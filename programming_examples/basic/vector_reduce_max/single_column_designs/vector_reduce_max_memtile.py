@@ -53,6 +53,10 @@ from ml_dtypes import bfloat16
 N_MEM_ELEMS = 2048
 
 
+# Elements per memtile tile; the CLI validator and the design share it.
+N_MEM_ELEMS = 2048
+
+
 @iron.jit
 def vector_reduce_max(
     a_in: In,
