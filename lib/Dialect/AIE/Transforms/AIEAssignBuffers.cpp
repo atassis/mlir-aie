@@ -548,6 +548,18 @@ static bool basicAllocation(TileOp tile) {
 
   sortBuffersByAddress(allBuffers_on_tile);
 
+  // Raise the allocator's high-water mark over every buffer, not just the last:
+  // the vector is sorted by start address, and buffers in different
+  // alloc_groups may overlap, so the greatest start address is no longer also
+  // the greatest end address. Intra-group alignment padding can also push a
+  // member past its unit's nominal extent.
+  for (auto buffer : allBuffers_on_tile) {
+    auto addrOpt = buffer.getAddress();
+    assert(addrOpt.has_value() && "buffer must have address assigned");
+    highWater =
+        std::max<int64_t>(highWater, *addrOpt + buffer.getAllocationSize());
+  }
+
   return checkAndPrintOverlapStackframe(stacksize, allBuffers_on_tile) &&
          checkAndPrintBufferOverlap(allBuffers_on_tile, tileAlignBitWidth,
                                     maxVecAlignBits) &&
