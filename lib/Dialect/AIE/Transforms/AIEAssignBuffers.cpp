@@ -303,14 +303,38 @@ struct AllocUnit {
   // largest group's total, not the sum of every group. An ungrouped buffer is a
   // unit holding one group of one member, which is the pre-existing behaviour.
   SmallVector<SmallVector<BufferOp>> groups;
-  int64_t size = 0;     // max over groups of that group's summed extent
+  int64_t size = 0;     // max over groups of that group's padded extent
   bool aligned = false; // any member aligned => align the shared base
 };
 } // namespace
 
+// Simulate laying `group` out sequentially from a base of 0, applying each
+// member's own alignment exactly as the real placement loop in
+// basicAllocation does, and return the resulting extent (including any
+// inter-member padding). Valid at any base that is itself aligned to the
+// unit's `unitAlignBits` (the max required alignment over its members, see
+// its use in basicAllocation): every member's required alignment then
+// divides the base's, so the padding pattern -- and hence the extent -- does
+// not depend on the base's actual value.
+static int64_t groupExtent(ArrayRef<BufferOp> group,
+                           uint32_t tileAlignBitWidth,
+                           uint32_t maxVecAlignBitWidth) {
+  int64_t offset = 0;
+  for (auto buffer : group) {
+    if (buffer.getAligned())
+      offset = getAlignedAddress(
+          offset,
+          getRequiredAlignBits(buffer, tileAlignBitWidth, maxVecAlignBitWidth));
+    offset += buffer.getAllocationSize();
+  }
+  return offset;
+}
+
 // Group this tile's unallocated buffers into allocation units, preserving the
 // pass's existing largest-first order across units.
-static SmallVector<AllocUnit> buildAllocUnits(ArrayRef<BufferOp> buffers) {
+static SmallVector<AllocUnit> buildAllocUnits(ArrayRef<BufferOp> buffers,
+                                              uint32_t tileAlignBitWidth,
+                                              uint32_t maxVecAlignBitWidth) {
   SmallVector<AllocUnit> units;
   // Every alloc_group on this tile overlays every other, so they share ONE
   // unit. groupIndex maps a group name to its slot within that unit's group
@@ -337,10 +361,10 @@ static SmallVector<AllocUnit> buildAllocUnits(ArrayRef<BufferOp> buffers) {
       u.groups.push_back({});
     u.groups[it->second].push_back(buffer);
     u.aligned |= buffer.getAligned();
-    // A group's extent is its members' sum; the unit's is the largest such sum.
-    int64_t extent = 0;
-    for (auto member : u.groups[it->second])
-      extent += member.getAllocationSize();
+    // A group's extent is its members' padded layout; the unit's is the
+    // largest such extent.
+    int64_t extent = groupExtent(u.groups[it->second], tileAlignBitWidth,
+                                 maxVecAlignBitWidth);
     u.size = std::max(u.size, extent);
   }
   llvm::stable_sort(units, [](const AllocUnit &a, const AllocUnit &b) {
@@ -496,7 +520,7 @@ static bool basicAllocation(TileOp tile) {
   for (auto buffer : allBuffers_on_tile)
     if (!buffer.getAddress())
       unpinnedBuffers.push_back(buffer);
-  SmallVector<AllocUnit> units = buildAllocUnits(unpinnedBuffers);
+  SmallVector<AllocUnit> units = buildAllocUnits(unpinnedBuffers, tileAlignBitWidth, maxVecAlignBits);
 
   SmallVector<BufferAllocation> layout;
   for (auto buffer : allocated_buffers) {
@@ -545,6 +569,7 @@ static bool basicAllocation(TileOp tile) {
         buffer.setAddress(offset);
         offset += buffer.getAllocationSize();
       }
+      unitEnd = std::max(unitEnd, offset);
     }
   }
 
