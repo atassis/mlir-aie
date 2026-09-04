@@ -209,11 +209,15 @@ struct AIEObjectFifoSplitPass
                               std::optional<int> repeatCount,
                               bool streamLenDecoupled = false,
                               bool disableSynchronization = false) {
+
+                              bool streamLenDecoupled = false) {
     auto pool = ObjectFifoPoolOp::create(
         builder, loc, name, tile, depth, elemType, /*buffers=*/ArrayAttr(),
         /*locks=*/ArrayAttr(),
         repeatCount ? builder.getI32IntegerAttr(*repeatCount) : IntegerAttr(),
         disableSynchronization || from.getDisableSynchronization(),
+
+        from.getDisableSynchronization(),
         streamLenDecoupled || from.getStreamLenDecoupled(),
         builder.getStringAttr(from.name().getValue()),
         holdsInitialContents ? from.getInitValuesAttr() : ArrayAttr());
@@ -554,6 +558,8 @@ void AIEObjectFifoSplitPass::createLinkPools() {
                            /*holdsInitialContents=*/ownerIsOutput,
                            linkOp.getRepeatCount(), streamLenDecoupled,
                            disableSynchronization);
+
+                           linkOp.getRepeatCount(), streamLenDecoupled);
     linkPoolOwner.insert(owner);
 
     SmallVector<int32_t> allSegments;
