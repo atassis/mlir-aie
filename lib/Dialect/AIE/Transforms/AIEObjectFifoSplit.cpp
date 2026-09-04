@@ -207,12 +207,13 @@ struct AIEObjectFifoSplitPass
                               ArrayRef<std::pair<int64_t, int64_t>> extents,
                               bool holdsInitialContents,
                               std::optional<int> repeatCount,
-                              bool streamLenDecoupled = false) {
+                              bool streamLenDecoupled = false,
+                              bool disableSynchronization = false) {
     auto pool = ObjectFifoPoolOp::create(
         builder, loc, name, tile, depth, elemType, /*buffers=*/ArrayAttr(),
         /*locks=*/ArrayAttr(),
         repeatCount ? builder.getI32IntegerAttr(*repeatCount) : IntegerAttr(),
-        from.getDisableSynchronization(),
+        disableSynchronization || from.getDisableSynchronization(),
         streamLenDecoupled || from.getStreamLenDecoupled(),
         builder.getStringAttr(from.name().getValue()),
         holdsInitialContents ? from.getInitValuesAttr() : ArrayAttr());
@@ -541,11 +542,18 @@ void AIEObjectFifoSplitPass::createLinkPools() {
     };
     bool streamLenDecoupled = llvm::any_of(ins, declaresDecoupled) ||
                               llvm::any_of(outs, declaresDecoupled);
+    // whether its locks are generated must not depend on which fifo that is.
+    auto asksToSkipLocks = [](ObjectFifoCreateOp fifo) {
+      return fifo.getDisableSynchronization();
+    };
+    bool disableSynchronization = llvm::any_of(ins, asksToSkipLocks) ||
+                                  llvm::any_of(outs, asksToSkipLocks);
 
     auto pool = createPool(linkOp.getLoc(), name, *sharedTile, depth, elemType,
                            owner, extents,
                            /*holdsInitialContents=*/ownerIsOutput,
-                           linkOp.getRepeatCount(), streamLenDecoupled);
+                           linkOp.getRepeatCount(), streamLenDecoupled,
+                           disableSynchronization);
     linkPoolOwner.insert(owner);
 
     SmallVector<int32_t> allSegments;
