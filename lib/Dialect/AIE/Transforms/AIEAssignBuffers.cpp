@@ -194,6 +194,7 @@ static bool checkAndPrintBufferOverlap(ArrayRef<BufferOp> sortedBuffers,
     // or two ungrouped buffers would compare equal as absent and exempt every
     // ordinary overlap.
     BufferOp blocker;
+    int64_t blockerAddr = 0;
     int64_t blockerEnd = 0;
     for (size_t j = 0; j < i; ++j) {
       auto other = sortedBuffers[j];
@@ -205,6 +206,7 @@ static bool checkAndPrintBufferOverlap(ArrayRef<BufferOp> sortedBuffers,
       assert(otherAddrOpt.has_value() && "buffer must have address assigned");
       int64_t end = *otherAddrOpt + other.getAllocationSize();
       if (end > blockerEnd) {
+        blockerAddr = *otherAddrOpt;
         blockerEnd = end;
         blocker = other;
       }
@@ -213,7 +215,7 @@ static bool checkAndPrintBufferOverlap(ArrayRef<BufferOp> sortedBuffers,
       cur.emitOpError("")
           << bufferLabel(cur) << " at address 0x" << llvm::utohexstr(curAddr)
           << " overlaps with " << bufferLabel(blocker) << " at address 0x"
-          << llvm::utohexstr(blocker.getAddress().value())
+          << llvm::utohexstr(blockerAddr)
           << " (size: " << blocker.getAllocationSize() << " bytes)";
       return false;
     }
@@ -341,9 +343,9 @@ static SmallVector<AllocUnit> buildAllocUnits(ArrayRef<BufferOp> buffers) {
       extent += member.getAllocationSize();
     u.size = std::max(u.size, extent);
   }
-  std::stable_sort(
-      units.begin(), units.end(),
-      [](const AllocUnit &a, const AllocUnit &b) { return a.size > b.size; });
+  llvm::stable_sort(units, [](const AllocUnit &a, const AllocUnit &b) {
+    return a.size > b.size;
+  });
   return units;
 }
 
@@ -1337,7 +1339,13 @@ struct AIEAssignBufferAddressesPass
         tileAllocationScheme = clAllocScheme;
       }
 
-      if (tileAllocationScheme == "basic-sequential") {
+      // Only basic-sequential implements overlays, so a tile carrying one
+      // takes that path rather than trying bank-aware first and silently
+      // dropping them.
+      bool needsBasic = tileAllocationScheme == "basic-sequential" ||
+                        (tileAllocationScheme != "bank-aware" &&
+                         tileHasAllocGroup(device, tile));
+      if (needsBasic) {
         if (!basicAllocation(tile)) {
           emitAllocationFailure(tile, "basic-sequential");
           return signalPassFailure();
@@ -1351,13 +1359,6 @@ struct AIEAssignBufferAddressesPass
         }
         if (simpleBankAwareAllocation(tile) != BankAwareResult::Success) {
           emitAllocationFailure(tile, "bank-aware");
-          return signalPassFailure();
-        }
-      } else if (tileHasAllocGroup(device, tile)) {
-        // Only basic-sequential implements overlays, so do not try bank-aware
-        // first and silently drop them.
-        if (!basicAllocation(tile)) {
-          emitAllocationFailure(tile, "basic-sequential");
           return signalPassFailure();
         }
       } else {
