@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -96,6 +97,29 @@ def _kernel_pch(cxx: str, pch_flags: list[str]) -> str | None:
     if pch.exists():
         return str(pch)
 
+    # Everyone who reaches here missed, so build under a lock and re-check --
+    # otherwise every concurrent build spends ~2.7 s and ~180 MB producing the
+    # same 19 MB file. A thread lock alone covers only one process; kernel
+    # compiles inside one build AND separate builds on one machine both race.
+    from aie.utils.compile.cache.utils import file_lock
+
+    with _PCH_BUILD_LOCK:
+        if pch.exists():
+            return str(pch)
+        try:
+            with file_lock(str(cache / f"{key}.lock"), timeout_seconds=300):
+                if pch.exists():
+                    return str(pch)
+                return _build_kernel_pch(cxx, pch_flags, cache, key, pch)
+        except (TimeoutError, OSError):
+            # A PCH is an optimisation: never let the lock be why a build stalls.
+            return _build_kernel_pch(cxx, pch_flags, cache, key, pch)
+
+
+_PCH_BUILD_LOCK = threading.Lock()
+
+
+def _build_kernel_pch(cxx, pch_flags, cache, key, pch):
     try:
         empty = cache / f"{key}.h"
         empty.touch()
