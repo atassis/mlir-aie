@@ -777,6 +777,11 @@ def _aiecc_cache_store(entry, work_dir, named, preexisting):
                 shutil.copy2(child, tmp / "workdir" / child.name)
         for flag, dest in named:
             shutil.copy2(dest, tmp / "named" / flag.lstrip("-"))
+        # os.replace refuses a non-empty directory, and `entry` can exist here:
+        # the caller holds this key's lock and only reaches the store after a
+        # restore DECLINED the entry (a missing named output). Clear it first --
+        # still inside that lock, so no reader can be inside it.
+        shutil.rmtree(entry, ignore_errors=True)
         os.replace(tmp, entry)
     except OSError as e:
         logger.debug("aiecc cache: not storing %s (%s)", entry.name, e)
@@ -792,7 +797,16 @@ def _aiecc_cache_prune(root: Path) -> None:
     evicts by age rather than by use.  That is deliberate -- stat'ing every
     entry on every hit costs more than the occasional wrong eviction, and a
     wrongly evicted entry is a recompile, not a fault.
+
+    Every deletion takes the SAME per-key lock the compile path holds while it
+    restores. Without it a concurrent build copying out of an entry gets a
+    half-deleted tree -- a corrupt work dir, not a miss, and the one failure
+    mode of this cache that is worse than not having it. An entry that is busy
+    is skipped rather than waited for: eviction is housekeeping and must never
+    block a build.
     """
+    from aie.utils.compile.cache.utils import file_lock
+
     if _AIECC_CACHE_MAX_GB <= 0:
         return
     try:
@@ -807,7 +821,12 @@ def _aiecc_cache_prune(root: Path) -> None:
         if total <= cap:
             return
         for _, n, d in sorted(sized):
-            shutil.rmtree(d, ignore_errors=True)
+            try:
+                with file_lock(str(root / f"{d.name}.lock"), timeout_seconds=0):
+                    shutil.rmtree(d, ignore_errors=True)
+            except (TimeoutError, OSError):
+                logger.debug("aiecc cache: %s is busy, not evicting", d.name)
+                continue
             total -= n
             logger.debug("aiecc cache: evicted %s", d.name)
             if total <= cap:
