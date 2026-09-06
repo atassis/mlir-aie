@@ -138,12 +138,25 @@ def _kernel_pch(cxx: str, pch_flags: list[str]) -> str | None:
     if pch.exists():
         return str(pch)
 
+    # Two locks, because they guard different duplications. The thread lock is
+    # for the parallel kernel compiles inside ONE build; the file lock is for
+    # concurrent builds, which are the common case on a shared box and would
+    # otherwise each spend ~2.7 s and ~180 MB producing the same 19 MB file.
+    # Both re-check after acquiring: everyone missed the fast path above.
     with _PCH_BUILD_LOCK:
-        # Re-check: concurrent kernel compiles all miss above, and building one
-        # PCH per thread costs the wall this exists to save.
         if pch.exists():
             return str(pch)
-        return _build_kernel_pch(cxx, pch_flags, cache, key, pch)
+        from aie.utils.compile.cache.utils import file_lock
+
+        try:
+            with file_lock(str(cache / f"{key}.lock"), timeout_seconds=300):
+                if pch.exists():
+                    return str(pch)
+                return _build_kernel_pch(cxx, pch_flags, cache, key, pch)
+        except (TimeoutError, OSError):
+            # Never let the lock be the reason a build stalls or fails: a PCH is
+            # an optimisation. Build our own copy and move on.
+            return _build_kernel_pch(cxx, pch_flags, cache, key, pch)
 
 
 _PCH_BUILD_LOCK = threading.Lock()
