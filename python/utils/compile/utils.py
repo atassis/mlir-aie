@@ -608,11 +608,20 @@ def compile_cxx_core_function(
 # comparing `elfs_main_core_*`), so a hit that restored only the named artifacts
 # would break them in a way no test covers.
 #
-# Off unless asked for.  A wrong hit here ships a wrong xclbin, and this project
-# has already paid for a compile cache keyed on too little; `AIE_AIECC_CACHE=1`
-# turns it on, and `python/utils/compile/cache/aiecc_cache_selftest.py` is the
-# invalidation self-test that has to pass before that becomes a default.
-_AIECC_CACHE_ENABLED = os.environ.get("AIE_AIECC_CACHE", "0") == "1"
+# ON by default.  The key covers every input this invocation has -- the MLIR text,
+# the content of every object it links, the tool identities, and every argument
+# that is not a destination -- and `test/python/test_aiecc_cache_key.py` holds it
+# to that: seven input classes that must move the key, two that must not, fail-
+# closed on an unreadable input, and four degenerate key functions each of which
+# must be rejected.  That suite was itself proven non-vacuous by sabotaging the
+# real key three ways and confirming it goes red.  `AIE_AIECC_CACHE=0` disables.
+_AIECC_CACHE_ENABLED = os.environ.get("AIE_AIECC_CACHE", "1") != "0"
+
+# A cache that is on by default and never evicts is a disk-filler, and this
+# project already has one: NPU_CACHE_HOME sits at 2.3 GB / 5082 entries, kept
+# survivable only because CI wipes it per run.  Prune oldest-first past a cap
+# rather than repeat that.  ~3.5 MB per entry for a 24-core design.
+_AIECC_CACHE_MAX_GB = float(os.environ.get("AIE_AIECC_CACHE_MAX_GB", "8"))
 
 # Flags whose VALUE names a destination rather than an input.  The flag itself
 # stays in the key (asking for an xclbin is not the same run as not asking); its
@@ -772,6 +781,39 @@ def _aiecc_cache_store(entry, work_dir, named, preexisting):
     except OSError as e:
         logger.debug("aiecc cache: not storing %s (%s)", entry.name, e)
         shutil.rmtree(tmp, ignore_errors=True)
+        return
+    _aiecc_cache_prune(entry.parent)
+
+
+def _aiecc_cache_prune(root: Path) -> None:
+    """Drop oldest entries until the store is back under the cap.
+
+    Mtime order, not access order: a hit does not touch the entry, so this
+    evicts by age rather than by use.  That is deliberate -- stat'ing every
+    entry on every hit costs more than the occasional wrong eviction, and a
+    wrongly evicted entry is a recompile, not a fault.
+    """
+    if _AIECC_CACHE_MAX_GB <= 0:
+        return
+    try:
+        entries = [d for d in root.iterdir() if d.is_dir()]
+        sized = []
+        total = 0
+        for d in entries:
+            n = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+            total += n
+            sized.append((d.stat().st_mtime, n, d))
+        cap = _AIECC_CACHE_MAX_GB * (1 << 30)
+        if total <= cap:
+            return
+        for _, n, d in sorted(sized):
+            shutil.rmtree(d, ignore_errors=True)
+            total -= n
+            logger.debug("aiecc cache: evicted %s", d.name)
+            if total <= cap:
+                return
+    except OSError:
+        return
 
 
 def _run_aiecc(mlir_file: str, args: list[str]):
