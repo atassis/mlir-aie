@@ -588,6 +588,192 @@ def compile_cxx_core_function(
                 raise RuntimeError(f"[Peano] LLVM bitcode assembly failed{detail}")
 
 
+# --- Content-addressed cache for a whole aiecc invocation ---------------------
+#
+# `CompilableDesign.compile()` bypasses the JIT cache whenever the caller names
+# its output paths ("the caller is presumed to manage their own dependency
+# tracking"), and every design that goes through a build graph rather than
+# @iron.jit does exactly that.  What those callers manage instead is filename +
+# mtime inside one build directory, which is not a build cache: it cannot tell
+# two designs apart that write the same filename, so the graphs that use it end
+# up disabling it -- amd/IRON's encoder-MHA driver gives every build a fresh work
+# dir precisely because four different `--pipelines` values produced one artifact.
+#
+# So key the aiecc run on its INPUTS instead, and let the caller keep naming the
+# destinations.  Measured on that design: an unchanged rebuild costs 7.7 s of
+# aiecc, and 0.3 s when this hits.
+#
+# The whole work directory is stored, not just the requested outputs: aiecc's
+# per-core ELF directories are read by real consumers (trace probes, A/B scripts
+# comparing `elfs_main_core_*`), so a hit that restored only the named artifacts
+# would break them in a way no test covers.
+#
+# Off unless asked for.  A wrong hit here ships a wrong xclbin, and this project
+# has already paid for a compile cache keyed on too little; `AIE_AIECC_CACHE=1`
+# turns it on, and `python/utils/compile/cache/aiecc_cache_selftest.py` is the
+# invalidation self-test that has to pass before that becomes a default.
+_AIECC_CACHE_ENABLED = os.environ.get("AIE_AIECC_CACHE", "0") == "1"
+
+# Flags whose VALUE names a destination rather than an input.  The flag itself
+# stays in the key (asking for an xclbin is not the same run as not asking); its
+# path does not, so one cached build can serve any destination.
+#
+# This list is a policy and it is checked the safe way round: an argument that is
+# not on it is kept VERBATIM, so a flag added to aiecc later over-invalidates the
+# cache instead of being silently ignored.  Note `--xclbin-kernel-name` is NOT
+# here and must not be -- it names the kernel inside the artifact, which is
+# input, not destination, and a suffix rule on "-name=" would wrongly strip it.
+_AIECC_DESTINATION_FLAGS = (
+    "--npu-insts-name",
+    "--xclbin-name",
+    "--pdi-name",
+    "--elf-name",
+    "--full-elf-name",
+    "--txn-name",
+    "--ctrlpkt-name",
+    "--ctrlpkt-elf-name",
+    "--ctrlpkt-dma-seq-name",
+    "--tmpdir",
+    "--output-dir",
+    "--checkpoint",
+    "--repeater-output-dir",
+)
+
+# Flags whose value identifies a TOOLCHAIN by path.  The path is per-install, so
+# it is replaced by a fingerprint of what it points at (see _tool_identity).
+_AIECC_TOOLCHAIN_FLAGS = ("--peano", "--aietools")
+
+
+def _tool_identity(binary: str) -> str:
+    """Fingerprint a toolchain binary by what it is, not where it sits.
+
+    Both aiecc and clang print a git SHA. Only the first line is used: aiecc also
+    prints a `compiled:` timestamp, which differs between two installs of the
+    same commit and would make this key per-machine -- the failure mlir-aie#3427
+    introduced for aiecc by keying on mtime.
+    """
+    try:
+        out = subprocess.run(
+            [binary, "--version"], capture_output=True, check=False
+        ).stdout.decode(errors="replace")
+    except OSError:
+        return ""
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    return " | ".join(lines[:2]) if "git SHA" in out else (lines[0] if lines else "")
+
+
+def _aiecc_cache_key(mlir_text, args, work_dir, use_chess, fold_ddr_addr_offset):
+    """Hash everything that decides what this aiecc run produces.
+
+    Returns None when an input cannot be read, which disables the cache for that
+    call: a key that silently omits an input is worse than no key at all.
+    """
+    h = hashlib.sha256()
+    h.update(b"aiecc-cache-v1\0")
+    h.update(_tool_identity(config.aiecc_path()).encode() + b"\0")
+    h.update(str(use_chess).encode() + b"\0")
+    h.update(str(fold_ddr_addr_offset).encode() + b"\0")
+    h.update(mlir_text.encode() + b"\0")
+
+    for arg in args:
+        flag, _, value = arg.partition("=")
+        if flag in _AIECC_DESTINATION_FLAGS:
+            h.update(flag.encode() + b"=<dest>\0")
+        elif flag in _AIECC_TOOLCHAIN_FLAGS:
+            ident = (
+                _tool_identity(os.path.join(value, "bin", "clang++")) if value else ""
+            )
+            h.update(flag.encode() + b"=" + ident.encode() + b"\0")
+        elif flag.startswith("-j"):
+            # Measured on a 24-core design: insts.bin and every per-core ELF are
+            # byte-identical between -j1 and -j16, and input_with_addresses.mlir
+            # differs only in the work-dir path it embeds -- which two runs at
+            # the SAME -j differ in too. Parallelism is not an input.
+            h.update(b"-j=<any>\0")
+        else:
+            h.update(arg.encode() + b"\0")
+
+    # Every file the module links, by content. This is the one input that is not
+    # in the text: `link_with = "x.o"` resolves against work_dir at aiecc time,
+    # so two runs of identical MLIR against different objects are different runs.
+    for name in sorted(set(re.findall(r'link_with\s*=\s*"([^"]+)"', mlir_text))):
+        path = Path(work_dir) / name
+        try:
+            h.update(name.encode() + b"\0" + hashlib.sha256(path.read_bytes()).digest())
+        except OSError:
+            logger.debug("aiecc cache: cannot read linked object %s; not caching", path)
+            return None
+
+    for arg in args:
+        if arg.startswith("--xclbin-input="):
+            try:
+                h.update(
+                    hashlib.sha256(Path(arg.split("=", 1)[1]).read_bytes()).digest()
+                )
+            except OSError:
+                return None
+
+    return h.hexdigest()[:32]
+
+
+def _aiecc_named_outputs(args):
+    """Return the (flag, path) destinations this invocation was asked to write."""
+    out = []
+    for arg in args:
+        flag, sep, value = arg.partition("=")
+        if sep and flag in _AIECC_DESTINATION_FLAGS and flag.endswith("-name"):
+            out.append((flag, value))
+    return out
+
+
+def _aiecc_cache_dir(key):
+    from aie.utils.compile import NPU_CACHE_HOME
+
+    return NPU_CACHE_HOME / "aiecc" / key
+
+
+def _aiecc_cache_restore(entry, work_dir, named):
+    """Copy a cached run's work directory and named outputs into place."""
+    src = entry / "workdir"
+    if not src.is_dir():
+        return False
+    for flag, dest in named:
+        if not (entry / "named" / flag.lstrip("-")).is_file():
+            return False
+    shutil.copytree(src, work_dir, dirs_exist_ok=True, symlinks=True)
+    for flag, dest in named:
+        os.makedirs(os.path.dirname(os.path.abspath(dest)) or ".", exist_ok=True)
+        shutil.copy2(entry / "named" / flag.lstrip("-"), dest)
+    return True
+
+
+def _aiecc_cache_store(entry, work_dir, named, preexisting):
+    """Record what the run produced, atomically enough to be shared.
+
+    Only entries aiecc created are stored: the caller may have staged inputs into
+    work_dir (amd/IRON symlinks its whole build directory in), and those are the
+    caller's to recreate, not the cache's to own.
+    """
+    tmp = entry.parent / (entry.name + f".tmp{os.getpid()}")
+    try:
+        shutil.rmtree(tmp, ignore_errors=True)
+        (tmp / "workdir").mkdir(parents=True)
+        (tmp / "named").mkdir()
+        for child in Path(work_dir).iterdir():
+            if child.name in preexisting or child.is_symlink():
+                continue
+            if child.is_dir():
+                shutil.copytree(child, tmp / "workdir" / child.name, symlinks=True)
+            else:
+                shutil.copy2(child, tmp / "workdir" / child.name)
+        for flag, dest in named:
+            shutil.copy2(dest, tmp / "named" / flag.lstrip("-"))
+        os.replace(tmp, entry)
+    except OSError as e:
+        logger.debug("aiecc cache: not storing %s (%s)", entry.name, e)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _run_aiecc(mlir_file: str, args: list[str]):
     aiecc_bin = config.aiecc_path()
     cmd = [aiecc_bin, mlir_file] + args
@@ -728,9 +914,31 @@ def compile_mlir_module(
     # If no work_dir is provided, fall back to a temporary file instead.
     if work_dir:
         mlir_file = os.path.join(work_dir, "aie.mlir")
+        mlir_text = str(mlir_module)
         with open(mlir_file, "w") as f:
-            f.write(str(mlir_module))
-        _run_aiecc(mlir_file, args)
+            f.write(mlir_text)
+
+        key = (
+            _aiecc_cache_key(mlir_text, args, work_dir, use_chess, fold_ddr_addr_offset)
+            if _AIECC_CACHE_ENABLED
+            else None
+        )
+        if key is None:
+            _run_aiecc(mlir_file, args)
+        else:
+            from aie.utils.compile.cache.utils import file_lock
+
+            entry = _aiecc_cache_dir(key)
+            named = _aiecc_named_outputs(args)
+            # aie.mlir was just written, so it is an input here and must not be
+            # counted as something aiecc produced.
+            preexisting = {c.name for c in Path(work_dir).iterdir()}
+            with file_lock(str(entry.parent / f"{key}.lock")):
+                if entry.is_dir() and _aiecc_cache_restore(entry, work_dir, named):
+                    logger.debug("aiecc cache hit (%s)", key)
+                else:
+                    _run_aiecc(mlir_file, args)
+                    _aiecc_cache_store(entry, work_dir, named, preexisting)
     else:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".mlir", delete=False) as f:
             f.write(str(mlir_module))
