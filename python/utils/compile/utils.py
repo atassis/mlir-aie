@@ -5,6 +5,7 @@
 #
 """Low-level helpers for compiling MLIR modules and external C++ kernels to NPU artifacts."""
 
+import hashlib
 import logging
 import os
 import re
@@ -22,6 +23,102 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+# --- Precompiled header for the driver-injected intrinsics -------------------
+#
+# The AIE driver `-include`s its intrinsics header into every TU it compiles
+# (clang/lib/Driver/ToolChains/AIE.cpp, AddClangSystemIncludeArgs).  For aie2p
+# that header set is 67k lines of inline intrinsic definitions and Sema re-runs
+# over all of it per kernel.  Measured on an EMPTY translation unit: aie2p costs
+# 2.14 s against 0.45 s for aie2 and 0.019 s for the host, and -ftime-trace puts
+# 2.02 s of the 2.11 s in ParseDeclarationOrFunctionDefinition.  Preprocessing is
+# not the cost (-E is 0.19 s); parsing the inline bodies is.
+#
+# So parse it once into a PCH and pass that back with -mno-vitis-headers, which
+# suppresses the automatic inclusion.  Measured on aie_kernels/aie2p/mha.cc:
+# 5.28 s -> 2.80 s wall and 251.6 MB -> 205.6 MB peak RSS, object byte-identical.
+#
+# Two properties make this safe rather than merely fast:
+#
+#   * The PCH source is an EMPTY header.  The driver injects the intrinsics into
+#     the PCH's own TU exactly as it would into a kernel's, so the PCH holds
+#     precisely what it replaces and no header path has to be located or guessed.
+#
+#   * The key covers only the compiler and the flags THIS function fixes, never a
+#     caller's -I / -D / compile_args.  That is what keeps it to one PCH per
+#     target rather than one per kernel, and it is sound in both directions:
+#     extra caller defines are accepted and produce a byte-identical object
+#     (verified), while a CONFLICTING one is a hard clang error naming the PCH,
+#     not a silently different parse.  The retry below turns that error back into
+#     an ordinary compile so a caller can never be blocked by this optimisation.
+#
+# Set AIE_KERNEL_PCH=0 to disable.
+_PCH_ENABLED = os.environ.get("AIE_KERNEL_PCH", "1") != "0"
+
+
+def _compiler_identity(cxx: str) -> str:
+    """Identify the compiler by what it IS, not by where it sits.
+
+    ``clang --version`` prints the llvm-aie git SHA, identical across installs of
+    one build; a path or an mtime is not.  mlir-aie#3427 keyed aiecc by mtime and
+    made two installs of the same commit disagree -- here the same mistake would
+    serve a PCH built by a different compiler.  Costs ~16 ms, once per process.
+    """
+    try:
+        out = subprocess.run([cxx, "--version"], capture_output=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+    return out.decode(errors="replace").strip()
+
+
+def _kernel_pch(cxx: str, pch_flags: list[str]) -> str | None:
+    """Path to a PCH built with ``pch_flags``, building it on first use.
+
+    Fails OPEN: every error returns None and the caller compiles normally.
+    Written under a temporary name and renamed into place, so a concurrent kernel
+    compile can never read a half-written PCH.
+    """
+    ident = _compiler_identity(cxx)
+    if not ident:
+        return None
+    key = hashlib.sha256("\0".join([ident, *pch_flags]).encode()).hexdigest()[:32]
+    try:
+        # Deferred: aie.utils.compile.__init__ imports this module, so
+        # NPU_CACHE_HOME cannot be imported at module scope.
+        from aie.utils.compile import NPU_CACHE_HOME
+
+        cache = NPU_CACHE_HOME / "pch"
+        cache.mkdir(parents=True, exist_ok=True)
+    except (ImportError, OSError):
+        return None
+
+    pch = cache / f"{key}.pch"
+    if pch.exists():
+        return str(pch)
+
+    try:
+        empty = cache / f"{key}.h"
+        empty.touch()
+        with tempfile.NamedTemporaryFile(
+            dir=cache, prefix=f"{key}.", suffix=".tmp", delete=False
+        ) as tmp:
+            tmp_path = tmp.name
+        ret = subprocess.run(
+            [cxx, "-x", "c++-header", str(empty), "-o", tmp_path, *pch_flags],
+            capture_output=True,
+            check=False,
+        )
+        if ret.returncode != 0 or not os.path.getsize(tmp_path):
+            logger.debug(
+                "PCH build failed; compiling without it:\n%s",
+                ret.stderr.decode(errors="replace"),
+            )
+            os.unlink(tmp_path)
+            return None
+        os.replace(tmp_path, pch)
+    except OSError:
+        return None
+    return str(pch)
 
 
 def resolve_target_arch(device=None) -> str:
@@ -302,13 +399,10 @@ def compile_cxx_core_function(
             f"-I{config.cxx_header_path()}",
         ]
     else:
-        cmd = [
-            config.peano_cxx_path(),
-            source_path,
-            *emit_flags,
-            "-o",
-            f"{output_path}",
-            f"-I{config.cxx_header_path()}",
+        # The flags this function fixes for every kernel, in one place: they go
+        # into the compile AND into the PCH key, and a second copy would let the
+        # two disagree about what a header was parsed with.
+        peano_flags = [
             "-std=c++20",
             "-Wno-parentheses",
             "-Wno-attributes",
@@ -316,11 +410,6 @@ def compile_cxx_core_function(
             "-Wno-empty-body",
             "-O2",
             "-DNDEBUG",
-            # Have the compiler report what it actually read, the way ninja and
-            # ccache learn a translation unit's real inputs.
-            "-MD",
-            "-MF",
-            f"{output_path}.d",
             # Pre-trip aie_api's aie_adf.hpp include guard so stock upstream
             # aie_api never pulls in <adf.h> (Vitis-only, absent from Peano).
             # No mlir-aie kernel uses adf:: symbols, so this only elides dead
@@ -335,9 +424,30 @@ def compile_cxx_core_function(
             # the same stack accounting. -ffunction-sections and
             # -fdata-sections give each symbol its own section, which the
             # attribution in StackSizeAnalysis.h needs.
-            cmd.extend(
-                ["-ffunction-sections", "-fdata-sections", "-fstack-size-section"]
-            )
+            peano_flags += [
+                "-ffunction-sections",
+                "-fdata-sections",
+                "-fstack-size-section",
+            ]
+
+        cmd = [
+            config.peano_cxx_path(),
+            source_path,
+            *emit_flags,
+            "-o",
+            f"{output_path}",
+            f"-I{config.cxx_header_path()}",
+            # Have the compiler report what it actually read, the way ninja and
+            # ccache learn a translation unit's real inputs.
+            "-MD",
+            "-MF",
+            f"{output_path}.d",
+            *peano_flags,
+        ]
+        if _PCH_ENABLED:
+            pch = _kernel_pch(cmd[0], peano_flags)
+            if pch is not None:
+                cmd[1:1] = ["-mno-vitis-headers", "-include-pch", pch]
 
     # Add include directories
     if include_dirs:
@@ -355,6 +465,15 @@ def compile_cxx_core_function(
         check=False,
         capture_output=True,
     )
+    if ret.returncode != 0 and "-include-pch" in cmd:
+        # The PCH is an optimisation and must never be the reason a build fails
+        # or the reason an error message is confusing.  Redo the compile without
+        # it and report THAT, so what surfaces is the kernel's own diagnostic.
+        i = cmd.index("-include-pch")
+        plain = [a for j, a in enumerate(cmd) if j not in (i, i + 1)]
+        plain.remove("-mno-vitis-headers")
+        logger.debug("Retrying without the PCH: %s", " ".join(plain))
+        ret = subprocess.run(plain, cwd=cwd, check=False, capture_output=True)
     if ret.stdout:
         logger.debug("%s", ret.stdout.decode())
     if ret.returncode != 0:
