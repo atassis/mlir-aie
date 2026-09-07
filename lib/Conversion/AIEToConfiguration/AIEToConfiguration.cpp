@@ -465,15 +465,24 @@ emitTransactionOps(OpBuilder &builder, Location fallbackLoc,
                    std::vector<TransactionBinaryOperation> &operations,
                    std::vector<memref::GlobalOp> &global_data) {
 
+  // One constant per distinct value. They all land in the same block through
+  // `builder`, so the first use dominates every later one.
+  llvm::DenseMap<uint32_t, Value> constantCache;
+  auto constant = [&](Location loc, uint32_t value) {
+    Value &cached = constantCache[value];
+    if (!cached)
+      cached = AIEX::createConstantI32(builder, loc, value);
+    return cached;
+  };
+
   // create the txn ops
   for (auto [op, payload] : llvm::zip(operations, global_data)) {
     Location loc = op.sourceLoc.value_or(fallbackLoc);
 
     if (op.cmd.Opcode == XAie_TxnOpcode::XAIE_IO_WRITE) {
-      AIEX::NpuWrite32Op::create(
-          builder, loc, AIEX::createConstantI32(builder, loc, op.cmd.RegOff),
-          AIEX::createConstantI32(builder, loc, op.cmd.Value), nullptr, nullptr,
-          nullptr);
+      AIEX::NpuWrite32Op::create(builder, loc, constant(loc, op.cmd.RegOff),
+                                 constant(loc, op.cmd.Value), nullptr, nullptr,
+                                 nullptr);
     } else if (op.cmd.Opcode == XAie_TxnOpcode::XAIE_IO_BLOCKWRITE) {
       auto memref = memref::GetGlobalOp::create(builder, loc, payload.getType(),
                                                 payload.getName());
@@ -481,11 +490,10 @@ emitTransactionOps(OpBuilder &builder, Location fallbackLoc,
           builder, loc, builder.getUI32IntegerAttr(op.cmd.RegOff),
           memref.getResult(), nullptr, nullptr, nullptr);
     } else if (op.cmd.Opcode == XAie_TxnOpcode::XAIE_IO_MASKWRITE) {
-      AIEX::NpuMaskWrite32Op::create(
-          builder, loc, AIEX::createConstantI32(builder, loc, op.cmd.RegOff),
-          AIEX::createConstantI32(builder, loc, op.cmd.Value),
-          AIEX::createConstantI32(builder, loc, op.cmd.Mask), nullptr, nullptr,
-          nullptr);
+      AIEX::NpuMaskWrite32Op::create(builder, loc, constant(loc, op.cmd.RegOff),
+                                     constant(loc, op.cmd.Value),
+                                     constant(loc, op.cmd.Mask), nullptr,
+                                     nullptr, nullptr);
     } else if (op.cmd.Opcode == XAie_TxnOpcode::XAIE_IO_CUSTOM_OP_TCT) {
       if (!op.sync) {
         llvm::errs() << "Missing sync payload while emitting transaction\n";
@@ -493,12 +501,9 @@ emitTransactionOps(OpBuilder &builder, Location fallbackLoc,
       }
       const TransactionBinaryOperation::SyncPayload &sync = *op.sync;
       AIEX::NpuSyncOp::create(
-          builder, loc, AIEX::createConstantI32(builder, loc, sync.column),
-          AIEX::createConstantI32(builder, loc, sync.row),
-          AIEX::createConstantI32(builder, loc, sync.direction),
-          AIEX::createConstantI32(builder, loc, sync.channel),
-          AIEX::createConstantI32(builder, loc, sync.columnCount),
-          AIEX::createConstantI32(builder, loc, sync.rowCount));
+          builder, loc, constant(loc, sync.column), constant(loc, sync.row),
+          constant(loc, sync.direction), constant(loc, sync.channel),
+          constant(loc, sync.columnCount), constant(loc, sync.rowCount));
     } else if (op.cmd.Opcode == 0x8 /* XAie_TxnOpcode::XAIE_IO_LOAD_PDI */) {
       if (!op.loadPdi) {
         llvm::errs() << "Missing load_pdi payload while emitting transaction\n";
