@@ -5,8 +5,8 @@
 #
 """Five transpose strategies on a single AIE column, ``@iron.jit``-compiled.
 
-All five strategies produce the same end result: a full ``M x N`` →
-``N x M`` transpose.  Only the on-device mechanism differs, and each
+All five strategies produce the same end result: a full ``M x K`` →
+``K x M`` transpose.  Only the on-device mechanism differs, and each
 mechanism has its own (dtype, size) support envelope:
 
   * ``dma``         — pure shim-DMA stride; no compute core.
@@ -66,7 +66,12 @@ _SHUFFLE_SRC = str(_KERNELS_DIR / "shuffle_16x16.cc")
 _DYN_SRC = str(_KERNELS_DIR / "transpose_dyn.cc")
 
 _BYTES_TO_DTYPE = {1: np.uint8, 2: np.uint16, 4: np.uint32}
-_DYN_DTYPE_MACRO = {1: "DTYPE_i8", 2: "DTYPE_i16", 4: "DTYPE_i32"}
+
+# Core data memory on both npu1 and npu2 (AIETargetModel::getLocalMemorySize),
+# and the ObjectFifo constructor's default depth.
+_CORE_L1_BYTES = 64 * 1024
+_FIFO_DEPTH = 2
+_COMBINED_DTYPE_MACRO = {1: "DTYPE_i8", 2: "DTYPE_i16", 4: "DTYPE_i32"}
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +292,22 @@ def _transpose_dyn(
     K: CompileTime[int] = 64,
     dtype_bytes: CompileTime[int] = 4,
 ):
+    if dtype_bytes not in _BYTES_TO_DTYPE:
+        raise ValueError(
+            f"--strategy=dyn supports {sorted(_BYTES_TO_DTYPE)}-byte elements; "
+            f"got dtype_bytes={dtype_bytes}."
+        )
+    # dyn moves the whole tile into L1 in one DMA, so both fifos' buffers have
+    # to sit there at once: 2 fifos x depth 2 x the tile.  Checked here because
+    # overflowing it otherwise surfaces as a placement failure from aiecc.
+    tile_bytes = M * K * dtype_bytes
+    l1_bytes = 2 * _FIFO_DEPTH * tile_bytes
+    if l1_bytes > _CORE_L1_BYTES:
+        raise ValueError(
+            f"--strategy=dyn needs {l1_bytes} B of L1 for a {M}x{K} tile of "
+            f"{dtype_bytes}-byte elements (2 fifos x depth {_FIFO_DEPTH}), "
+            f"over the core's {_CORE_L1_BYTES} B."
+        )
     dtype = _BYTES_TO_DTYPE[dtype_bytes]
     tensor_ty = np.ndarray[(M, K), np.dtype[dtype]]
 
@@ -294,7 +315,7 @@ def _transpose_dyn(
         "transpose_dyn",
         source_file=_DYN_SRC,
         arg_types=[tensor_ty, tensor_ty, np.int32, np.int32],
-        compile_flags=[f"-D{_DYN_DTYPE_MACRO[dtype_bytes]}"],
+        compile_flags=[f"-D{_COMBINED_DTYPE_MACRO[dtype_bytes]}"],
     )
 
     in_fifo = ObjectFifo(tensor_ty, name="in_fifo")
