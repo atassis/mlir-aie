@@ -1000,18 +1000,25 @@ buildMainGraph(mlir::MLIRContext &context, Graph &g,
   // For --load-pdi-to-ctrl-pkt this edge holds the control-packet ops before
   // DMA lowering: the extraction point for the control-packet binary.
   bool ctrlPkt = loadPdiToCtrlPkt.getValue();
-  bool registerReset = expandLoadPdiRegisterReset.getValue();
+  bool registerResetOn = registerReset.getValue();
   EdgeWithTypedOutput<ModRef> &npuExpanded =
       (expandLoadPdis.getValue() || ctrlPkt)
           ? static_cast<EdgeWithTypedOutput<ModRef> &>(
                 npuMaterialized.map<ModRef>(
                     "npu_expanded.mlir",
                     PassPipeline{&context,
-                                 [ctrlPkt, registerReset](
+                                 [ctrlPkt, registerResetOn](
                                      mlir::MLIRContext *ctx, mlir::ModuleOp) {
                                    return getExpandLoadPdiPipeline(
-                                       ctx, ctrlPkt, registerReset);
+                                       ctx, ctrlPkt, registerResetOn);
                                  }}))
+
+                    PassPipeline{
+                        &context,
+                        [ctrlPkt](mlir::MLIRContext *ctx, mlir::ModuleOp) {
+                          return getExpandLoadPdiPipeline(
+                              ctx, ctrlPkt, registerReset.getValue());
+                        }}))
           : npuMaterialized;
 
   // The default tail unrolls runtime-sequence loops and pools dynamic BDs; the
@@ -1798,6 +1805,13 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // --register-reset only changes what the load_pdi expansion emits, so on its
+  // own it would be silently inert; the pass rejects the ctrl-pkt pairing.
+  if (registerReset.getValue() && !expandLoadPdis.getValue()) {
+    llvm::errs() << "aiecc: --register-reset requires --expand-load-pdis\n";
+    return 1;
+  }
+
   if (showVersion) {
     printVersion(llvm::outs());
     return 0;
@@ -1829,14 +1843,6 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // The register reset replaces the empty-device firmware reset that only the
-  // --expand-load-pdis write32 flow emits, so it has nothing to act on alone,
-  // and the control-packet flow resets through the overlay instead.
-  if (expandLoadPdiRegisterReset && !expandLoadPdis) {
-    llvm::errs() << "aiecc: --expand-load-pdi-register-reset requires "
-                    "--expand-load-pdis\n";
-    return 1;
-  }
 
   // Disambiguate the full-ELF control packet flow and the standalone
   // artifact flows.
