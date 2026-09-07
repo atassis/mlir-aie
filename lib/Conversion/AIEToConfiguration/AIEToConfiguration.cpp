@@ -470,6 +470,11 @@ emitTransactionOps(OpBuilder &builder, Location fallbackLoc,
 
   // One constant per distinct value. They all land in the same block through
   // `builder`, so the first use dominates every later one.
+  //
+  // Because the first use is what creates the op, callers must bind the
+  // operands to locals rather than call this inside an argument list: the
+  // evaluation order of function arguments is unspecified, and it decides the
+  // order the constants are emitted in.
   llvm::DenseMap<uint32_t, Value> constantCache;
   auto constant = [&](Location loc, uint32_t value) {
     Value &cached = constantCache[value];
@@ -483,8 +488,9 @@ emitTransactionOps(OpBuilder &builder, Location fallbackLoc,
     Location loc = op.sourceLoc.value_or(fallbackLoc);
 
     if (op.cmd.Opcode == XAie_TxnOpcode::XAIE_IO_WRITE) {
-      AIEX::NpuWrite32Op::create(builder, loc, constant(loc, op.cmd.RegOff),
-                                 constant(loc, op.cmd.Value), nullptr, nullptr,
+      Value address = constant(loc, op.cmd.RegOff);
+      Value value = constant(loc, op.cmd.Value);
+      AIEX::NpuWrite32Op::create(builder, loc, address, value, nullptr, nullptr,
                                  nullptr);
     } else if (op.cmd.Opcode == XAie_TxnOpcode::XAIE_IO_BLOCKWRITE) {
       auto memref = memref::GetGlobalOp::create(builder, loc, payload.getType(),
@@ -493,20 +499,25 @@ emitTransactionOps(OpBuilder &builder, Location fallbackLoc,
           builder, loc, builder.getUI32IntegerAttr(op.cmd.RegOff),
           memref.getResult(), nullptr, nullptr, nullptr);
     } else if (op.cmd.Opcode == XAie_TxnOpcode::XAIE_IO_MASKWRITE) {
-      AIEX::NpuMaskWrite32Op::create(builder, loc, constant(loc, op.cmd.RegOff),
-                                     constant(loc, op.cmd.Value),
-                                     constant(loc, op.cmd.Mask), nullptr,
-                                     nullptr, nullptr);
+      Value address = constant(loc, op.cmd.RegOff);
+      Value value = constant(loc, op.cmd.Value);
+      Value mask = constant(loc, op.cmd.Mask);
+      AIEX::NpuMaskWrite32Op::create(builder, loc, address, value, mask,
+                                     nullptr, nullptr, nullptr);
     } else if (op.cmd.Opcode == XAie_TxnOpcode::XAIE_IO_CUSTOM_OP_TCT) {
       if (!op.sync) {
         llvm::errs() << "Missing sync payload while emitting transaction\n";
         return failure();
       }
       const TransactionBinaryOperation::SyncPayload &sync = *op.sync;
-      AIEX::NpuSyncOp::create(
-          builder, loc, constant(loc, sync.column), constant(loc, sync.row),
-          constant(loc, sync.direction), constant(loc, sync.channel),
-          constant(loc, sync.columnCount), constant(loc, sync.rowCount));
+      Value column = constant(loc, sync.column);
+      Value row = constant(loc, sync.row);
+      Value direction = constant(loc, sync.direction);
+      Value channel = constant(loc, sync.channel);
+      Value columnCount = constant(loc, sync.columnCount);
+      Value rowCount = constant(loc, sync.rowCount);
+      AIEX::NpuSyncOp::create(builder, loc, column, row, direction, channel,
+                              columnCount, rowCount);
     } else if (op.cmd.Opcode == 0x8 /* XAie_TxnOpcode::XAIE_IO_LOAD_PDI */) {
       if (!op.loadPdi) {
         llvm::errs() << "Missing load_pdi payload while emitting transaction\n";
