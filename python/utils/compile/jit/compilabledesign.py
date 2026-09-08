@@ -404,7 +404,12 @@ class CompilableDesign:
 
                 use_chess = self._resolve_use_chess(external_kernels)
 
-                compile_external_kernels(external_kernels, kernel_dir, target_arch)
+                compile_external_kernels(
+                    external_kernels,
+                    kernel_dir,
+                    target_arch,
+                    extra_include_dirs=self.include_paths,
+                )
 
                 compile_mlir_module(
                     mlir_module=mlir_module,
@@ -523,7 +528,12 @@ class CompilableDesign:
                 ExternalFunction._instances.clear()
 
                 use_chess = self._resolve_use_chess(external_kernels)
-                compile_external_kernels(external_kernels, kernel_dir, target_arch)
+                compile_external_kernels(
+                    external_kernels,
+                    kernel_dir,
+                    target_arch,
+                    extra_include_dirs=self.include_paths,
+                )
 
                 compile_mlir_module(
                     mlir_module=mlir_module,

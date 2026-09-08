@@ -630,7 +630,7 @@ def _copy_source(dest: str, src: str) -> None:
         shutil.copy2(src, tmp)
 
 
-def compile_external_kernels(funcs, kernel_dir, target_arch):
+def compile_external_kernels(funcs, kernel_dir, target_arch, extra_include_dirs=()):
     """Compile every ExternalFunction in ``funcs`` into ``kernel_dir``.
 
     Kernels are separate translation units with separate outputs, so they
@@ -651,6 +651,9 @@ def compile_external_kernels(funcs, kernel_dir, target_arch):
     Each compile is single-threaded and peaks near 205 MB of RSS on aie2p (250 MB
     without the intrinsics PCH), so the bound is cores rather than memory on an
     ordinary box.  Set AIE_KERNEL_COMPILE_JOBS to override.
+
+    ``extra_include_dirs`` is forwarded to every compile; see
+    ``compile_external_kernel``.
     """
     pending = [f for f in funcs if not f._compiled]
     if not pending:
@@ -660,7 +663,7 @@ def compile_external_kernels(funcs, kernel_dir, target_arch):
     # per-invocation state there, so the Chess path runs serially.
     if any(getattr(f, "_use_chess", False) for f in pending):
         for f in pending:
-            compile_external_kernel(f, kernel_dir, target_arch)
+            compile_external_kernel(f, kernel_dir, target_arch, extra_include_dirs)
         return
 
     groups: dict[str, list] = {}
@@ -678,12 +681,12 @@ def compile_external_kernels(funcs, kernel_dir, target_arch):
     if jobs == 1:
         for group in groups.values():
             for f in group:
-                compile_external_kernel(f, kernel_dir, target_arch)
+                compile_external_kernel(f, kernel_dir, target_arch, extra_include_dirs)
         return
 
     def _run(group):
         for f in group:
-            compile_external_kernel(f, kernel_dir, target_arch)
+            compile_external_kernel(f, kernel_dir, target_arch, extra_include_dirs)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
         # list() re-raises the first failure, after the others have finished --
@@ -691,7 +694,7 @@ def compile_external_kernels(funcs, kernel_dir, target_arch):
         list(pool.map(_run, groups.values()))
 
 
-def compile_external_kernel(func, kernel_dir, target_arch):
+def compile_external_kernel(func, kernel_dir, target_arch, extra_include_dirs=()):
     """Compile an ExternalFunction to an object file in the kernel directory.
 
     The output file is named ``func.object_file_name`` and placed in ``kernel_dir``.
@@ -704,6 +707,9 @@ def compile_external_kernel(func, kernel_dir, target_arch):
             ``compile_mlir_module`` so that relative link_with paths resolve
             correctly.
         target_arch: Peano target architecture string (e.g., "aie2", "aie2p").
+        extra_include_dirs: Additional -I directories, forwarded from the
+            owning CompilableDesign's include_paths. Applied after
+            func._include_dirs.
     """
     # Skip if already compiled in this session.
     if func._compiled:
@@ -743,7 +749,7 @@ def compile_external_kernel(func, kernel_dir, target_arch):
             # in the emitted .ll ``define`` that _make_ir_inlinable must rewrite.
             # (inline + symbol_prefix is rejected above, so no rename applies.)
             symbol_name=func._original_name,
-            include_dirs=func._include_dirs,
+            include_dirs=list(func._include_dirs) + list(extra_include_dirs),
             compile_args=func._compile_flags,
             cwd=str(kernel_dir),
             inline=getattr(func, "_inline", False),
@@ -771,8 +777,11 @@ def compile_external_kernel(func, kernel_dir, target_arch):
         # copied into kernel_dir.
         src_dir = os.path.dirname(os.path.abspath(func._source_file))
         include_dirs = list(func._include_dirs)
+        # The kernel's own directory outranks the design's paths: a sibling header must not
+        # be shadowed by a same-named one the design happens to pass.
         if src_dir not in include_dirs:
             include_dirs.append(src_dir)
+        include_dirs += [d for d in extra_include_dirs if d not in include_dirs]
         compile_cxx_core_function(
             source_path=source_file,
             target_arch=target_arch,
