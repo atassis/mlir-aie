@@ -131,7 +131,9 @@ def _compute_recipe_hash(
     C++ compiler, so two otherwise identical designs pointed at different
     header trees compile to different objects. Hashed in ORDER, not sorted
     like the flag lists above, because ``-I`` search order decides which
-    header wins when two directories provide the same name.
+    header wins when two directories provide the same name. Their CONTENT is
+    hashed too: editing a header in place leaves the path unchanged, and a
+    path-only key would serve a stale object forever.
     """
     h = hashlib.sha256()
 
@@ -176,7 +178,12 @@ def _compute_recipe_hash(
     h.update(repr(sorted(aiecc_flags)).encode())
     h.update(repr(sorted(compile_flags)).encode())
     h.update(f"full_elf={full_elf}".encode())
-    h.update(repr([str(p) for p in include_paths]).encode())
+    for p in include_paths:
+        h.update(str(p).encode())
+        for f in sorted(Path(p).rglob("*")) if Path(p).is_dir() else []:
+            if f.is_file():
+                h.update(str(f.relative_to(p)).encode())
+                h.update(f.read_bytes())
 
     return h.hexdigest()
 
