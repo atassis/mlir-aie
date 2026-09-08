@@ -330,30 +330,44 @@ class CompilableDesign:
         elf_path: Path | str | None = None,
         full_elf_path: Path | str | None = None,
         pdi_path: Path | str | None = None,
-    ) -> tuple[Path, Path | None]:
+    ) -> tuple[Path | None, Path | None]:
         """Compile the generator to ``(xclbin_path, inst_path)``.
 
-        When both ``xclbin_path`` and ``inst_path`` are given, artifacts are
+        When ``xclbin_path`` and/or ``inst_path`` are given, artifacts are
         written directly to those paths; the parent directory is used as
         ``work_dir`` for intermediate files (``.o``, lowered ``.mlir``).  The
         on-disk cache is bypassed in this mode — the caller is presumed to
         manage their own dependency tracking (e.g. via a Makefile).
 
-        When both are ``None`` (the default), behavior is unchanged: artifacts
-        land in ``~/.npu/cache/<hash>/`` and the cache is consulted first.
+        Either path may be given on its own.  Only the requested artifacts are
+        built, and the slot of an artifact that was not requested is ``None`` in
+        the returned tuple:
 
-        Static designs require both paths or neither. Designs with active
-        ``DispatchTime[T]`` parameters instead accept ``xclbin_path`` alone
-        (plus optional ``pdi_path``), and return ``(xclbin_path, None)``.
-        They reject ``inst_path`` and ``elf_path`` because instructions are
-        built per call. Their immutable dispatch library stays in
-        ``<xclbin stem>.prj``; retrieve it with ``get_dispatch_lib_path()``.
+        * **both** — ``(xclbin_path, inst_path)``, the full design.
+        * **overlay-only** (``xclbin_path``) — ``(xclbin_path, None)``.  Builds
+          the on-chip dataflow without a runtime sequence.
+        * **insts-only** (``inst_path``) — ``(None, inst_path)``.  Builds a
+          runtime sequence against an overlay compiled separately, so one
+          shape-agnostic overlay can serve many sequences without recompiling
+          (and discarding) an identical xclbin per sequence.
+
+        Designs with active ``DispatchTime[T]`` parameters accept
+        ``xclbin_path`` alone (plus optional ``pdi_path``) and return
+        ``(xclbin_path, None)``.  They reject ``inst_path`` and ``elf_path``
+        because instructions are built per call.  Their immutable dispatch
+        library stays in ``<xclbin stem>.prj``; retrieve it with
+        ``get_dispatch_lib_path()``.
+
+        When both are ``None`` (the default), behavior is unchanged: artifacts
+        land in ``~/.npu/cache/<hash>/`` and the cache is consulted first.  The
+        cache keys the two artifacts together, so it is bypassed whenever either
+        path is given explicitly.
 
         ``elf_path`` is optional and orthogonal: when set, aiecc also wraps
         the NPU instructions into an ELF (via ``aiebu-asm``) at that path,
         suitable for C++ testbenches that load through ``xrt::elf`` +
-        ``xrt::module``.  Requires ``xclbin_path`` / ``inst_path`` to be set
-        too — the cache path doesn't track ELF artifacts.
+        ``xrt::module``.  Requires an explicit output path — the cache path
+        doesn't track ELF artifacts.
 
         Full-ELF mode is selected either by ``full_elf=True`` on the design or
         by passing ``full_elf_path`` here.  In this mode a single
@@ -364,9 +378,9 @@ class CompilableDesign:
 
         ``pdi_path`` is likewise optional: when set, aiecc writes the
         Programmable Device Image (config data packed by ``bootgen``) to that
-        path. It requires an explicit ``xclbin_path`` (and ``inst_path`` for
-        static designs). In default cache mode aiecc still emits a ``main.pdi``
-        into the cache directory — use `get_pdi_path` to locate it.
+        path.  Like ``elf_path`` it requires an explicit output path.  In
+        default cache mode aiecc still emits a ``main.pdi`` into the cache
+        directory — use :meth:`get_pdi_path` to locate it.
         """
         from aie.iron.kernel import ExternalFunction
 
@@ -393,27 +407,25 @@ class CompilableDesign:
                 "compile(): DispatchTime[T] designs have no static instructions; "
                 "inst_path and elf_path must be None."
             )
-        if not has_dispatch and (xclbin_path is None) != (inst_path is None):
-            raise ValueError(
-                "compile(): xclbin_path and inst_path must be set together "
-                "(both paths to write artifacts directly, or both None to use "
-                f"the JIT cache).  Got xclbin_path={xclbin_path!r}, "
-                f"inst_path={inst_path!r}."
-            )
-        explicit_paths = xclbin_path is not None
+        # Either artifact may be requested on its own; the driver gates the
+        # two --get-* flags independently.  Any explicit path bypasses the
+        # cache, whose entry couples the pair under one hash.
+        explicit_paths = xclbin_path is not None or inst_path is not None
         cache_hash = None
 
         if elf_path is not None and not explicit_paths:
             raise ValueError(
-                "compile(): elf_path requires explicit xclbin_path + inst_path "
-                "(the JIT cache does not track ELF artifacts)."
+                "compile(): elf_path requires explicit output paths "
+                "(xclbin_path and/or inst_path; the JIT cache does not track "
+                "ELF artifacts)."
             )
 
         if pdi_path is not None and not explicit_paths:
             raise ValueError(
-                "compile(): pdi_path requires explicit xclbin_path "
-                "(the JIT cache does not track caller-named PDI artifacts; use "
-                "get_pdi_path() to locate the cache-mode main.pdi)."
+                "compile(): pdi_path requires explicit output paths "
+                "(xclbin_path and/or inst_path; the JIT cache does not track "
+                "caller-named PDI artifacts; use get_pdi_path() to locate the "
+                "cache-mode main.pdi)."
             )
 
         if not isinstance(self.mlir_generator, Path):
@@ -426,19 +438,23 @@ class CompilableDesign:
         fold_ddr_addr_offset = self._resolve_fold_ddr_addr_offset()
 
         if explicit_paths:
-            assert xclbin_path is not None
             # Absolutize so compile_external_kernel's `cwd=kernel_dir` doesn't
             # turn relative paths into "build/build/foo.cc" etc.
-            xclbin_path = Path(xclbin_path).resolve()
-            inst_path = Path(inst_path).resolve() if inst_path is not None else None
+            if xclbin_path is not None:
+                xclbin_path = Path(xclbin_path).resolve()
+            if inst_path is not None:
+                inst_path = Path(inst_path).resolve()
             if elf_path is not None:
                 elf_path = Path(elf_path).resolve()
             if pdi_path is not None:
                 pdi_path = Path(pdi_path).resolve()
             # Per-xclbin scratch dir (mirrors aiecc's default <input>.prj
             # naming) so two siblings sharing one build/ don't clobber each
-            # other's input_with_addresses.mlir / .o files.
-            kernel_dir = xclbin_path.parent / f"{xclbin_path.stem}.prj"
+            # other's input_with_addresses.mlir / .o files.  An insts-only
+            # build names it after the insts instead, for the same reason.
+            anchor = xclbin_path if xclbin_path is not None else inst_path
+            assert anchor is not None
+            kernel_dir = anchor.parent / f"{anchor.stem}.prj"
             lock_file_path = kernel_dir / ".lock"
         else:
             cache_hash = self._compute_cache_hash()
@@ -457,7 +473,7 @@ class CompilableDesign:
                 if has_dispatch
                 else inst_path
             )
-            xclbin_exists = xclbin_path.exists()
+            xclbin_exists = xclbin_path is not None and xclbin_path.exists()
             inst_exists = companion_path is not None and companion_path.exists()
 
             if (
@@ -495,7 +511,9 @@ class CompilableDesign:
                 logger.debug(
                     "Compiling '%s' to %s (explicit paths, cache bypassed)",
                     self.generator_name,
-                    xclbin_path,
+                    ", ".join(
+                        str(p) for p in (xclbin_path, inst_path) if p is not None
+                    ),
                 )
             else:
                 logger.debug(
@@ -546,9 +564,9 @@ class CompilableDesign:
 
                 # aiecc may exit 0 even when xclbin generation fails silently
                 # (missing xclbinutil/bootgen); verify outputs exist.
-                expected_outputs = [xclbin_path]
-                if inst_path is not None:
-                    expected_outputs.append(inst_path)
+                expected_outputs = [
+                    p for p in (xclbin_path, inst_path) if p is not None
+                ]
                 if elf_path is not None:
                     expected_outputs.append(Path(elf_path))
                 if pdi_path is not None:
