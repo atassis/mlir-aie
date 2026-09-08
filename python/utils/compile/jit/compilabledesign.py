@@ -406,7 +406,12 @@ class CompilableDesign:
 
                 for func in external_kernels:
                     if not func._compiled:
-                        compile_external_kernel(func, kernel_dir, target_arch)
+                        compile_external_kernel(
+                            func,
+                            kernel_dir,
+                            target_arch,
+                            extra_include_dirs=self.include_paths,
+                        )
 
                 compile_mlir_module(
                     mlir_module=mlir_module,
@@ -527,7 +532,12 @@ class CompilableDesign:
                 use_chess = self._resolve_use_chess(external_kernels)
                 for func in external_kernels:
                     if not func._compiled:
-                        compile_external_kernel(func, kernel_dir, target_arch)
+                        compile_external_kernel(
+                            func,
+                            kernel_dir,
+                            target_arch,
+                            extra_include_dirs=self.include_paths,
+                        )
 
                 compile_mlir_module(
                     mlir_module=mlir_module,

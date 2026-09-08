@@ -567,7 +567,7 @@ def _rename_symbol_in_object(object_path: str, old_name: str, new_name: str) -> 
         raise RuntimeError(f"Symbol rename failed: {result.stderr.decode()}")
 
 
-def compile_external_kernel(func, kernel_dir, target_arch):
+def compile_external_kernel(func, kernel_dir, target_arch, extra_include_dirs=()):
     """Compile an ExternalFunction to an object file in the kernel directory.
 
     The output file is named ``func.object_file_name`` and placed in ``kernel_dir``.
@@ -580,6 +580,9 @@ def compile_external_kernel(func, kernel_dir, target_arch):
             ``compile_mlir_module`` so that relative link_with paths resolve
             correctly.
         target_arch: Peano target architecture string (e.g., "aie2", "aie2p").
+        extra_include_dirs: Additional -I directories, forwarded from the
+            owning CompilableDesign's include_paths. Applied after
+            func._include_dirs.
     """
     # Skip if already compiled in this session.
     if func._compiled:
@@ -620,7 +623,7 @@ def compile_external_kernel(func, kernel_dir, target_arch):
             # in the emitted .ll ``define`` that _make_ir_inlinable must rewrite.
             # (inline + symbol_prefix is rejected above, so no rename applies.)
             symbol_name=func._original_name,
-            include_dirs=func._include_dirs,
+            include_dirs=list(func._include_dirs) + list(extra_include_dirs),
             compile_args=func._compile_flags,
             cwd=str(kernel_dir),
             inline=getattr(func, "_inline", False),
@@ -648,8 +651,11 @@ def compile_external_kernel(func, kernel_dir, target_arch):
         # copied into kernel_dir.
         src_dir = os.path.dirname(os.path.abspath(func._source_file))
         include_dirs = list(func._include_dirs)
+        # The kernel's own directory outranks the design's paths: a sibling header must not
+        # be shadowed by a same-named one the design happens to pass.
         if src_dir not in include_dirs:
             include_dirs.append(src_dir)
+        include_dirs += [d for d in extra_include_dirs if d not in include_dirs]
         compile_cxx_core_function(
             source_path=source_file,
             target_arch=target_arch,

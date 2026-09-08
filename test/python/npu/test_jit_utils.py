@@ -11,6 +11,7 @@
 
 # Unit tests for compile_external_kernel and cache key utilities.
 
+import inspect
 import os
 import tempfile
 import pytest
@@ -129,6 +130,102 @@ def test_compile_external_kernel_source_file_uses_true_basename(npu_target_arch)
 
         assert os.path.exists(os.path.join(kernel_dir, "conv.cc"))
         assert not os.path.exists(os.path.join(kernel_dir, "conv_step.cc"))
+
+
+def test_compile_external_kernel_signature_preserves_positional_parameters():
+    """extra_include_dirs must be appended, not shift the established API."""
+    assert list(inspect.signature(compile_external_kernel).parameters) == [
+        "func",
+        "kernel_dir",
+        "target_arch",
+        "extra_include_dirs",
+    ]
+
+
+def test_compile_external_kernel_extra_include_dirs_required_source_string(
+    npu_target_arch,
+):
+    """Without extra_include_dirs, a header outside func's own _include_dirs
+    is not found -- the control for the next two tests."""
+    with (
+        tempfile.TemporaryDirectory() as hdr_dir,
+        tempfile.TemporaryDirectory() as kernel_dir,
+    ):
+        with open(os.path.join(hdr_dir, "extra_thing.h"), "w") as f:
+            f.write("#define EXTRA_THING 1\n")
+
+        func = ExternalFunction(
+            "add_one",
+            source_string="""#include "extra_thing.h"
+                extern "C" {
+                    void add_one(int* a, int* b, int n) {
+                        for (int i = 0; i < n; i++) b[i] = a[i] + EXTRA_THING;
+                    }
+                }""",
+        )
+        with pytest.raises(RuntimeError, match="extra_thing.h"):
+            compile_external_kernel(func, kernel_dir, target_arch=npu_target_arch)
+
+
+def test_compile_external_kernel_extra_include_dirs_forwarded_source_string(
+    npu_target_arch,
+):
+    """extra_include_dirs must reach the Peano compiler for a source_string
+    ExternalFunction: a -I-only header must resolve and the object must
+    exist."""
+    with (
+        tempfile.TemporaryDirectory() as hdr_dir,
+        tempfile.TemporaryDirectory() as kernel_dir,
+    ):
+        with open(os.path.join(hdr_dir, "extra_thing.h"), "w") as f:
+            f.write("#define EXTRA_THING 1\n")
+
+        func = ExternalFunction(
+            "add_one",
+            source_string="""#include "extra_thing.h"
+                extern "C" {
+                    void add_one(int* a, int* b, int n) {
+                        for (int i = 0; i < n; i++) b[i] = a[i] + EXTRA_THING;
+                    }
+                }""",
+        )
+        compile_external_kernel(
+            func, kernel_dir, target_arch=npu_target_arch, extra_include_dirs=(hdr_dir,)
+        )
+        obj = os.path.join(kernel_dir, "add_one.o")
+        assert os.path.exists(obj)
+        assert os.path.getsize(obj) > 0
+
+
+def test_compile_external_kernel_extra_include_dirs_forwarded_source_file(
+    npu_target_arch,
+):
+    """Same as above for the source_file branch (the second call site in
+    compile_external_kernel, which also appends func._include_dirs' src_dir)."""
+    with (
+        tempfile.TemporaryDirectory() as hdr_dir,
+        tempfile.TemporaryDirectory() as src_dir,
+        tempfile.TemporaryDirectory() as kernel_dir,
+    ):
+        with open(os.path.join(hdr_dir, "extra_thing.h"), "w") as f:
+            f.write("#define EXTRA_THING 1\n")
+
+        src = os.path.join(src_dir, "my_kernel.cc")
+        with open(src, "w") as f:
+            f.write("""#include "extra_thing.h"
+                extern "C" {
+                    void my_kernel(int* a, int* b, int n) {
+                        for (int i = 0; i < n; i++) b[i] = a[i] + EXTRA_THING;
+                    }
+                }""")
+
+        func = ExternalFunction("my_kernel", source_file=src)
+        compile_external_kernel(
+            func, kernel_dir, target_arch=npu_target_arch, extra_include_dirs=(hdr_dir,)
+        )
+        obj = os.path.join(kernel_dir, "my_kernel.o")
+        assert os.path.exists(obj)
+        assert os.path.getsize(obj) > 0
 
 
 def test_compile_external_kernel_shared_object_deterministic(npu_target_arch):
