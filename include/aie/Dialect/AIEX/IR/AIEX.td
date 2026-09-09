@@ -1737,6 +1737,7 @@ def AIEX_DmaChannelResetForOp
   }];
   let arguments = (ins FlatSymbolRefAttr:$objfifo);
   let assemblyFormat = [{ `(` $objfifo `)` attr-dict }];
+  let hasVerifier = 1;
 }
 
 def AIEX_BufferClearOp: AIEX_Op<"buffer_clear", [HasParent<"AIE::RuntimeSequenceOp">, SkipAccessibilityCheckTrait]> {

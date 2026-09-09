@@ -1005,12 +1005,21 @@ struct AIEDMATasksToNPUPass
              << ctrlRegName
              << " Enable_Out_of_Order field does not fit in a 32-bit register";
 
+    // encodeFieldValue is optional for the same reason getFieldMask above is:
+    // it fails when the value does not fit the field's width. Guarded rather
+    // than dereferenced so the failure names the field, like its three
+    // siblings here, instead of aborting on a disengaged optional.
+    std::optional<uint32_t> oooVal = tm.encodeFieldValue(*oooField, 1);
+    if (!oooVal)
+      return op.emitOpError()
+             << ctrlRegName
+             << " Enable_Out_of_Order field cannot encode the value 1";
+
     Location loc = op.getLoc();
     IntegerAttr colAttr = builder.getI32IntegerAttr(col);
     IntegerAttr rowAttr = builder.getI32IntegerAttr(row);
     Value addr = createConstantI32(builder, loc, ctrlAddrLocal);
-    Value val =
-        createConstantI32(builder, loc, tm.encodeFieldValue(*oooField, 1));
+    Value val = createConstantI32(builder, loc, *oooVal);
     Value mask = createConstantI32(builder, loc, *oooMask);
     NpuMaskWrite32Op::create(builder, loc, addr, val, mask, nullptr, colAttr,
                              rowAttr);
