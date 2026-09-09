@@ -2298,8 +2298,7 @@ def AIE_ObjectFifoCreateOp: AIE_Op<"objectfifo", [HasParent<"DeviceOp">, Symbol]
       OptionalAttr<ConfinedAttr<AIEI8Attr, [IntMinValue<0>]>>:$packet_id,
       // Carried to this fifo's shim allocation; see its own
       // stream_len_decoupled.
-      UnitAttr:$stream_len_decoupled);
-
+      UnitAttr:$stream_len_decoupled,
       // Allocation group, propagated onto every buffer this objectFifo lowers
       // to -- a fifo's depth slots are live together, which is what one group
       // asserts. Two fifos in DIFFERENT groups are asserted never to be live
