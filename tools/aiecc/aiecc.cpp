@@ -1018,27 +1018,16 @@ buildMainGraph(mlir::MLIRContext &context, Graph &g,
   // DMA lowering: the extraction point for the control-packet binary.
   bool ctrlPkt = loadPdiToCtrlPkt.getValue();
   bool registerResetOn = registerReset.getValue();
-  EdgeWithTypedOutput<ModRef> &npuExpanded =
-      (expandLoadPdis.getValue() || ctrlPkt)
-          ? static_cast<EdgeWithTypedOutput<ModRef> &>(
-                npuMaterialized.map<ModRef>(
-                    "npu_expanded.mlir",
-                    PassPipeline{&context,
-                                 [ctrlPkt, registerResetOn](
-                                     mlir::MLIRContext *ctx, mlir::ModuleOp) {
-                                   return getExpandLoadPdiPipeline(
-                                       ctx, ctrlPkt, registerResetOn);
-                                 }}))
-          : npuMaterialized;
-
   auto expandPipeline =
-      [&context, ctrlPkt](
+      [&context, ctrlPkt, registerResetOn](
           EdgeWithTypedOutput<ModRef> &src) -> EdgeWithTypedOutput<ModRef> & {
     return src.map<ModRef>(
         "npu_expanded.mlir",
         PassPipeline{&context,
-                     [ctrlPkt](mlir::MLIRContext *ctx, mlir::ModuleOp) {
-                       return getExpandLoadPdiPipeline(ctx, ctrlPkt);
+                     [ctrlPkt, registerResetOn](mlir::MLIRContext *ctx,
+                                                mlir::ModuleOp) {
+                       return getExpandLoadPdiPipeline(ctx, ctrlPkt,
+                                                       registerResetOn);
                      }});
   };
 

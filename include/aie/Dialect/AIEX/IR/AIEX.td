@@ -1417,6 +1417,8 @@ def AIE_DMAConfigureTaskForOp : AIEX_Op<"dma_configure_task_for", [HasAncestor<"
     $alloc (`repeat` $repeat_count_val^ `:` type($repeat_count_val))? regions attr-dict
   }];
 
+  let hasVerifier = 1;
+
   let extraClassDeclaration = [{
     // The repeat count as an OpFoldResult: runtime operand if present, else the
     // compile-time attribute.
@@ -1803,6 +1805,7 @@ def AIEX_DmaChannelResetForOp: AIEX_Op<"dma_channel_reset_for", [HasParent<"AIE:
   }];
   let arguments = (ins FlatSymbolRefAttr:$objfifo);
   let assemblyFormat = [{ `(` $objfifo `)` attr-dict }];
+  let hasVerifier = 1;
 }
 
 def AIEX_BufferClearOp: AIEX_Op<"buffer_clear", [HasParent<"AIE::RuntimeSequenceOp">, SkipAccessibilityCheckTrait]> {
