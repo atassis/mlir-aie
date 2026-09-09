@@ -1045,7 +1045,7 @@ def AIE_NpuAddressPatchOp
     : AIEX_Op<"npu.address_patch", [AttrSizedOperandSegments]> {
   let summary = "address patch operator";
   let arguments = (ins UI32Attr:$addr, Optional<I32>:$addr_val,
-      OptionalAttr<I32Attr>:$arg_idx, I32:$arg_plus,
+      OptionalAttr<I32Attr>:$arg_idx, AnyTypeOf<[I32, I64]>:$arg_plus,
       Optional<AnyMemRef>:$buffer);
   let results = (outs );
   let assemblyFormat = [{

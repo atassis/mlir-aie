@@ -847,6 +847,16 @@ std::optional<uint32_t> AIEX::getConstantIntOperand(mlir::Value v) {
   return static_cast<uint32_t>(cst.getZExtValue());
 }
 
+// Same match, without the narrowing. `address_patch`'s arg_plus is a buffer OFFSET and aie-rt
+// carries it as u64, so a caller that truncates it to 32 bits silently mis-addresses any buffer
+// past 4 GiB. Callers whose field really is 32-bit keep using getConstantIntOperand.
+std::optional<uint64_t> AIEX::getConstantInt64Operand(mlir::Value v) {
+  mlir::APInt cst;
+  if (!mlir::matchPattern(v, mlir::m_ConstantInt(&cst)))
+    return std::nullopt;
+  return cst.getZExtValue();
+}
+
 mlir::Value AIEX::createConstantI32(mlir::OpBuilder &builder,
                                     mlir::Location loc, uint32_t value) {
   return arith::ConstantOp::create(

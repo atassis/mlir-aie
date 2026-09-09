@@ -14,6 +14,8 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 
+#include <limits>
+
 using namespace mlir;
 
 namespace xilinx::AIEX {
@@ -111,6 +113,19 @@ Value buildArgPlusValue(OpBuilder &builder, Location loc,
       assert(oc && sc && "allConst already verified these are constant");
       bytes += (*oc) * (*sc) * elemWidthBytes;
     }
+    // Widen ONLY when the offset does not fit, so every design that fitted before emits the
+    // identical i32 constant and no existing IR or test moves. Past 4 GiB an i32 silently wrapped
+    // and the BD was patched with a truncated address -- aie-rt carries this field as u64
+    // (patch_op_t::argplus) and the TXN op has a high word for it, so the narrowing was ours alone.
+    //
+    // This covers the CONSTANT path only. The runtime path below is i32 throughout and still
+    // wraps; it is left alone because a value that is not known here cannot be range-checked here,
+    // and because the static TXN target already refuses a non-constant arg_plus outright
+    // (AIETargetNPU.cpp, "Cannot translate address_patch with non-constant arg_plus"). A dynamic
+    // sequence targeting the C++ TXN builder is the one path that would still truncate.
+    if (bytes > std::numeric_limits<uint32_t>::max() || bytes < 0)
+      return arith::ConstantOp::create(
+          builder, loc, IntegerAttr::get(builder.getIntegerType(64), bytes));
     return arith::ConstantOp::create(builder, loc,
                                      IntegerAttr::get(i32ty, bytes));
   }
