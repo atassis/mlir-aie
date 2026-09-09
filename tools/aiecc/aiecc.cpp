@@ -1029,13 +1029,6 @@ buildMainGraph(mlir::MLIRContext &context, Graph &g,
                                    return getExpandLoadPdiPipeline(
                                        ctx, ctrlPkt, registerResetOn);
                                  }}))
-
-                    PassPipeline{
-                        &context,
-                        [ctrlPkt](mlir::MLIRContext *ctx, mlir::ModuleOp) {
-                          return getExpandLoadPdiPipeline(
-                              ctx, ctrlPkt, registerReset.getValue());
-                        }}))
           : npuMaterialized;
 
   auto expandPipeline =

@@ -1346,6 +1346,30 @@ verifyTaskCoversWholeObjects(Operation *task, AIE::ShimDMAAllocationOp alloc,
 }
 
 LogicalResult AIEX::DMAConfigureTaskForOp::verify() {
+  // Recover the shim tile through the referenced shim DMA allocation symbol so
+  // the per-BD dimension limit can be enforced on the runtime-sequence path
+  // before the allocation is substituted into a concrete DMAConfigureTaskOp.
+  AIE::DeviceOp dev = getOperation()->getParentOfType<AIE::DeviceOp>();
+  if (!dev)
+    return success();
+  AIE::ShimDMAAllocationOp allocOp = AIE::ShimDMAAllocationOp::getForSymbol(
+      dev, getAlloc().getRootReference());
+  if (!allocOp)
+    return success(); // symbol resolved during a later pass; defer the check
+  // Do not call allocOp.getTileOp(): it hard-asserts when the allocation is
+  // still bound to an unplaced (logical) tile. Resolve the concrete tile
+  // defensively and defer the check until placement substitutes a real tile.
+  auto tile =
+      llvm::dyn_cast_or_null<AIE::TileOp>(allocOp.getTile().getDefiningOp());
+  if (!tile)
+    return success();
+  const AIE::AIETargetModel &targetModel = AIE::getTargetModel(getOperation());
+  if (failed(verifyTaskBDDimensions(targetModel, tile.getCol(), tile.getRow(),
+                                    getBody())))
+    return failure();
+  return verifyTaskCoversWholeObjects(getOperation(), allocOp,
+                                      getRepeatCountValue(), getBody());
+}
 
 // Resolving the allocation symbol through the collection keeps the lookup off
 // the device's linear symbol scan, which a per-op verifier repeats after every
@@ -1622,8 +1646,8 @@ LogicalResult AIEX::BufferClearOp::verify() {
                          << ")'s local data memory size (" << memSize
                          << " bytes)";
 
-
-// NpuReadRegOp
+  return success();
+}
 //===----------------------------------------------------------------------===//
 
 std::optional<uint32_t> AIEX::NpuReadRegOp::getAbsoluteAddress() {
