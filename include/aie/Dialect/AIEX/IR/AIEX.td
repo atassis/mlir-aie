@@ -1737,6 +1737,7 @@ def AIEX_DmaChannelResetForOp
   }];
   let arguments = (ins FlatSymbolRefAttr:$objfifo);
   let assemblyFormat = [{ `(` $objfifo `)` attr-dict }];
+}
 
 def AIEX_BufferClearOp: AIEX_Op<"buffer_clear", [HasParent<"AIE::RuntimeSequenceOp">, SkipAccessibilityCheckTrait]> {
   let summary = "Zero a range of tile-local data memory from a runtime sequence";
