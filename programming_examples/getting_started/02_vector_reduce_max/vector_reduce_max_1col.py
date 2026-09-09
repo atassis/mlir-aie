@@ -105,7 +105,12 @@ def vector_reduce_max(
     # writes the final maximum value to the output ObjectFifo.
     def final_core_body(of_in, of_out, reduce_fn, nextC_buffer, tmp_buffer):
         elem_out = of_out.acquire(1)
-        for _ in range_(num_iter):
+        # A core-resident buffer holds its value across runs of the same design,
+        # so the first tile writes the accumulator instead of folding into it.
+        elem_in = of_in.acquire(1)
+        reduce_fn(elem_in, nextC_buffer, elems_per_core)
+        of_in.release(1)
+        for _ in range_(num_iter - 1):
             elem_in = of_in.acquire(1)
             reduce_fn(elem_in, tmp_buffer, elems_per_core)
             with if_(nextC_buffer[0] < tmp_buffer[0]):
@@ -115,7 +120,12 @@ def vector_reduce_max(
         of_out.release(1)
 
     def core_body(of_in, of_out, in0, reduce_fn, nextC_buffer, tmp_buffer):
-        for _ in range_(num_iter):
+        # A core-resident buffer holds its value across runs of the same design,
+        # so the first tile writes the accumulator instead of folding into it.
+        elem_in = of_in.acquire(1)
+        reduce_fn(elem_in, nextC_buffer, elems_per_core)
+        of_in.release(1)
+        for _ in range_(num_iter - 1):
             elem_in = of_in.acquire(1)
             reduce_fn(elem_in, tmp_buffer, elems_per_core)
             with if_(nextC_buffer[0] < tmp_buffer[0]) as if_op:
