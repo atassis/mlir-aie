@@ -115,7 +115,7 @@ static void materializeCoreDataBuffers(DeviceOp device) {
                          /*initial_value=*/nullptr,
                          /*mem_bank=*/nullptr,
                          /*core_data=*/builder.getUnitAttr(),
-                         /*aligned=*/nullptr);
+                         /*aligned=*/nullptr, /*alloc_group=*/nullptr);
     buffer->setAttr(SymbolTable::getSymbolAttrName(),
                     builder.getStringAttr("core_data_" +
                                           std::to_string(tile.getCol()) + "_" +
