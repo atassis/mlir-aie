@@ -24,6 +24,7 @@ from .aie import (
     TileOp,
     bds,
     dma_bd,
+    next_bd,
     _as_i32,
 )
 from .transform.structured import MixedValues, _dispatch_mixed_values
@@ -425,6 +426,94 @@ def shim_dma_single_bd_task(
                 offset_parameter=offset_parameter,
             )
             EndOp()
+    return task
+
+
+def shim_dma_chained_bd_task(alloc, bd_specs, issue_token: bool = False):
+    """One shim DMA task carrying a CHAIN of buffer descriptors on one allocation.
+
+    `aiex.dma_configure_task` is defined as "the (chain of) buffer descriptors to be executed on a
+    given channel and direction", and the hardware walks a chain without the control processor
+    re-issuing between BDs. `shim_dma_single_bd_task` above writes exactly one, which is an API
+    choice rather than a hardware limit -- so N sequential transfers on ONE fifo cost N
+    configure/start/await/free quadruples where they could cost one.
+
+    `bd_specs` is an ordered list of kwargs dicts, each the per-BD half of
+    `shim_dma_single_bd_task`'s signature (`mem` plus `tap` XOR sizes/strides/offset/transfer_len,
+    and the optional burst_length/axcache/packet/offset_parameter). They execute in list order.
+
+    REFUSES rather than mis-emits. `repeat_count` is a TASK-level field taken from `sizes[0]`, so
+    BDs whose outer dimension disagrees cannot share a task: the second BD would silently inherit
+    the first's iteration count. A runtime-valued repeat is refused for the same reason. Callers
+    are expected to fall back to one task per BD.
+    """
+    if not bd_specs:
+        raise ValueError("shim_dma_chained_bd_task: empty bd_specs")
+
+    norm = []
+    for spec in bd_specs:
+        spec = dict(spec)
+        tap = spec.pop("tap", None)
+        offset = spec.pop("offset", None)
+        sizes = spec.pop("sizes", None)
+        strides = spec.pop("strides", None)
+        if tap is not None and not (offset is None and sizes is None and strides is None):
+            raise ValueError(
+                "shim_dma_chained_bd_task: a BD takes either a TensorAccessPattern OR "
+                "sizes/strides/offset, not both"
+            )
+        if tap is not None:
+            sizes = tap.sizes.copy()
+            strides = tap.strides.copy()
+            offset = int(tap.offset)
+        if sizes is not None:
+            if len(sizes) > 4:
+                raise ValueError(
+                    f"shim DMA BD supports at most 4 dimensions, got {len(sizes)}"
+                )
+            while len(sizes) < 4:
+                sizes = [1] + list(sizes)
+                if strides is not None:
+                    strides = [0] + list(strides)
+        rc = 0
+        if sizes:
+            s0 = sizes[0]
+            if not isinstance(s0, (int, np.integer)):
+                raise ValueError(
+                    "shim_dma_chained_bd_task: a runtime-valued outer size cannot be chained -- "
+                    "repeat_count is one task-level field and cannot differ per BD"
+                )
+            if s0 > 1:
+                rc = int(s0) - 1
+        norm.append((spec, offset, sizes, strides, rc))
+
+    repeats = {n[4] for n in norm}
+    if len(repeats) != 1:
+        raise ValueError(
+            f"shim_dma_chained_bd_task: BDs disagree on repeat_count {sorted(repeats)}; "
+            "repeat_count is task-level, so these cannot share one task"
+        )
+    repeat_count = norm[0][4]
+
+    task = dma_configure_task_for(
+        alloc, repeat_count=repeat_count, repeat_count_val=None, issue_token=issue_token
+    )
+    with bds(task) as bd:
+        last = len(norm) - 1
+        for i, (spec, offset, sizes, strides, _) in enumerate(norm):
+            with bd[i]:
+                shim_dma_bd(
+                    spec.pop("mem"),
+                    offset=offset,
+                    sizes=sizes,
+                    strides=strides,
+                    **spec,
+                )
+                # Every BD but the last hands off to its successor; the last terminates the chain.
+                if i != last:
+                    next_bd(bd[i + 1])
+                else:
+                    EndOp()
     return task
 
 

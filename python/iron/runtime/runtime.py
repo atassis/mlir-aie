@@ -18,6 +18,7 @@ bounds) elaborates to a flat binary sequence.
 from __future__ import annotations
 
 import itertools
+import os
 import logging
 from typing import Callable, Sequence, get_origin
 
@@ -28,8 +29,10 @@ from ...dialects._aie_ops_gen import (  # pyright: ignore[reportMissingImports]
     RuntimeSequenceOp,
 )
 from ...dialects.aiex import (
+    shim_dma_chained_bd_task,
     dma_await_task,
     dma_free_task,
+    dma_start_task,
     npu_load_pdi,  # pyright: ignore[reportAttributeAccessIssue]
     sync_scratchpad_parameters_from_host,  # pyright: ignore[reportAttributeAccessIssue]
 )
@@ -76,6 +79,10 @@ class ActiveSequence:
         # The implicit group for fill/drain calls that pass no explicit group.
         self._default_task_group = TaskGroup(next(runtime._task_group_index))
         self._open_task_groups: list[TaskGroup] = []
+        # Pending run of adjacent transfers that could share one task: (key, group, [DMATask]).
+        # Only populated when chaining is enabled; otherwise every transfer resolves eagerly as
+        # before and this stays None.
+        self._pending: tuple | None = None
         self._used_default = False
         self._used_explicit = False
 
@@ -87,6 +94,8 @@ class ActiveSequence:
         self._open_task_groups.append(tg)
 
     def finish_task_group(self, tg: TaskGroup) -> None:
+        # A group close is a synchronisation point, so nothing may still be queued behind it.
+        self._flush_pending()
         """Close a task group: await its waited tasks, then free the rest.
 
         Waits are ordered before frees within the group, matching the
@@ -122,19 +131,68 @@ class ActiveSequence:
         long-standing "await implies release" convention -- it just does so
         with an explicit free instead of folding it into the await.
         """
-        task.resolve()
         if task_group is not None:
             self._used_explicit = True
             group = task_group
         else:
             self._used_default = True
             group = self._default_task_group
+
+        if self._runtime._chain_shim_bds:
+            key = task.chain_key()
+            if key is not None:
+                if self._pending is not None and self._pending[0] == key and self._pending[1] is group:
+                    self._pending[2].append(task)
+                else:
+                    self._flush_pending()
+                    self._pending = (key, group, [task])
+                return
+        # Anything that cannot chain must first flush what is queued, or the emitted order stops
+        # matching the order the body asked for -- which is the one thing a DMA sequence cannot lose.
+        self._flush_pending()
+        task.resolve()
+        self._record(task, group)
+
+    def _record(self, task: DMATask, group: TaskGroup) -> None:
         if task.will_wait():
             group._actions.append((dma_await_task, [task.task]))
         group._actions.append((dma_free_task, [task.task]))
 
+    def _flush_pending(self) -> None:
+        """Emit the queued run: one task for the whole chain, or one each if it will not chain.
+
+        A refusal from `shim_dma_chained_bd_task` is NOT an error here -- it means these BDs cannot
+        legally share a task (they disagree on repeat_count) -- so the fallback emits exactly what
+        the unchained path would have, and the sequence is still correct.
+        """
+        if self._pending is None:
+            return
+        _key, group, tasks = self._pending
+        self._pending = None
+        if len(tasks) > 1:
+            try:
+                chained = shim_dma_chained_bd_task(
+                    tasks[0]._object_fifo.name,
+                    [t.bd_spec() for t in tasks],
+                    issue_token=tasks[0].will_wait(),
+                )
+            except ValueError:
+                chained = None
+            if chained is not None:
+                dma_start_task(chained)
+                for t in tasks:
+                    t.adopt_task(chained)
+                # ONE await and ONE free for the chain: the members share a handle, and recording
+                # the same handle N times would await a completed task N-1 more times.
+                self._record(tasks[0], group)
+                return
+        for t in tasks:
+            t.resolve()
+            self._record(t, group)
+
     def finalize(self) -> None:
         """Close bookkeeping after the body runs."""
+        self._flush_pending()
         explicit_open = [
             tg for tg in self._open_task_groups if tg is not self._default_task_group
         ]
@@ -171,6 +229,7 @@ class Runtime(Resolvable):
         fn_args: "Sequence | None" = None,
         *,
         strict_task_groups: bool = True,
+        chain_shim_bds: bool | None = None,
     ) -> None:
         """Create a runtime from its sequence body and fn_args.
 
@@ -204,6 +263,7 @@ class Runtime(Resolvable):
             fn_args (Sequence | None): Types/ints (runtime inputs) and shared objects,
                 in the order ``seq_fn`` expects them. Defaults to None (empty list).
             strict_task_groups (bool): Disallow mixing the default and explicit task groups. Defaults to True.
+            chain_shim_bds (bool): Emit adjacent same-fifo transfers in one task as a BD chain. Defaults to False.
         """
         self._seq_fn: Callable = seq_fn
         self._fn_args = list(fn_args) if fn_args is not None else []
@@ -232,6 +292,19 @@ class Runtime(Resolvable):
         self._tile_dmas = []
         self._scratchpad_parameters: list[ScratchpadParameter] = []
         self._strict_task_groups = strict_task_groups
+        # OPT-IN. Adjacent transfers on ONE fifo inside ONE task group are emitted as a
+        # single task carrying a BD chain, so the control processor issues one
+        # configure/start/await/free where it issued N. Bytes, order and BD contents are
+        # unchanged; what changes is the number of shim DMA tasks. Default off because this
+        # is the funnel every design's shim path goes through.
+        # An explicit kwarg always wins; otherwise IRON_CHAIN_SHIM_BDS=1 turns it on process-wide,
+        # which is what lets a design be A/B'd without threading the argument through every
+        # operator that builds a Runtime. Unset means off, so the emitted MLIR is unchanged.
+        self._chain_shim_bds = (
+            os.environ.get("IRON_CHAIN_SHIM_BDS", "0") == "1"
+            if chain_shim_bds is None
+            else bool(chain_shim_bds)
+        )
         self._task_group_index = itertools.count()
 
     def _register_fn_args(self) -> None:

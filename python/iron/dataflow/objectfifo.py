@@ -993,6 +993,13 @@ class ObjectFifoHandle(Resolvable):
             task.resolve()
         # Wrap the transfer's !index result: it is both the scf iter_arg payload
         # and the operand dma_await_task/dma_free_task accept.
+        #
+        # None when the runtime DEFERRED this transfer to chain it with its neighbours: there is no
+        # task op yet, and inventing one would hand the caller a handle to an op that may never be
+        # emitted separately. Only reachable with chaining enabled, which is opt-in, and every
+        # fill/drain call site in the operator library discards this value.
+        if not task.is_resolved():
+            return None
         return Task(task.task.result)
 
     def fill(

@@ -101,6 +101,35 @@ class DMATask(RuntimeTask):
             raise ValueError("Cannot get task before it is created (during resolve())")
         return self._task
 
+    def is_resolved(self) -> bool:
+        """Whether this transfer has emitted its op yet. False only on the deferred chaining path."""
+        return self._task is not None
+
+    def chain_key(self):
+        """What must match for two transfers to share ONE task, or None if this one cannot chain.
+
+        The fifo and direction are the channel; `wait` is included because chaining collapses N
+        completion tokens into one, so mixing a waited transfer with an unwaited one would change
+        what the group can await. The dynamic path is excluded outright -- a runtime-valued outer
+        size becomes the task's repeat_count, which is one field per task and cannot differ per BD.
+        """
+        if self._tap is None:
+            return None
+        return (self._object_fifo.name, bool(self._wait))
+
+    def bd_spec(self) -> dict:
+        """This transfer's per-BD arguments, for `shim_dma_chained_bd_task`."""
+        return dict(
+            mem=self._rt_data.op,
+            tap=self._tap,
+            offset_parameter=self._offset_parameter,
+            packet=self._packet,
+        )
+
+    def adopt_task(self, task) -> None:
+        """Point this transfer at a task emitted on its behalf (it shares one with its chain)."""
+        self._task = task
+
     def resolve(
         self,
         loc: ir.Location | None = None,
