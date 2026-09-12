@@ -14,6 +14,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include <algorithm>
@@ -233,8 +234,14 @@ struct DmaToNpuPattern : OpConversionPattern<NpuDmaMemcpyNdOp> {
   using OpConversionPattern::OpConversionPattern;
 
 public:
-  DmaToNpuPattern(MLIRContext *context, PatternBenefit benefit = 1)
-      : OpConversionPattern(context, benefit) {}
+  DmaToNpuPattern(MLIRContext *context, mlir::SymbolTable *shimAllocTable,
+                  PatternBenefit benefit = 1)
+      : OpConversionPattern(context, benefit), shimAllocTable(shimAllocTable) {
+  }
+
+  // Built once per device; see runOnOperation. Owned by the pass, live only
+  // during the conversion.
+  mlir::SymbolTable *shimAllocTable;
 
   LogicalResult
   matchAndRewrite(NpuDmaMemcpyNdOp op, OpAdaptor adaptor,
@@ -265,8 +272,8 @@ public:
     if (!dev)
       return failure();
 
-    auto infoOp = AIE::ShimDMAAllocationOp::getForSymbol(
-        dev, op.getMetadata().getRootReference());
+    auto infoOp = shimAllocTable->lookup<AIE::ShimDMAAllocationOp>(
+        op.getMetadata().getRootReference());
     if (!infoOp) {
       return op->emitOpError("couldn't find shim_dma_allocation op.");
     }
@@ -568,8 +575,8 @@ public:
     auto dev = op->getParentOfType<AIE::DeviceOp>();
     if (!dev)
       return failure();
-    auto infoOp = AIE::ShimDMAAllocationOp::getForSymbol(
-        dev, op.getMetadata().getRootReference());
+    auto infoOp = shimAllocTable->lookup<AIE::ShimDMAAllocationOp>(
+        op.getMetadata().getRootReference());
     if (!infoOp)
       return op->emitOpError("couldn't find shim_dma_allocation op.");
     AIE::TileOp shimTile = infoOp.getTileOp();
@@ -634,8 +641,13 @@ struct DmaWaitToSyncPattern : OpConversionPattern<NpuDmaWaitOp> {
 public:
   using OpConversionPattern::OpConversionPattern;
 
-  DmaWaitToSyncPattern(MLIRContext *context, PatternBenefit benefit = 1)
-      : OpConversionPattern(context, benefit) {}
+  DmaWaitToSyncPattern(MLIRContext *context, mlir::SymbolTable *shimAllocTable,
+                       PatternBenefit benefit = 1)
+      : OpConversionPattern(context, benefit), shimAllocTable(shimAllocTable) {
+  }
+
+  // See DmaToNpuPattern's identical member above.
+  mlir::SymbolTable *shimAllocTable;
 
   LogicalResult
   matchAndRewrite(NpuDmaWaitOp op, OpAdaptor adaptor,
@@ -645,7 +657,7 @@ public:
       return op->emitError("couldn't find parent of type DeviceOp");
 
     AIE::ShimDMAAllocationOp shimDmaAllocOp =
-        AIE::ShimDMAAllocationOp::getForSymbol(dev, op.getSymbol());
+        shimAllocTable->lookup<AIE::ShimDMAAllocationOp>(op.getSymbol());
     if (!shimDmaAllocOp) {
       return op->emitError("couldn't find shim_dma_allocation op");
     }
@@ -923,10 +935,16 @@ struct AIEDmaToNpuPass : xilinx::AIEX::impl::AIEDmaToNpuBase<AIEDmaToNpuPass> {
       }
     }
 
+    // Built once here instead of via ShimDMAAllocationOp::getForSymbol's
+    // per-call linear scan -- DmaToNpuPattern and DmaWaitToSyncPattern each
+    // run once per candidate op, so an uncached scan is O(N * top-level
+    // device symbols) across the conversion.
+    mlir::SymbolTable shimAllocTable(device);
+
     RewritePatternSet patterns(&getContext());
     patterns.insert<BlockWriteSymToAddr>(&getContext());
-    patterns.insert<DmaToNpuPattern>(&getContext());
-    patterns.insert<DmaWaitToSyncPattern>(&getContext());
+    patterns.insert<DmaToNpuPattern>(&getContext(), &shimAllocTable);
+    patterns.insert<DmaWaitToSyncPattern>(&getContext(), &shimAllocTable);
     patterns.insert<MaskWrite32SymToAddr>(&getContext());
     patterns.insert<PushQueuetoWrite32Pattern>(&getContext());
     patterns.insert<RtpToWrite32Pattern>(&getContext());

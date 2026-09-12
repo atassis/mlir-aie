@@ -2114,6 +2114,10 @@ def AIE_ShimDMAAllocationOp
     /// record the type it carries.
     std::optional<int64_t> getObjectSizeInBytes();
     TileOp getTileOp();
+    /// O(top-level device symbols) per call (linear scan via lookupSymbol).
+    /// Fine for a one-off resolution; never call this in a loop over many
+    /// ops -- build a mlir::SymbolTable once and use its lookup<> instead
+    /// (see AIEDmaToNpu.cpp's DmaToNpuPattern/DmaWaitToSyncPattern).
     static ::xilinx::AIE::ShimDMAAllocationOp getForSymbol(::xilinx::AIE::DeviceOp device, ::llvm::StringRef symbol);
   }];
 }
