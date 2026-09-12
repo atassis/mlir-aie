@@ -21,6 +21,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/WalkPatternRewriteDriver.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringMap.h"
 
 namespace xilinx::AIEX {
 #define GEN_PASS_DEF_AIEMATERIALIZERUNTIMESEQUENCES
@@ -57,6 +58,42 @@ struct RuntimeCallGraphCyclicityAnalysis {
     llvm::DenseSet<AIE::RuntimeSequenceOp> callStack;
     llvm::DenseSet<AIE::RuntimeSequenceOp> visited;
 
+    // Module-level symbol cache for calleeSequenceCached below; see
+    // populateModuleSymbolCache's comment. Kept lazy (populated inside the
+    // lambda, not here): this analysis runs once per runtime_sequence op,
+    // most with no RunOps at all, and an eager scan here paid module-wide
+    // cost on every one of them regardless (measured regression, 2026-09-12).
+    llvm::DenseMap<StringAttr, Operation *> moduleSymbolCache;
+    bool moduleSymbolCachePopulated = false;
+    auto calleeSequenceCached =
+        [&moduleSymbolCache, &moduleSymbolCachePopulated,
+         op](RunOp runOp) -> AIE::RuntimeSequenceOp {
+      ConfigureOp configureOp =
+          runOp.getOperation()->getParentOfType<ConfigureOp>();
+      if (!configureOp)
+        return nullptr;
+      if (!moduleSymbolCachePopulated) {
+        if (ModuleOp moduleOp = op->getParentOfType<ModuleOp>()) {
+          for (Operation &topOp : moduleOp.getOps()) {
+            if (auto symName = topOp.getAttrOfType<StringAttr>(
+                    SymbolTable::getSymbolAttrName()))
+              moduleSymbolCache[symName] = &topOp;
+          }
+        }
+        moduleSymbolCachePopulated = true;
+      }
+      auto devIt = moduleSymbolCache.find(
+          configureOp.getSymbolAttr().getRootReference());
+      if (devIt == moduleSymbolCache.end())
+        return nullptr;
+      auto calleeDevice = llvm::dyn_cast<AIE::DeviceOp>(devIt->second);
+      if (!calleeDevice)
+        return nullptr;
+      return llvm::dyn_cast_or_null<AIE::RuntimeSequenceOp>(
+          SymbolTable::lookupSymbolIn(calleeDevice,
+                                      runOp.getRuntimeSequenceSymbol()));
+    };
+
     std::function<bool(AIE::RuntimeSequenceOp)> hasCycle =
         [&](AIE::RuntimeSequenceOp seq) -> bool {
       if (callStack.contains(seq)) {
@@ -72,8 +109,7 @@ struct RuntimeCallGraphCyclicityAnalysis {
       // Check all sequences called by this one
       bool foundCycle = false;
       seq.walk([&](RunOp runOp) {
-        if (AIE::RuntimeSequenceOp callee =
-                runOp.getCalleeRuntimeSequenceOp()) {
+        if (AIE::RuntimeSequenceOp callee = calleeSequenceCached(runOp)) {
           if (hasCycle(callee)) {
             foundCycle = true;
             return WalkResult::interrupt();
@@ -333,6 +369,29 @@ copyReferencedSSAValues(PatternRewriter &rewriter,
   return success();
 }
 
+// Indexes moduleOp's top-level symbols once instead of paying
+// SymbolTable::lookupSymbolIn's per-call linear scan of every top-level op
+// (device count in practice) on each lookup -- O(devices) per lookup,
+// O(devices * inlines) total across a pass that resolves one cross-device
+// reference per inlined symbol AND (via RunOp/ConfigureOp's own
+// getCalleeDeviceOp/getCalleeRuntimeSequenceOp) one callee-device lookup per
+// RunOp match. Profiled 2026-09-12: this callee-device resolution, not the
+// cross-device symbol fallback below, is the dominant cost -- fixing the
+// latter alone left the pass's growth curve essentially unchanged.
+static void
+populateModuleSymbolCache(ModuleOp moduleOp,
+                          llvm::DenseMap<StringAttr, Operation *> &cache,
+                          bool &populated) {
+  if (populated)
+    return;
+  for (Operation &topOp : moduleOp.getOps()) {
+    if (auto symName =
+            topOp.getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName()))
+      cache[symName] = &topOp;
+  }
+  populated = true;
+}
+
 // Inlines the definitions of all symbols referenced in the given operation
 // at the current insertion point in the given rewriter, unless the symbol
 // definition is in the "previouslyInlinedSymbolMap" map. While inlining,
@@ -345,7 +404,10 @@ static LogicalResult inlineReferencedSymbolDefinitions(
     AIE::DeviceOp callerDevice,
     llvm::DenseMap<Operation *, Operation *> &clonedDefs,
     mlir::OpBuilder::InsertPoint &clonedDefOpsInsertionPoint,
-    llvm::SetVector<SymbolRefAttr> &allSymbolNames) {
+    llvm::SetVector<SymbolRefAttr> &allSymbolNames,
+    llvm::StringMap<unsigned> &nextSuffixCounter,
+    llvm::DenseMap<StringAttr, Operation *> &moduleSymbolCache,
+    bool &moduleSymbolCachePopulated) {
   MLIRContext *ctx = op->getContext();
   for (NamedAttribute namedAttr : op->getAttrs()) {
     Attribute attr = namedAttr.getValue();
@@ -354,10 +416,12 @@ static LogicalResult inlineReferencedSymbolDefinitions(
       if (!previouslyInlinedSymbolMap.count(oldSymbolRef)) {
         llvm::StringRef oldName = oldSymbolRef.getRootReference().getValue();
         std::string uniqueName = oldName.str();
-        unsigned uniquingCounter = 0;
-        while (allSymbolNames.count(SymbolRefAttr::get(ctx, uniqueName))) {
-          uniqueName = oldName.str() + "_" + std::to_string(uniquingCounter);
-          uniquingCounter++;
+        if (allSymbolNames.count(SymbolRefAttr::get(ctx, uniqueName))) {
+          unsigned &uniquingCounter = nextSuffixCounter[oldName];
+          do {
+            uniqueName = oldName.str() + "_" + std::to_string(uniquingCounter);
+            ++uniquingCounter;
+          } while (allSymbolNames.count(SymbolRefAttr::get(ctx, uniqueName)));
         }
         newSymbolRef = SymbolRefAttr::get(ctx, uniqueName);
         allSymbolNames.insert(newSymbolRef);
@@ -375,7 +439,22 @@ static LogicalResult inlineReferencedSymbolDefinitions(
         }
         if (!symbolDefOp) {
           if (ModuleOp moduleOp = lookupFrom->getParentOfType<ModuleOp>()) {
-            symbolDefOp = SymbolTable::lookupSymbolIn(moduleOp, oldSymbolRef);
+            if (!oldSymbolRef.getNestedReferences().empty()) {
+              // Nested refs are rare here (this pass flattens cross-device
+              // refs to single names); fall back to the general resolver
+              // rather than teach the cache below to walk nested scopes too.
+              symbolDefOp = SymbolTable::lookupSymbolIn(moduleOp, oldSymbolRef);
+            } else {
+              // See populateModuleSymbolCache's comment: this replaces
+              // lookupSymbolIn's per-call linear scan of every top-level
+              // device with a one-time index.
+              populateModuleSymbolCache(moduleOp, moduleSymbolCache,
+                                        moduleSymbolCachePopulated);
+              auto cached =
+                  moduleSymbolCache.find(oldSymbolRef.getRootReference());
+              symbolDefOp = cached != moduleSymbolCache.end() ? cached->second
+                                                              : nullptr;
+            }
           }
         }
         if (!symbolDefOp) {
@@ -429,6 +508,22 @@ struct InlineRuntimeCallsPattern : RewritePattern {
   llvm::SetVector<SymbolRefAttr> &allSymbolNames;
   llvm::DenseMap<Operation *, Operation *> &clonedDefs;
 
+  // Per-base-name resume point for the uniquing search below, so the k-th
+  // inline of a repeated base name probes once instead of re-walking every
+  // suffix already claimed by this pass (same anti-pattern/fix shape as the
+  // id-uniquing cache in AIEDecomposeLargeDmaBd.cpp). Safe to resume from
+  // rather than restart at 0: allSymbolNames only grows, so a suffix this
+  // pattern already claimed stays claimed, and any pre-existing name at an
+  // unvisited suffix is still caught by the membership check below.
+  mutable llvm::StringMap<unsigned> nextSuffixCounter;
+
+  // Module-level symbol cache; see populateModuleSymbolCache's comment.
+  // Scoped to this pattern instance (one per device, matching
+  // allSymbolNames' own scope), shared by the cross-device symbol lookup
+  // below and by this pattern's own callee-device resolution.
+  mutable llvm::DenseMap<StringAttr, Operation *> moduleSymbolCache;
+  mutable bool moduleSymbolCachePopulated = false;
+
   InlineRuntimeCallsPattern(
       MLIRContext *ctx, mlir::OpBuilder::InsertPoint &ssaDefInsertPoint,
       mlir::OpBuilder::InsertPoint &symbolDefInsertPoint,
@@ -448,10 +543,35 @@ struct InlineRuntimeCallsPattern : RewritePattern {
       return failure();
     }
 
-    AIE::DeviceOp calleeDevice = runOp.getCalleeDeviceOp();
+    // Resolve the callee device via the module-symbol cache rather than
+    // runOp.getCalleeDeviceOp()/getCalleeRuntimeSequenceOp(), which each
+    // re-scan every top-level device for the same device_ref on every
+    // match -- see populateModuleSymbolCache's comment.
+    AIEX::ConfigureOp configureOp =
+        runOp.getOperation()->getParentOfType<AIEX::ConfigureOp>();
+    ModuleOp moduleOp = runOp.getOperation()->getParentOfType<ModuleOp>();
+    if (!configureOp || !moduleOp) {
+      return failure();
+    }
+    populateModuleSymbolCache(moduleOp, moduleSymbolCache,
+                              moduleSymbolCachePopulated);
+    auto calleeIt = moduleSymbolCache.find(
+        configureOp.getSymbolAttr().getRootReference());
+    AIE::DeviceOp calleeDevice =
+        calleeIt != moduleSymbolCache.end()
+            ? llvm::dyn_cast<AIE::DeviceOp>(calleeIt->second)
+            : nullptr;
+    if (!calleeDevice) {
+      // Matches getReferencedDeviceOp()'s own diagnostic for this case.
+      configureOp.emitError()
+          << "No such device: '" << configureOp.getSymbolAttr() << "'";
+      return failure();
+    }
     AIE::RuntimeSequenceOp calleeRuntimeSequence =
-        runOp.getCalleeRuntimeSequenceOp();
-    if (!calleeDevice || !calleeRuntimeSequence) {
+        llvm::dyn_cast_or_null<AIE::RuntimeSequenceOp>(
+            SymbolTable::lookupSymbolIn(calleeDevice,
+                                        runOp.getRuntimeSequenceSymbol()));
+    if (!calleeRuntimeSequence) {
       return failure();
     }
 
@@ -541,7 +661,8 @@ struct InlineRuntimeCallsPattern : RewritePattern {
         if (failed(inlineReferencedSymbolDefinitions(
                 rewriter, nestedOp, calleeRuntimeSequence.getOperation(),
                 argMap, previouslyInlinedSymbolMap, callerDevice, clonedDefs,
-                symbolDefInsertPoint, allSymbolNames))) {
+                symbolDefInsertPoint, allSymbolNames, nextSuffixCounter,
+                moduleSymbolCache, moduleSymbolCachePopulated))) {
           return WalkResult::interrupt();
         }
         return WalkResult::advance();
@@ -646,6 +767,13 @@ struct AIEMaterializeRuntimeSequencesPass
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
 
+    // Same cache as InlineRuntimeCallsPattern's (see populateModuleSymbolCache):
+    // this pre-materialization verification loop resolves one callee device
+    // per ConfigureOp via getReferencedDeviceOp(), which re-scans every
+    // top-level device per call -- O(devices * configures) otherwise.
+    llvm::DenseMap<StringAttr, Operation *> verifyModuleSymbolCache;
+    bool verifyModuleSymbolCachePopulated = false;
+
     // Process each device in the module
     for (AIE::DeviceOp deviceOp : moduleOp.getOps<AIE::DeviceOp>()) {
 
@@ -663,7 +791,14 @@ struct AIEMaterializeRuntimeSequencesPass
         // DeviceOp from a verifier causes a data race on its symbol table.
         for (ConfigureOp configureOp :
              runtimeSequenceOp.getOps<ConfigureOp>()) {
-          AIE::DeviceOp referencedDev = configureOp.getReferencedDeviceOp();
+          populateModuleSymbolCache(moduleOp, verifyModuleSymbolCache,
+                                    verifyModuleSymbolCachePopulated);
+          auto devIt = verifyModuleSymbolCache.find(
+              configureOp.getSymbolAttr().getRootReference());
+          AIE::DeviceOp referencedDev =
+              devIt != verifyModuleSymbolCache.end()
+                  ? llvm::dyn_cast<AIE::DeviceOp>(devIt->second)
+                  : nullptr;
           if (!referencedDev) {
             // ConfigureOp::verify() already reported the error (no such
             // device, not a device, or device type mismatch) at parse time;
