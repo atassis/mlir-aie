@@ -26,7 +26,6 @@
 #include "llvm/ADT/TypeSwitch.h"
 
 #include <map>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -4377,34 +4376,15 @@ std::optional<int64_t> ShimDMAAllocationOp::getObjectSizeInBytes() {
          static_cast<int64_t>(layout.getTypeSize(elemType.getElementType()));
 }
 
-// Safe as a global, mutex-guarded cache (not a per-call-site one, unlike
-// aie-dma-to-npu's local table) because ShimDMAAllocationOps are created only
-// by AIEObjectFifoAllocate/AIEGenerateColumnControlOverlay, early, and never
-// erased or renamed after -- one built table stays valid device-wide. Mutex:
-// aie-opt runs passes multi-threaded, and op verifiers are among the callers.
-// A miss rebuilds once and rechecks rather than returning null immediately:
-// DMAConfigureTaskForOp::verify() looks up a symbol before it exists yet and
-// treats "not found" as "resolved by a later pass".
-static std::mutex &getShimAllocTableCacheMutex() {
-  static std::mutex mutex;
-  return mutex;
-}
-static llvm::DenseMap<Operation *, std::unique_ptr<SymbolTable>> &
-getShimAllocTableCache() {
-  static llvm::DenseMap<Operation *, std::unique_ptr<SymbolTable>> cache;
-  return cache;
-}
-
 ShimDMAAllocationOp ShimDMAAllocationOp::getForSymbol(DeviceOp device,
                                                       llvm::StringRef symbol) {
-  std::lock_guard<std::mutex> guard(getShimAllocTableCacheMutex());
-  auto &table = getShimAllocTableCache()[device.getOperation()];
-  if (!table)
-    table = std::make_unique<SymbolTable>(device);
-  if (auto op = table->lookup<ShimDMAAllocationOp>(symbol))
-    return op;
-  table = std::make_unique<SymbolTable>(device);
-  return table->lookup<ShimDMAAllocationOp>(symbol);
+  Operation *maybeOp = device.lookupSymbol(symbol);
+  if (maybeOp) {
+    if (ShimDMAAllocationOp op = dyn_cast<ShimDMAAllocationOp>(maybeOp)) {
+      return op;
+    }
+  }
+  return nullptr;
 }
 
 //===----------------------------------------------------------------------===//
