@@ -19,6 +19,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/DenseSet.h"
@@ -227,7 +228,7 @@ static bool isUnderRuntimeControlFlow(AIE::DMABDOp op) {
 }
 
 static std::optional<std::pair<AIE::TileOp, Operation *>>
-resolveTaskAndTile(AIE::DMABDOp op) {
+resolveTaskAndTile(AIE::DMABDOp op, const mlir::SymbolTable &symbolTable) {
   if (auto cfg = op->getParentOfType<DMAConfigureTaskOp>()) {
     // Decomposition is a shape rewrite, so an unplaced tile is not an error
     // here: decline and let the pattern run again after placement.
@@ -237,11 +238,10 @@ resolveTaskAndTile(AIE::DMABDOp op) {
     return std::make_pair(tile, cfg.getOperation());
   }
   if (auto cfgFor = op->getParentOfType<DMAConfigureTaskForOp>()) {
-    AIE::DeviceOp dev = op->getParentOfType<AIE::DeviceOp>();
-    if (!dev)
-      return std::nullopt;
-    auto allocOp = AIE::ShimDMAAllocationOp::getForSymbol(
-        dev, cfgFor.getAlloc().getRootReference());
+    // symbolTable.lookup instead of ShimDMAAllocationOp::getForSymbol's
+    // per-call linear device scan -- see the pass's own symbolTable comment.
+    auto allocOp = symbolTable.lookup<AIE::ShimDMAAllocationOp>(
+        cfgFor.getAlloc().getRootReference());
     if (!allocOp)
       return std::nullopt;
     AIE::TileOp tile = allocOp.getTileOp();
@@ -285,7 +285,11 @@ static int64_t allocateNextId(NpuDmaMemcpyNdOp op, int64_t startId,
 }
 
 struct DecomposeLargeDmaBdPattern : OpRewritePattern<NpuDmaMemcpyNdOp> {
-  using OpRewritePattern::OpRewritePattern;
+  const mlir::SymbolTable &symbolTable;
+
+  DecomposeLargeDmaBdPattern(MLIRContext *ctx,
+                             const mlir::SymbolTable &symbolTable)
+      : OpRewritePattern<NpuDmaMemcpyNdOp>(ctx), symbolTable(symbolTable) {}
 
   // used-id sets, keyed by enclosing RuntimeSequenceOp then by metadata,
   // populated by one walk per sequence the first time it is matched against
@@ -320,12 +324,10 @@ struct DecomposeLargeDmaBdPattern : OpRewritePattern<NpuDmaMemcpyNdOp> {
     if (isContiguousTransfer(pattern.sizes, pattern.strides))
       return failure();
 
-    AIE::DeviceOp dev = op->getParentOfType<AIE::DeviceOp>();
-    if (!dev)
-      return failure();
-
-    auto allocOp = AIE::ShimDMAAllocationOp::getForSymbol(
-        dev, op.getMetadata().getRootReference());
+    // symbolTable.lookup instead of ShimDMAAllocationOp::getForSymbol's
+    // per-call linear device scan -- see the pass's own symbolTable comment.
+    auto allocOp =
+        symbolTable.lookup<AIE::ShimDMAAllocationOp>(op.getMetadata().getRootReference());
     if (!allocOp)
       return failure();
 
@@ -398,7 +400,11 @@ struct DecomposeLargeDmaBdPattern : OpRewritePattern<NpuDmaMemcpyNdOp> {
 };
 
 struct DecomposeLargeDmaBdTaskPattern : OpRewritePattern<AIE::DMABDOp> {
-  using OpRewritePattern::OpRewritePattern;
+  const mlir::SymbolTable &symbolTable;
+
+  DecomposeLargeDmaBdTaskPattern(MLIRContext *ctx,
+                                 const mlir::SymbolTable &symbolTable)
+      : OpRewritePattern<AIE::DMABDOp>(ctx), symbolTable(symbolTable) {}
 
   LogicalResult matchAndRewrite(AIE::DMABDOp op,
                                 PatternRewriter &rewriter) const override {
@@ -408,7 +414,7 @@ struct DecomposeLargeDmaBdTaskPattern : OpRewritePattern<AIE::DMABDOp> {
         op->getParentOfType<AIE::DMAOp>())
       return failure();
 
-    auto taskAndTile = resolveTaskAndTile(op);
+    auto taskAndTile = resolveTaskAndTile(op, symbolTable);
     if (!taskAndTile)
       return failure();
 
@@ -530,9 +536,16 @@ struct AIEDecomposeLargeDmaBdPass
           AIEDecomposeLargeDmaBdPass> {
   void runOnOperation() override {
     AIE::DeviceOp device = getOperation();
+    // Built once: neither pattern creates, erases or renames a
+    // ShimDMAAllocationOp (both only query one), so this stays valid across
+    // the whole greedy run -- same contract as AIESubstituteShimDMAAllocations's
+    // own device-wide SymbolTable, replacing getForSymbol's per-call linear
+    // scan (O(top-level symbols) per candidate op, confirmed live at
+    // ~90% of pass samples on a real batched-prefill build, 2026-09-13).
+    mlir::SymbolTable symbolTable(device);
     RewritePatternSet patterns(&getContext());
     patterns.add<DecomposeLargeDmaBdPattern, DecomposeLargeDmaBdTaskPattern>(
-        &getContext());
+        &getContext(), symbolTable);
     if (failed(applyPatternsGreedily(device, std::move(patterns))))
       signalPassFailure();
   }
