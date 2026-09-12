@@ -137,7 +137,14 @@ AIEX::verifyStridesWraps(mlir::Operation *forOp,
                          llvm::SmallVector<int64_t, 4> inputStrides,
                          llvm::SmallVector<int64_t, 4> hardwareSizes,
                          llvm::SmallVector<int64_t, 4> hardwareStrides,
-                         bool skipTransformationChecks) {
+                         bool skipTransformationChecks, bool quiet) {
+  // quiet: see the AIEXDialect.h declaration.
+  auto emitOpError = [&](llvm::Twine message) -> InFlightDiagnostic {
+    if (quiet)
+      return mlir::emitError(forOp->getLoc())
+             << "'" << forOp->getName() << "' op " << message;
+    return forOp->emitOpError(message);
+  };
   const auto &targetModel = AIE::getTargetModel(forOp);
   auto addressGranularity = targetModel.getAddressGenGranularity();
   DataLayout dataLayout = DataLayout::closest(forOp);
@@ -148,7 +155,7 @@ AIEX::verifyStridesWraps(mlir::Operation *forOp,
   if (!targetModel.isCoreTile(tileCol, tileRow) &&
       !targetModel.isMemTile(tileCol, tileRow) &&
       !targetModel.isShimNOCTile(tileCol, tileRow))
-    return forOp->emitOpError(
+    return emitOpError(
         "Unsupported tile type at (" + std::to_string(tileCol) + ", " +
         std::to_string(tileRow) + ") Must be ShimNOC, Mem or Core.");
 
@@ -158,7 +165,7 @@ AIEX::verifyStridesWraps(mlir::Operation *forOp,
 
   for (int i = 0; i < 4; i++) {
     if (inputSizes[i] <= 0) {
-      return forOp->emitOpError("Size ") << i << " must be a positive integer.";
+      return emitOpError("Size ") << i << " must be a positive integer.";
     }
   }
 
@@ -169,7 +176,7 @@ AIEX::verifyStridesWraps(mlir::Operation *forOp,
         << " bytes each equal " << (inputSizes[0] * elemWidth / 8)
         << " bytes, which is not divisible by " << (addressGranularity / 8)
         << ". ";
-    return forOp->emitOpError(msg.str());
+    return emitOpError(msg.str());
   }
 
   for (int i = 0; i < 3; i++) {
@@ -177,14 +184,14 @@ AIEX::verifyStridesWraps(mlir::Operation *forOp,
       // If inputSize[i] == 1, anything is allowable in the stride, since that
       // stride will never be applied. For any larger size, we must verify that
       // the stride is positive.
-      return forOp->emitOpError("Stride ")
+      return emitOpError("Stride ")
              << i << " must be a positive integer.";
     }
   }
   // A value of zero is allowable for the fourth-dimension stride
   // (this indicates an interation stride for the repeat of 0)
   if (inputSizes[3] > 1 && inputStrides[3] < 0) {
-    return forOp->emitOpError("Stride 3 must be a non-negative integer.");
+    return emitOpError("Stride 3 must be a non-negative integer.");
   }
 
   for (int i = 0; i < 4; i++) {
@@ -199,34 +206,34 @@ AIEX::verifyStridesWraps(mlir::Operation *forOp,
           << (elemWidth / 8) << " bytes = " << (inputStrides[i] * elemWidth / 8)
           << " bytes, which is not divisible by " << (addressGranularity / 8)
           << ". ";
-      return forOp->emitOpError(msg.str());
+      return emitOpError(msg.str());
     }
   }
 
   if (!skipTransformationChecks && hardwareSizes[0] > (1 << wrap_bits) - 1)
-    return forOp->emitOpError(
+    return emitOpError(
         "Size 0 exceeds the [0:" + std::to_string((1 << wrap_bits) - 1) +
         "] range.");
   if (!skipTransformationChecks && hardwareSizes[1] > (1 << wrap_bits) - 1)
-    return forOp->emitOpError(
+    return emitOpError(
         "Size 1 exceeds the [0:" + std::to_string((1 << wrap_bits) - 1) +
         "] range.");
   if (hardwareSizes[3] > (1 << iter_bits) - 1)
-    return forOp->emitOpError(
+    return emitOpError(
         "Size 3 exceeds the [1:" + std::to_string(1 << iter_bits) + "] range.");
   if (hardwareStrides[0] > (1 << step_bits) - 1)
-    return forOp->emitOpError("Stride 0 exceeds the [1:" +
+    return emitOpError("Stride 0 exceeds the [1:" +
                               std::to_string(1 << step_bits) + "] range.");
   if (hardwareStrides[1] > (1 << step_bits) - 1)
-    return forOp->emitOpError("Stride 1 exceeds the [1:" +
+    return emitOpError("Stride 1 exceeds the [1:" +
                               std::to_string(1 << step_bits) + "] range.");
   if (hardwareStrides[2] > (1 << step_bits) - 1)
-    return forOp->emitOpError("Stride 2 exceeds the [1:" +
+    return emitOpError("Stride 2 exceeds the [1:" +
                               std::to_string(1 << step_bits) + "] range.");
   // strides[3] exceeding the range is ok iff the sizes[3] is one, which is
   // checked below
   if (hardwareStrides[3] > (1 << step_bits) - 1 && hardwareSizes[3] > 0)
-    return forOp->emitOpError("Stride 3 exceeds the [1:" +
+    return emitOpError("Stride 3 exceeds the [1:" +
                               std::to_string(1 << step_bits) + "] range.");
 
   return success();

@@ -39,6 +39,10 @@ void getHardwareStridesWraps(const AIE::AIETargetModel &targetModel,
                              llvm::SmallVector<int64_t, 4> inputStrides,
                              llvm::SmallVector<int64_t, 4> &sizes,
                              llvm::SmallVector<int64_t, 4> &strides);
+// `quiet=true` skips the context's default "see current operation" note
+// (Operation::emitError reprinting forOp's top-level ancestor, an
+// SSANameState over the whole module) for callers that discard the
+// diagnostic anyway, e.g. patternPassesVerification's legality probe.
 mlir::LogicalResult
 verifyStridesWraps(mlir::Operation *forOp,
                    mlir::BaseMemRefType referencedBufType, int tileCol,
@@ -46,7 +50,7 @@ verifyStridesWraps(mlir::Operation *forOp,
                    llvm::SmallVector<int64_t, 4> inputStrides,
                    llvm::SmallVector<int64_t, 4> hardwareSizes,
                    llvm::SmallVector<int64_t, 4> hardwareStrides,
-                   bool skipTransformationChecks = false);
+                   bool skipTransformationChecks = false, bool quiet = false);
 bool isLinearTransfer(llvm::ArrayRef<int64_t> sizes,
                       llvm::ArrayRef<int64_t> strides);
 
