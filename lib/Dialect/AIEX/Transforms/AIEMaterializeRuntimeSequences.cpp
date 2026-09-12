@@ -23,6 +23,9 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
 
+#include <chrono>
+#include <cstdlib>
+
 namespace xilinx::AIEX {
 #define GEN_PASS_DEF_AIEMATERIALIZERUNTIMESEQUENCES
 #include "aie/Dialect/AIEX/Transforms/AIEXPasses.h.inc"
@@ -33,6 +36,35 @@ namespace xilinx::AIEX {
 using namespace mlir;
 using namespace xilinx;
 using namespace xilinx::AIEX;
+
+// Progress heartbeat for monitoring a long-running run from outside the
+// process: this pass has no per-op signal otherwise, so a build stuck here
+// for tens of minutes looks identical to one making steady progress. Off
+// (zero perturbation) unless AIE_TRACE_PROGRESS_EVERY is a positive integer;
+// then emits one stderr line every that many matches, with an elapsed timer
+// started on first use. `label` distinguishes multiple call sites sharing
+// the counter's caller-provided storage.
+static void traceProgressIfEnabled(const char *label, long &counter,
+                                   std::chrono::steady_clock::time_point &start,
+                                   bool &started) {
+  static const long every = [] {
+    const char *v = getenv("AIE_TRACE_PROGRESS_EVERY");
+    return v ? std::atol(v) : 0;
+  }();
+  if (every <= 0)
+    return;
+  if (!started) {
+    start = std::chrono::steady_clock::now();
+    started = true;
+  }
+  if (++counter % every == 0) {
+    double elapsedS =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+            .count();
+    llvm::errs() << "[" << label << "] " << counter << " done, elapsed "
+                 << elapsedS << "s\n";
+  }
+}
 
 struct RuntimeCallGraphCyclicityAnalysis {
   AnalysisManager &analysisManager;
@@ -524,6 +556,11 @@ struct InlineRuntimeCallsPattern : RewritePattern {
   mutable llvm::DenseMap<StringAttr, Operation *> moduleSymbolCache;
   mutable bool moduleSymbolCachePopulated = false;
 
+  // See traceProgressIfEnabled's comment.
+  mutable long tracedInlineCount = 0;
+  mutable std::chrono::steady_clock::time_point traceStart;
+  mutable bool traceStarted = false;
+
   InlineRuntimeCallsPattern(
       MLIRContext *ctx, mlir::OpBuilder::InsertPoint &ssaDefInsertPoint,
       mlir::OpBuilder::InsertPoint &symbolDefInsertPoint,
@@ -675,6 +712,8 @@ struct InlineRuntimeCallsPattern : RewritePattern {
     // The aiex.run op has been inlined; erase it.
     rewriter.eraseOp(runOp);
 
+    traceProgressIfEnabled("aie-materialize: RunOps inlined", tracedInlineCount,
+                           traceStart, traceStarted);
     return success();
   }
 };

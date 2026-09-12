@@ -23,6 +23,9 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/DenseSet.h"
 
+#include <chrono>
+#include <cstdlib>
+
 namespace xilinx::AIEX {
 #define GEN_PASS_DEF_AIEDECOMPOSELARGEDMABD
 #include "aie/Dialect/AIEX/Transforms/AIEXPasses.h.inc"
@@ -33,6 +36,31 @@ using namespace xilinx;
 using namespace xilinx::AIEX;
 
 namespace {
+
+// Progress heartbeat; see the identical helper's comment in
+// AIEMaterializeRuntimeSequences.cpp. Same env var, same semantics, kept as
+// a file-local copy rather than a shared header for two call sites.
+void traceProgressIfEnabled(const char *label, long &counter,
+                            std::chrono::steady_clock::time_point &start,
+                            bool &started) {
+  static const long every = [] {
+    const char *v = getenv("AIE_TRACE_PROGRESS_EVERY");
+    return v ? std::atol(v) : 0;
+  }();
+  if (every <= 0)
+    return;
+  if (!started) {
+    start = std::chrono::steady_clock::now();
+    started = true;
+  }
+  if (++counter % every == 0) {
+    double elapsedS =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+            .count();
+    llvm::errs() << "[" << label << "] " << counter << " done, elapsed "
+                 << elapsedS << "s\n";
+  }
+}
 
 static bool allConstant(NpuDmaMemcpyNdOp op) {
   return llvm::all_of(op.getMixedSizes(),
@@ -267,6 +295,11 @@ struct DecomposeLargeDmaBdPattern : OpRewritePattern<NpuDmaMemcpyNdOp> {
                         llvm::DenseMap<Attribute, llvm::DenseSet<int64_t>>>
       usedIdsCache;
 
+  // See traceProgressIfEnabled's comment.
+  mutable long tracedDecomposeCount = 0;
+  mutable std::chrono::steady_clock::time_point traceStart;
+  mutable bool traceStarted = false;
+
   llvm::DenseMap<Attribute, llvm::DenseSet<int64_t>> &
   getUsedIdsForSeq(AIE::RuntimeSequenceOp seq) const {
     auto [it, inserted] = usedIdsCache.try_emplace(seq.getOperation());
@@ -358,6 +391,8 @@ struct DecomposeLargeDmaBdPattern : OpRewritePattern<NpuDmaMemcpyNdOp> {
                          last && op.getIssueToken());
     }
     rewriter.eraseOp(op);
+    traceProgressIfEnabled("aie-decompose-dma: multi-BD ops decomposed",
+                           tracedDecomposeCount, traceStart, traceStarted);
     return success();
   }
 };
