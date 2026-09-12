@@ -183,7 +183,8 @@ bool AIEX::patternPassesVerification(Operation *forOp,
   return succeeded(verifyStridesWraps(forOp, referencedBufType, tileCol,
                                       tileRow, pattern.sizes, pattern.strides,
                                       hwSizes, hwStrides,
-                                      /*skipTransformationChecks=*/false));
+                                      /*skipTransformationChecks=*/false,
+                                      /*quiet=*/true));
 }
 
 bool AIEX::isDecomposableNdDmaPattern(Operation *forOp,

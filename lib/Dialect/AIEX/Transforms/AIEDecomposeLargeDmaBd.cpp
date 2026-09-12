@@ -259,6 +259,25 @@ static int64_t allocateNextId(NpuDmaMemcpyNdOp op, int64_t startId,
 struct DecomposeLargeDmaBdPattern : OpRewritePattern<NpuDmaMemcpyNdOp> {
   using OpRewritePattern::OpRewritePattern;
 
+  // used-id sets, keyed by enclosing RuntimeSequenceOp then by metadata,
+  // populated by one walk per sequence the first time it is matched against
+  // instead of one walk per decomposed op (same anti-pattern/fix shape as the
+  // getOrCreateDataMemref cache, #3212). Mutable: matchAndRewrite is const.
+  mutable llvm::DenseMap<Operation *,
+                        llvm::DenseMap<Attribute, llvm::DenseSet<int64_t>>>
+      usedIdsCache;
+
+  llvm::DenseMap<Attribute, llvm::DenseSet<int64_t>> &
+  getUsedIdsForSeq(AIE::RuntimeSequenceOp seq) const {
+    auto [it, inserted] = usedIdsCache.try_emplace(seq.getOperation());
+    if (!inserted)
+      return it->second;
+    seq.walk([&](NpuDmaMemcpyNdOp other) {
+      it->second[other.getMetadataAttr()].insert(other.getId());
+    });
+    return it->second;
+  }
+
   LogicalResult matchAndRewrite(NpuDmaMemcpyNdOp op,
                                 PatternRewriter &rewriter) const override {
     if (!allConstant(op))
@@ -320,21 +339,20 @@ struct DecomposeLargeDmaBdPattern : OpRewritePattern<NpuDmaMemcpyNdOp> {
       return success();
     }
 
-    llvm::DenseSet<int64_t> usedIds;
+    llvm::DenseSet<int64_t> fallbackUsedIds;
+    llvm::DenseSet<int64_t> *usedIds = &fallbackUsedIds;
     if (auto seq = op->getParentOfType<AIE::RuntimeSequenceOp>()) {
-      seq.walk([&](NpuDmaMemcpyNdOp other) {
-        if (other == op)
-          return;
-        if (other.getMetadata() == op.getMetadata())
-          usedIds.insert(other.getId());
-      });
+      usedIds = &getUsedIdsForSeq(seq)[op.getMetadataAttr()];
+      // op is about to be erased -- its own id is not a collision to avoid,
+      // and excluding it lets the first decomposed sub-op below reuse it.
+      usedIds->erase(op.getId());
     }
 
     int64_t nextId = op.getId();
     rewriter.setInsertionPoint(op);
     for (auto [idx, subPattern] : llvm::enumerate(bds)) {
       bool last = idx + 1 == bds.size();
-      int64_t id = allocateNextId(op, nextId, usedIds);
+      int64_t id = allocateNextId(op, nextId, *usedIds);
       nextId = id + 1;
       createDecomposedOp(rewriter, op, subPattern, id,
                          last && op.getIssueToken());
