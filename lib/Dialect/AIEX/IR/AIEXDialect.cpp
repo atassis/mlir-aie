@@ -661,12 +661,9 @@ LogicalResult AIEX::NpuDmaMemcpyNdOp::verify() {
   return success();
 }
 
-// The dynamic path's shim-NOC-tile requirement and the static path's ND
-// wrap-size check both resolve the referenced shim_dma_allocation symbol.
-// Doing that here, through the SymbolTableCollection MLIR's own SymbolTable-
-// trait verification builds fresh per verify() call, is what makes it fast
-// and safe -- see DMAConfigureTaskForOp::verifySymbolUses's comment; the
-// plain verify() above no longer resolves this symbol itself.
+// Moved here from plain verify() for the same reason and with the same
+// safety argument as DMAConfigureTaskForOp::verifySymbolUses -- see its
+// comment.
 LogicalResult
 AIEX::NpuDmaMemcpyNdOp::verifySymbolUses(SymbolTableCollection &symbols) {
   BaseMemRefType buffer = getMemref().getType();
