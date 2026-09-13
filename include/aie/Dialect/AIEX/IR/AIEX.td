@@ -526,9 +526,11 @@ def AIE_RunOp : AIEX_Op<"run", [HasParent<"ConfigureOp">]> {
   }];
 }
 
-def AIE_NpuDmaMemcpyNdOp
-    : AIEX_Op<"npu.dma_memcpy_nd", [AttrSizedOperandSegments,
-                                    MyOffsetSizeAndStrideOpInterface]> {
+def AIE_NpuDmaMemcpyNdOp: AIEX_Op<"npu.dma_memcpy_nd", [
+    AttrSizedOperandSegments,
+    MyOffsetSizeAndStrideOpInterface,
+    DeclareOpInterfaceMethods<SymbolUserOpInterface>
+  ]> {
   let summary = "half DMA operator";
 
   let description = [{
