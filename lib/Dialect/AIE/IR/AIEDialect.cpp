@@ -1452,22 +1452,26 @@ LogicalResult ObjectFifoLinkOp::verify() {
       }
     }
 
-    std::vector<int> repeat_counts;
-    for (auto fifoOut : getOutputObjectFifos()) {
-      if (auto repeatCount = fifoOut.getRepeatCount()) {
-        repeat_counts.push_back(*repeatCount);
-      } else {
-        repeat_counts.push_back(0);
-      }
-    }
-    for (auto repeat : repeat_counts)
-      if (repeat_counts[0] != repeat)
-        return emitError("repeat counts of output object FIFOs must be equal");
-
   } else {
     if (!getSrcOffsets().empty() && !getDstOffsets().empty())
       return emitOpError("all offsets should be empty if there is no "
                          "join or distribute");
+  }
+
+  // A join or distribute's shared pool has one repeat_count, so every
+  // participant that sets one -- on either side -- must agree. Checked across
+  // ALL participants, not just the outputs: the previous version only
+  // compared getOutputObjectFifos(), which is trivially one element for a
+  // join and so never actually compared anything on that side, silently
+  // accepting disagreeing input repeat_counts (and getRepeatCount() below
+  // never read them either).
+  if (isJoin() || isDistribute()) {
+    std::vector<int> repeat_counts;
+    for (ObjectFifoCreateOp fifo : participants(*this))
+      repeat_counts.push_back(fifo.getRepeatCount().value_or(0));
+    for (int repeat : repeat_counts)
+      if (repeat_counts[0] != repeat)
+        return emitError("repeat counts of linked object FIFOs must be equal");
   }
 
   return success();
@@ -1586,9 +1590,15 @@ std::vector<int> ObjectFifoLinkOp::getDistributeTransferLengths() {
 }
 
 std::optional<int> ObjectFifoLinkOp::getRepeatCount() {
+  // verify() requires every participant that sets a repeat_count to agree, on
+  // either side, so any participant that has one reports the same value --
+  // check outputs first only to keep the common (non-join) case's scan short.
   for (auto fifoOut : getOutputObjectFifos())
     if (fifoOut.getRepeatCount().has_value())
       return {fifoOut.getRepeatCount()};
+  for (auto fifoIn : getInputObjectFifos())
+    if (fifoIn.getRepeatCount().has_value())
+      return {fifoIn.getRepeatCount()};
   return {};
 }
 
