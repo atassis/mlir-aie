@@ -201,18 +201,23 @@ struct AIEObjectFifoSplitPass
     return builder.getArrayAttr(names);
   }
 
+  // Two or more fifos share one pool at a link point, so this takes
+  // `disableSynchronization` already resolved by the caller rather than
+  // reading it off `from` -- a single participant is not the right source
+  // once more than one may set it. The non-link call sites below still pass
+  // their one fifo's own value, which is trivially correct there.
   ObjectFifoPoolOp createPool(Location loc, StringRef name, Value tile,
                               int depth, MemRefType elemType,
                               ObjectFifoCreateOp from,
                               ArrayRef<std::pair<int64_t, int64_t>> extents,
                               bool holdsInitialContents,
-                              std::optional<int> repeatCount) {
+                              std::optional<int> repeatCount,
+                              bool disableSynchronization) {
     auto pool = ObjectFifoPoolOp::create(
         builder, loc, name, tile, depth, elemType, /*buffers=*/ArrayAttr(),
         /*locks=*/ArrayAttr(),
         repeatCount ? builder.getI32IntegerAttr(*repeatCount) : IntegerAttr(),
-        from.getDisableSynchronization(),
-        builder.getStringAttr(from.name().getValue()),
+        disableSynchronization, builder.getStringAttr(from.name().getValue()),
         holdsInitialContents ? from.getInitValuesAttr() : ArrayAttr());
     createSegments(pool, loc, extents);
     return pool;
@@ -532,9 +537,25 @@ void AIEObjectFifoSplitPass::createLinkPools() {
                   : objectCountOn(device, *sharedTile, owner);
     }
 
-    auto pool = createPool(
-        linkOp.getLoc(), name, *sharedTile, depth, elemType, owner, extents,
-        /*holdsInitialContents=*/ownerIsOutput, linkOp.getRepeatCount());
+    // disable_synchronization means "skip lock generation for MY accesses to
+    // the shared object" -- if any participant on either side asks for that,
+    // the pool they share has no locks at all, so this is an OR over every
+    // participant rather than `owner`'s value alone. Reading only the owner
+    // silently dropped a non-owner's setting with no diagnostic; see the
+    // regression tests in debug_features/disable_synchronization_link_*.mlir.
+    bool disableSynchronization =
+        llvm::any_of(ins,
+                     [](ObjectFifoCreateOp f) {
+                       return f.getDisableSynchronization();
+                     }) ||
+        llvm::any_of(outs, [](ObjectFifoCreateOp f) {
+          return f.getDisableSynchronization();
+        });
+
+    auto pool = createPool(linkOp.getLoc(), name, *sharedTile, depth, elemType,
+                           owner, extents,
+                           /*holdsInitialContents=*/ownerIsOutput,
+                           linkOp.getRepeatCount(), disableSynchronization);
     linkPoolOwner.insert(owner);
 
     SmallVector<int32_t> allSegments;
@@ -610,7 +631,8 @@ void AIEObjectFifoSplitPass::runOnOperation() {
         ref = PoolRef{
             createPool(loc, (fifoName + "_pool").str(), tile, fifo.size(),
                        elemType, fifo, {{0, elemType.getNumElements()}},
-                       /*holdsInitialContents=*/true, fifo.getRepeatCount()),
+                       /*holdsInitialContents=*/true, fifo.getRepeatCount(),
+                       fifo.getDisableSynchronization()),
             {0}};
       }
 
@@ -663,7 +685,8 @@ void AIEObjectFifoSplitPass::runOnOperation() {
       auto pool =
           createPool(loc, (fifoName + "_pool").str(), prodTile, depth, elemType,
                      fifo, {{0, elemType.getNumElements()}},
-                     /*holdsInitialContents=*/true, fifo.getRepeatCount());
+                     /*holdsInitialContents=*/true, fifo.getRepeatCount(),
+                     fifo.getDisableSynchronization());
       prodRef = PoolRef{pool, {0}};
     }
 
@@ -716,11 +739,11 @@ void AIEObjectFifoSplitPass::runOnOperation() {
         int depth = isa<ArrayAttr>(fifo.getElemNumber())
                         ? fifo.size(consumerIndex + 1)
                         : objectCountOn(device, consumerTile, fifo);
-        auto pool = createPool(loc, (fifoName + suffix + "_pool").str(),
-                               consumerTile, depth, consElemType, fifo,
-                               {{0, consElemType.getNumElements()}},
-                               /*holdsInitialContents=*/false,
-                               /*repeatCount=*/std::nullopt);
+        auto pool = createPool(
+            loc, (fifoName + suffix + "_pool").str(), consumerTile, depth,
+            consElemType, fifo, {{0, consElemType.getNumElements()}},
+            /*holdsInitialContents=*/false,
+            /*repeatCount=*/std::nullopt, fifo.getDisableSynchronization());
         consRef = PoolRef{pool, {0}};
       }
 
