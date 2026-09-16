@@ -19,6 +19,9 @@
 
 #include "aie/Dialect/AIE/IR/AIEDialect.h"
 
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -276,10 +279,9 @@ inline llvm::json::Value makePatchInfoJson(int ctrlPktArgIdx,
 }
 
 // Full-ELF config.json fed to `aiebu-asm -t aie2_config`. One xrt-kernel per
-// device with ≥1 runtime sequence; PDIs array is shared (all devices) so
-// aiebu-asm can resolve any load_pdi reference. Argument count is
-// max(3, max runtime-seq arity). PDI IDs are read from `aiecc.pdi_id` on each
-// DeviceOp (stamped by `assignDevicePdiIds`).
+// device with ≥1 runtime sequence, carrying the PDIs that device's control code
+// loads. Argument count is max(3, max runtime-seq arity). PDI IDs are read from
+// `aiecc.pdi_id` on each DeviceOp (stamped by `assignDevicePdiIds`).
 //
 // `ctrlPktPaths` / `patchInfoPaths` (both keyed per runtime sequence as
 // "<device>_<sequence>" via `npuSeqKey`, optional) carry that sequence's
@@ -300,10 +302,13 @@ makeFullElfConfigJson(const Node<OpInModule<xilinx::AIE::DeviceOp>> &devices,
   };
 
   llvm::json::Array allPdis;
+  llvm::SmallVector<int> allPdiIds;
   for (const auto &item : devices.items)
-    if (auto it = pdiPaths.find(item.key); it != pdiPaths.end())
+    if (auto it = pdiPaths.find(item.key); it != pdiPaths.end()) {
       allPdis.push_back(
           O{{"id", devId(item.get().op)}, {"PDI_file", it->second}});
+      allPdiIds.push_back(devId(item.get().op));
+    }
 
   llvm::json::Array xrtKernels;
   for (const auto &item : devices.items) {
@@ -350,9 +355,16 @@ makeFullElfConfigJson(const Node<OpInModule<xilinx::AIE::DeviceOp>> &devices,
     if (instances.empty())
       continue;
 
+    // aiebu-asm emits a `.pdi.<id>` section per (xrt-kernel, PDI), so a shared
+    // list stores each image once per kernel: 8,091,264 B on a 48-layer
+    // Gemma-4 decode ELF, of which 736 B is reachable.
+    llvm::DenseSet<int> loaded;
+    devOp.walk(
+        [&](xilinx::AIEX::NpuLoadPdiOp lp) { loaded.insert(lp.getId()); });
     llvm::json::Array pdisCopy;
-    for (const auto &p : allPdis)
-      pdisCopy.push_back(llvm::json::Value(p));
+    for (auto [id, p] : llvm::zip(allPdiIds, allPdis))
+      if (loaded.contains(id))
+        pdisCopy.push_back(llvm::json::Value(p));
 
     xrtKernels.push_back(O{{"name", devName},
                            {"arguments", std::move(arguments)},
