@@ -231,8 +231,10 @@ struct AIEObjectFifoLowerDMAsPass
     size_t total = descriptors.size() * copies;
     size_t emitted = 0;
     Block *current = bdBlock;
-    for (Descriptor &descriptor : descriptors) {
-      for (int copy = 0; copy < copies; copy++) {
+    // Copy outer: `descriptors` is buffer-major, so nesting the other way replays [b0 x r, b1 x r]
+    // and a depth-d pool never alternates. Identical at d == 1.
+    for (int copy = 0; copy < copies; copy++) {
+      for (Descriptor &descriptor : descriptors) {
         Block *successor;
         if (emitted + 1 < total) {
           successor = builder.createBlock(endBlock);
