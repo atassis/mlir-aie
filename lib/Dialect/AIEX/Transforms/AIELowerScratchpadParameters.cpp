@@ -90,6 +90,8 @@ struct AIELowerScratchpadParametersPass
   void allocateBuffers(DeviceOp device, OpBuilder &builder) {
     MLIRContext *ctx = device.getContext();
     unsigned uniquingCounter = 0;
+    // One snapshot for the whole walk -- see generateUniqueSymbolName's declaration.
+    SymbolTable deviceSymbols(device);
 
     DenseMap<std::pair<StringRef, Operation *>, BufferOp> seen;
 
@@ -120,7 +122,7 @@ struct AIELowerScratchpadParametersPass
            std::to_string(tile.getRow()) + "_")
               .str();
       std::string bufName =
-          AIE::generateUniqueSymbolName(device, prefix, uniquingCounter);
+          AIE::generateUniqueSymbolName(deviceSymbols, prefix, uniquingCounter);
       auto buf =
           BufferOp::create(builder, readOp.getLoc(), bufType, tile,
                            builder.getStringAttr(bufName), /*address=*/nullptr,
