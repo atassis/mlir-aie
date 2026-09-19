@@ -162,14 +162,19 @@ struct DMAAwaitTaskOpPattern : OpConversionPattern<DMAAwaitTaskOp> {
     AIE::TileOp tile = task_op.tryGetTileOp();
     if (!tile)
       return emitUnplacedTileError(op, task_op);
+    // Constants are materialized in named locals so the emitted IR order does
+    // not depend on unspecified C++ argument-evaluation order (see
+    // AIELowerCoreReset.cpp), and the two `1`s share one Value instead of
+    // emitting it twice.
     Location loc = op.getLoc();
-    rewriter.replaceOpWithNewOp<NpuSyncOp>(
-        op, createConstantI32(rewriter, loc, tile.getCol()),
-        createConstantI32(rewriter, loc, tile.getRow()),
-        createConstantI32(rewriter, loc, (uint32_t)task_op.getDirection()),
-        createConstantI32(rewriter, loc, task_op.getChannel()),
-        createConstantI32(rewriter, loc, 1),
-        createConstantI32(rewriter, loc, 1));
+    Value col = createConstantI32(rewriter, loc, tile.getCol());
+    Value row = createConstantI32(rewriter, loc, tile.getRow());
+    Value dir =
+        createConstantI32(rewriter, loc, (uint32_t)task_op.getDirection());
+    Value channel = createConstantI32(rewriter, loc, task_op.getChannel());
+    Value one = createConstantI32(rewriter, loc, 1);
+    rewriter.replaceOpWithNewOp<NpuSyncOp>(op, col, row, dir, channel, one,
+                                           one);
     return success();
   }
 };

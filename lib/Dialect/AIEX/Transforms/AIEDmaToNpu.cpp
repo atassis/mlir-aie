@@ -669,17 +669,20 @@ public:
     }
 
     // Create with `column_num == 1` and `row_num == 1` to check for a single
-    // column and row.
+    // column and row. Constants are materialized in named locals so the
+    // emitted IR order does not depend on unspecified C++ argument-evaluation
+    // order (see AIELowerCoreReset.cpp), and the two `1`s share one Value
+    // instead of emitting it twice.
     Location loc = op->getLoc();
-    (void)rewriter.replaceOpWithNewOp<NpuSyncOp>(
-        op, createConstantI32(rewriter, loc, shimTile.getCol()),
-        createConstantI32(rewriter, loc, shimTile.getRow()),
-        createConstantI32(
-            rewriter, loc,
-            static_cast<uint32_t>(shimDmaAllocOp.getChannelDir())),
-        createConstantI32(rewriter, loc, shimDmaAllocOp.getChannelIndex()),
-        createConstantI32(rewriter, loc, 1),
-        createConstantI32(rewriter, loc, 1));
+    Value col = createConstantI32(rewriter, loc, shimTile.getCol());
+    Value row = createConstantI32(rewriter, loc, shimTile.getRow());
+    Value dir = createConstantI32(
+        rewriter, loc, static_cast<uint32_t>(shimDmaAllocOp.getChannelDir()));
+    Value channel =
+        createConstantI32(rewriter, loc, shimDmaAllocOp.getChannelIndex());
+    Value one = createConstantI32(rewriter, loc, 1);
+    (void)rewriter.replaceOpWithNewOp<NpuSyncOp>(op, col, row, dir, channel,
+                                                 one, one);
 
     return success();
   }
