@@ -308,6 +308,17 @@ struct AllocUnit {
 };
 } // namespace
 
+// Round a byte address up to the given alignment, expressed in bits.
+//
+// Upstream dropped this with the manual placement loop that
+// assignSequentialBufferAddresses replaced; the alloc_group overlay still lays
+// members out within a unit itself, so it needs its own aligner.
+static int64_t getAlignedAddress(int64_t address, uint32_t alignBitWidth) {
+  assert(alignBitWidth != 0 && alignBitWidth % 8 == 0 &&
+         "alignBitWidth must be a non-zero multiple of 8");
+  return llvm::alignTo(address, alignBitWidth / 8);
+}
+
 // Simulate laying `group` out sequentially from a base of 0, applying each
 // member's own alignment exactly as the real placement loop in
 // basicAllocation does, and return the resulting extent (including any
@@ -570,7 +581,6 @@ static bool basicAllocation(TileOp tile) {
         buffer.setAddress(offset);
         offset += buffer.getAllocationSize();
       }
-      unitEnd = std::max(unitEnd, offset);
     }
   }
 
