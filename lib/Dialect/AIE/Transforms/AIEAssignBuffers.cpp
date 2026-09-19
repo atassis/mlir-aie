@@ -520,7 +520,8 @@ static bool basicAllocation(TileOp tile) {
   for (auto buffer : allBuffers_on_tile)
     if (!buffer.getAddress())
       unpinnedBuffers.push_back(buffer);
-  SmallVector<AllocUnit> units = buildAllocUnits(unpinnedBuffers, tileAlignBitWidth, maxVecAlignBits);
+  SmallVector<AllocUnit> units =
+      buildAllocUnits(unpinnedBuffers, tileAlignBitWidth, maxVecAlignBits);
 
   SmallVector<BufferAllocation> layout;
   for (auto buffer : allocated_buffers) {
