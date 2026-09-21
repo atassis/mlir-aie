@@ -103,6 +103,187 @@ bool applyJobsEnvironment() {
 }
 
 //===----------------------------------------------------------------------===//
+// Runtime-sequence partitions (--partition-runtime-sequences)
+//===----------------------------------------------------------------------===//
+
+// Module attributes of a partition: every unit's sequence key in walk order,
+// and the index of the unit this partition keeps.
+constexpr llvm::StringLiteral kPartitionUnitsAttr = "aiecc.partition_units";
+constexpr llvm::StringLiteral kPartitionAttr = "aiecc.partition";
+constexpr llvm::StringLiteral kSequenceIndexAttr = "aiecc.sequence_index";
+
+std::string runtimeSequenceKey(xilinx::AIE::RuntimeSequenceOp seq) {
+  return npuSeqKey(
+      seq->getParentOfType<xilinx::AIE::DeviceOp>().getSymName(),
+      seq.getSymName());
+}
+
+// A unit is a runtime sequence that configures other devices and that no
+// aiex.run names: a top-level program that materialization inlines into.
+llvm::SmallVector<std::string> partitionUnits(mlir::ModuleOp module) {
+  llvm::StringSet<> callees;
+  module.walk([&](xilinx::AIEX::RunOp run) {
+    auto configure = run->getParentOfType<xilinx::AIEX::ConfigureOp>();
+    callees.insert(
+        npuSeqKey(configure.getSymbol(), run.getRuntimeSequenceSymbol()));
+  });
+  llvm::SmallVector<std::string> units;
+  module.walk([&](xilinx::AIE::RuntimeSequenceOp seq) {
+    std::string key = runtimeSequenceKey(seq);
+    bool configures = seq.walk([](xilinx::AIEX::ConfigureOp) {
+                           return mlir::WalkResult::interrupt();
+                         }).wasInterrupted();
+    if (configures && !callees.contains(key))
+      units.push_back(key);
+  });
+  return units;
+}
+
+// One clone of the design per unit, keeping every runtime sequence except the
+// other units. With fewer than two units the design is one partition.
+mlir::FailureOr<
+    std::vector<std::pair<std::string, mlir::OwningOpRef<mlir::ModuleOp>>>>
+partitionByRuntimeSequence(
+    const Item<mlir::OwningOpRef<mlir::ModuleOp>> &item) {
+  mlir::ModuleOp src = item.get().get();
+  llvm::SmallVector<std::string> units = partitionUnits(src);
+  if (units.size() < 2)
+    units.assign(1, "");
+  mlir::Builder b(src.getContext());
+  int32_t seqIndex = 0;
+  src.walk([&](xilinx::AIE::RuntimeSequenceOp seq) {
+    seq->setAttr(kSequenceIndexAttr, b.getI32IntegerAttr(seqIndex++));
+  });
+  llvm::SmallVector<mlir::Attribute> unitAttrs;
+  for (const std::string &u : units)
+    unitAttrs.push_back(b.getStringAttr(u));
+  std::vector<std::pair<std::string, mlir::OwningOpRef<mlir::ModuleOp>>> out;
+  for (size_t k = 0; k < units.size(); ++k) {
+    mlir::OwningOpRef<mlir::ModuleOp> clone(src.clone());
+    llvm::SmallVector<xilinx::AIE::RuntimeSequenceOp> others;
+    clone->walk([&](xilinx::AIE::RuntimeSequenceOp seq) {
+      std::string key = runtimeSequenceKey(seq);
+      if (key != units[k] && llvm::is_contained(units, key))
+        others.push_back(seq);
+    });
+    for (xilinx::AIE::RuntimeSequenceOp seq : others)
+      seq.erase();
+    (*clone)->setAttr(kPartitionUnitsAttr, b.getArrayAttr(unitAttrs));
+    (*clone)->setAttr(kPartitionAttr, b.getI32IntegerAttr(k));
+    out.emplace_back(units[k].empty() ? "design" : units[k], std::move(clone));
+  }
+  return out;
+}
+
+int64_t partitionIndex(mlir::ModuleOp module) {
+  auto idx = module->getAttrOfType<mlir::IntegerAttr>(kPartitionAttr);
+  return idx ? idx.getInt() : 0;
+}
+
+// Partition 0 owns every sequence that is not a unit; the others drop them
+// once lowered, so each sequence reaches the per-sequence edges once.
+void dropUnownedSequences(mlir::ModuleOp module) {
+  auto units = module->getAttrOfType<mlir::ArrayAttr>(kPartitionUnitsAttr);
+  if (!units || partitionIndex(module) == 0)
+    return;
+  llvm::StringRef own =
+      mlir::cast<mlir::StringAttr>(units[partitionIndex(module)]).getValue();
+  llvm::SmallVector<xilinx::AIE::RuntimeSequenceOp> drop;
+  module.walk([&](xilinx::AIE::RuntimeSequenceOp seq) {
+    if (runtimeSequenceKey(seq) != own)
+      drop.push_back(seq);
+  });
+  for (xilinx::AIE::RuntimeSequenceOp seq : drop)
+    seq.erase();
+}
+
+// The design as the per-device edges see it: partition 0, with every other
+// unit in its original place as a stub carrying the unit's arguments and the
+// load_pdi ops its expansion left behind -- all the full-ELF config reads.
+mlir::LogicalResult
+mergePartitions(const Node<mlir::OwningOpRef<mlir::ModuleOp>> &parts,
+                Item<mlir::OwningOpRef<mlir::ModuleOp>> &out) {
+  auto first = llvm::find_if(parts.items, [](const auto &item) {
+    return partitionIndex(item.get().get()) == 0;
+  });
+  if (first == parts.items.end())
+    return mlir::failure();
+  mlir::OwningOpRef<mlir::ModuleOp> merged(first->get().get().clone());
+  auto seqIndex = [](xilinx::AIE::RuntimeSequenceOp seq) {
+    auto idx = seq->getAttrOfType<mlir::IntegerAttr>(kSequenceIndexAttr);
+    return idx ? idx.getInt() : 0;
+  };
+  for (const auto &item : parts.items) {
+    if (&item == &*first)
+      continue;
+    item.get().get().walk([&](xilinx::AIE::RuntimeSequenceOp seq) {
+      llvm::StringRef devName =
+          seq->getParentOfType<xilinx::AIE::DeviceOp>().getSymName();
+      for (auto dev : merged->getOps<xilinx::AIE::DeviceOp>()) {
+        if (dev.getSymName() != devName)
+          continue;
+        mlir::Operation *before = dev.getBody()->getTerminator();
+        for (auto other : dev.getOps<xilinx::AIE::RuntimeSequenceOp>())
+          if (seqIndex(other) > seqIndex(seq)) {
+            before = other;
+            break;
+          }
+        mlir::OpBuilder b(before);
+        mlir::Operation *stub = b.cloneWithoutRegions(*seq.getOperation());
+        mlir::Block *body = new mlir::Block();
+        stub->getRegion(0).push_back(body);
+        for (mlir::BlockArgument arg : seq.getBody().front().getArguments())
+          body->addArgument(arg.getType(), arg.getLoc());
+        b.setInsertionPointToEnd(body);
+        seq.walk([&](xilinx::AIEX::NpuLoadPdiOp lp) { b.clone(*lp); });
+        break;
+      }
+    });
+  }
+  out.value = std::move(merged);
+  return mlir::success();
+}
+
+// aie-expand-load-pdi picks the empty device for a load_pdi by the parity of
+// its module-wide index, and creates the two empty devices in first-use
+// order. A partition renumbers from 0, so it reproduces the whole-design
+// result only when no non-unit sequence loads a PDI, every unit but the last
+// loads an even number, and each unit's first two load_pdis are expanded.
+mlir::LogicalResult checkPartitionLoadPdiParity(mlir::ModuleOp module) {
+  auto units = module->getAttrOfType<mlir::ArrayAttr>(kPartitionUnitsAttr);
+  if (!units || units.size() < 2)
+    return mlir::success();
+  std::string lastUnit =
+      mlir::cast<mlir::StringAttr>(units[units.size() - 1]).getValue().str();
+  std::string bad;
+  module.walk([&](xilinx::AIE::RuntimeSequenceOp seq) {
+    std::string key = runtimeSequenceKey(seq);
+    bool isUnit = llvm::any_of(units, [&](mlir::Attribute u) {
+      return mlir::cast<mlir::StringAttr>(u).getValue() == key;
+    });
+    llvm::SmallVector<xilinx::AIEX::NpuLoadPdiOp> loads;
+    seq.walk([&](xilinx::AIEX::NpuLoadPdiOp lp) { loads.push_back(lp); });
+    bool ok = isUnit ? (key == lastUnit || loads.size() % 2 == 0)
+                     : loads.empty();
+    for (size_t i = 0; isUnit && i < std::min<size_t>(2, loads.size()); ++i)
+      ok &= loads[i].getDeviceRefAttr() &&
+            loads[i].getExpandMode().value_or(
+                xilinx::AIEX::ExpandMode::write32) ==
+                xilinx::AIEX::ExpandMode::write32;
+    if (!ok && bad.empty())
+      bad = key;
+  });
+  if (bad.empty())
+    return mlir::success();
+  llvm::errs() << "aiecc: --partition-runtime-sequences: the load_pdi ops of "
+                  "runtime sequence '"
+               << bad
+               << "' would be expanded differently in a partition than in the "
+                  "whole design; build without the flag\n";
+  return mlir::failure();
+}
+
+//===----------------------------------------------------------------------===//
 // Shared subgraphs
 //===----------------------------------------------------------------------===//
 
@@ -1191,15 +1372,75 @@ buildMainGraph(mlir::MLIRContext &context, Graph &g,
   EdgeWithTypedOutput<ModRef> &npuSequence =
       ctrlPkt ? npuDmaLowered : npuExpanded;
 
-  auto &npuLowered = npuSequence.map<ModRef>(
-      "npu_lowered.mlir",
-      [](const Item<ModRef> &item, Item<ModRef> &out) -> mlir::LogicalResult {
-        ModRef clone = item.get().get().clone();
-        assignDevicePdiIds(*clone);
-        assignLoadPdiIds(*clone);
-        out.value = std::move(clone);
-        return mlir::success();
-      });
+  auto assignPdiIds = [](const Item<ModRef> &item,
+                         Item<ModRef> &out) -> mlir::LogicalResult {
+    ModRef clone = item.get().get().clone();
+    assignDevicePdiIds(*clone);
+    assignLoadPdiIds(*clone);
+    out.value = std::move(clone);
+    return mlir::success();
+  };
+  auto &npuLowered = npuSequence.map<ModRef>("npu_lowered.mlir", assignPdiIds);
+
+  // --partition-runtime-sequences: the same lowering, once per partition (see
+  // partitionByRuntimeSequence). The DMA lowering, which dominates large
+  // designs, runs partitions in parallel; the expansion drives aie-rt, which
+  // is not reentrant, so it stays exclusive.
+  auto &npuParts = npuLoweringInput.split<ModRef>("npu_partition_{0}.mlir",
+                                                  partitionByRuntimeSequence);
+  auto &npuPartsDma =
+      npuParts
+          .map<ModRef>("npu_materialized_{0}.mlir",
+                       PassPipeline{&context,
+                                    [](mlir::MLIRContext *ctx, mlir::ModuleOp) {
+                                      return getMaterializeRuntimeSeqPipeline(
+                                          ctx);
+                                    }})
+          .threadSafe()
+          .map<ModRef>("npu_dma_lowered_{0}.mlir",
+                       PassPipeline{&context,
+                                    [](mlir::MLIRContext *ctx, mlir::ModuleOp) {
+                                      return getNpuDmaLoweringPipeline(ctx);
+                                    }})
+          .threadSafe();
+  EdgeWithTypedOutput<ModRef> &npuPartsExpanded =
+      expandLoadPdis.getValue()
+          ? static_cast<EdgeWithTypedOutput<ModRef> &>(npuPartsDma.map<ModRef>(
+                "npu_expanded_{0}.mlir",
+                PassPipeline{&context,
+                             [registerResetOn](mlir::MLIRContext *ctx,
+                                               mlir::ModuleOp mod)
+                                 -> std::unique_ptr<mlir::PassManager> {
+                               if (mlir::failed(
+                                       checkPartitionLoadPdiParity(mod))) {
+                                 return nullptr;
+                               }
+                               return getExpandLoadPdiPipeline(
+                                   ctx, /*ctrlPkt=*/false, registerResetOn);
+                             }}))
+          : npuPartsDma;
+  auto &npuPartsLowered =
+      npuPartsExpanded
+          .map<ModRef>("npu_lowered_{0}.mlir",
+                       [assignPdiIds](const Item<ModRef> &item,
+                                      Item<ModRef> &out) -> mlir::LogicalResult {
+                         if (mlir::failed(assignPdiIds(item, out)))
+                           return mlir::failure();
+                         dropUnownedSequences(out.value->get());
+                         return mlir::success();
+                       })
+          .threadSafe();
+  auto &npuPartsMerged =
+      npuPartsLowered.join<ModRef>("npu_lowered_merged.mlir", mergePartitions);
+
+  bool partitioned = partitionRuntimeSequences.getValue() && !ctrlPkt &&
+                     !noMaterialize.getValue();
+  EdgeWithTypedOutput<ModRef> &npuLoweredDesign =
+      partitioned ? static_cast<EdgeWithTypedOutput<ModRef> &>(npuPartsMerged)
+                  : static_cast<EdgeWithTypedOutput<ModRef> &>(npuLowered);
+  EdgeWithTypedOutput<ModRef> &npuLoweredSequences =
+      partitioned ? static_cast<EdgeWithTypedOutput<ModRef> &>(npuPartsLowered)
+                  : static_cast<EdgeWithTypedOutput<ModRef> &>(npuLowered);
 
   // Root of the static configuration branch; contains compiled cores, etc., to
   // produce xclbins, or feed into the full ELF. Usually, this is completely
@@ -1214,7 +1455,7 @@ buildMainGraph(mlir::MLIRContext &context, Graph &g,
   //     rather than un-materialized `aiex.configure`/`aiex.run` ops.
   EdgeWithTypedOutput<ModRef> &staticInput =
       (expandLoadPdis.getValue() || loadPdiToCtrlPkt.getValue())
-          ? static_cast<EdgeWithTypedOutput<ModRef> &>(npuLowered)
+          ? npuLoweredDesign
           : static_cast<EdgeWithTypedOutput<ModRef> &>(physicalWithElfs);
   auto &staticPerDevice =
       splitPerDevice(staticInput, "perDevice_{0}.mlir", "perDeviceMatching");
@@ -1519,7 +1760,7 @@ buildMainGraph(mlir::MLIRContext &context, Graph &g,
   // NPU instruction-sequence branch
   //--------------------------------------------------------------------------//
   auto &npuLoweredPerDevice =
-      splitPerDevice(npuLowered, "perDeviceNPULowered_{0}.mlir",
+      splitPerDevice(npuLoweredDesign, "perDeviceNPULowered_{0}.mlir",
                      "perDeviceNPULoweredMatching");
 
   // Per-device transaction configuration MLIR. `convert-aie-to-transaction`
@@ -1545,7 +1786,7 @@ buildMainGraph(mlir::MLIRContext &context, Graph &g,
 
   // One item per runtime sequence, keyed "<device>_<sequence>"
   auto &perSeq =
-      npuLowered
+      npuLoweredSequences
           .split<OpInModule<RuntimeSequenceOp>>(
               "npu_seq_{0}.mlir",
               SplitIRAction<RuntimeSequenceOp>([](RuntimeSequenceOp s) {

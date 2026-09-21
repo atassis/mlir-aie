@@ -186,6 +186,12 @@ inline cl::opt<bool> noMaterialize(
     "no-materialize",
     cl::desc("Skip aie-materialize-runtime-sequences pass in NPU lowering"));
 
+inline cl::opt<bool> partitionRuntimeSequences(
+    "partition-runtime-sequences",
+    cl::desc("Lower each top-level runtime sequence that calls others in its "
+             "own clone of the design, in parallel (full-ELF / NPU "
+             "instruction flows only)"));
+
 // Parallelism. Independent edges (e.g. the per-core compile/link subprocesses)
 // are dispatched concurrently to a pool of this size. 1 runs fully
 // sequentially; 0 auto-detects the hardware concurrency.
