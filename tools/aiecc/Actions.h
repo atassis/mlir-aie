@@ -85,12 +85,9 @@ inline mlir::OwningOpRef<mlir::ModuleOp> asModule(const Item<File> &in,
   return parseModuleFromFile(in.asFile(), ctx);
 }
 
-// Run `pm` on `op` so that pipelines on the shared context may overlap.
-// PassManager::run appends the pipeline's dependent dialects to the context,
-// which MLIRContext::appendDialectRegistry forbids while any other run is in
-// flight; a run whose dependencies are already registered appends nothing.
-// So runs hold this lock shared, and the rare run that grows the registry
-// first does so under it exclusively.
+// Runs `pm` so that pipelines on the shared context may overlap: a run that
+// would grow the context's dialect registry (forbidden while another run is
+// in flight) grows it first, under this lock held exclusively.
 inline std::shared_mutex &contextRegistryMutex() {
   static std::shared_mutex m;
   return m;
