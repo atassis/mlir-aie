@@ -469,11 +469,11 @@ struct EdgeBase {
   std::string outputDir; // engine sets this before execute()
   bool producesFiles = true;
 
-  // True if execute() is free of shared, mutable state — in particular it does
-  // not touch the shared MLIRContext (e.g. external-tool/subprocess edges).
-  // The parallel scheduler may run such edges concurrently with any other
-  // edge; edges left false are serialized against each other. Set fluently via
-  // EdgeWithTypedOutput::threadSafe().
+  // True if execute() may run concurrently with any other edge: it only reads
+  // IR that other items share, mutates only IR it created, and runs pass
+  // pipelines through runPipeline(). The shared MLIRContext is multithreaded,
+  // so creating IR in it is safe. Edges left false are serialized against each
+  // other. Set fluently via EdgeWithTypedOutput::threadSafe().
   bool isThreadSafe = false;
 
   EdgeBase(Graph &g, std::string n) : graph(g), name(std::move(n)) {}

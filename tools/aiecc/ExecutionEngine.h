@@ -253,11 +253,11 @@ struct Engine {
   // barrier.
   //
   // A task is "exclusive" when its edge is not marked threadSafe: such edges
-  // may touch shared, non-thread-safe state (today, the shared MLIRContext), so
-  // at most one exclusive task runs at a time -- `exclusiveBusy` is that
-  // mutual-exclusion slot. threadSafe tasks (context-free external-tool
-  // invocations) run in parallel across the whole pool and alongside the one
-  // in-flight exclusive task.
+  // may touch shared, non-thread-safe state (IR other edges read, or a
+  // non-reentrant library such as aie-rt), so at most one exclusive task runs
+  // at a time -- `exclusiveBusy` is that mutual-exclusion slot. threadSafe
+  // tasks (see EdgeBase::isThreadSafe) run in parallel across the whole pool
+  // and alongside the one in-flight exclusive task.
   struct Scheduler {
     // Per-edge scheduling state.
     struct EdgeState {

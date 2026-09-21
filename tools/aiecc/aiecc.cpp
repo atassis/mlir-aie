@@ -128,7 +128,8 @@ buildObjectSubgraph(EdgeWithTypedOutput<ModRef> &lowered,
   std::string aietoolsRoot = discoverAietoolsDir(aietoolsDir.getValue());
 
   // Shared between chess and peano: LLLVMIR lowering
-  auto &llvmIR = lowered.map<std::string>("llvmIR_{0}.ll", translateToLLVMIR);
+  auto &llvmIR =
+      lowered.map<std::string>("llvmIR_{0}.ll", translateToLLVMIR).threadSafe();
 
   // Chess path: downgrade -> chess-llvm-link (intrinsic wrapper) ->
   // `xchesscc_wrapper -c`.
@@ -215,7 +216,7 @@ buildObjectSubgraph(EdgeWithTypedOutput<ModRef> &lowered,
   auto &peanoCompat =
       llvmIR.map<std::string>("peano-compat_{0}.ll", [](llvm::StringRef ir) {
         return downgradeIRForPeano(ir);
-      });
+      }).threadSafe();
   // Merge the core's merge-mode link artifacts (`link_merge_files`) into the
   // downgraded core IR before opt; with the kernel marked alwaysinline that
   // inlines its body into the core, leaving no func.call and no separate kernel
@@ -806,7 +807,7 @@ buildMainGraph(mlir::MLIRContext &context, Graph &g,
         return detectAIETarget(
             core.module.get(),
             core.op->getParentOfType<DeviceOp>().getSymName());
-      });
+      }).threadSafe();
 
   // Per-core .o node. Two strategies selectable, differing only in how many
   // times the lowering pipeline runs:
@@ -845,7 +846,7 @@ buildMainGraph(mlir::MLIRContext &context, Graph &g,
         return loweringPipeline(item.get().module.get(),
                                 core->getParentOfType<DeviceOp>().getSymName(),
                                 tile.getCol(), tile.getRow(), out);
-      });
+      }).threadSafe();
   // Merge-mode link artifacts for this core, llvm-linked into its own module.
   auto &perCoreIRLinkFiles = perCore.map<std::vector<std::string>>(
       "perCoreIRLinkFiles_{0}.txt",
@@ -930,7 +931,8 @@ buildMainGraph(mlir::MLIRContext &context, Graph &g,
             return xilinx::AIE::AIETranslateToLdScript(
                 rewritten.get(), os, tile.getCol(), tile.getRow(),
                 op->getParentOfType<DeviceOp>().getSymName());
-          });
+          })
+          .threadSafe();
 
   // Link each core's object into its .elf; user can chose between
   // chess/xbridge or peano
@@ -1301,7 +1303,7 @@ buildMainGraph(mlir::MLIRContext &context, Graph &g,
         ModRef clone = item.get().module.get().clone();
         auto pm =
             getControlPacketPipeline(&context, /*elfDir=*/"", d.getSymName());
-        if (!pm || mlir::failed(pm->run(*clone))) {
+        if (!pm || mlir::failed(runPipeline(*pm, *clone))) {
           return mlir::failure();
         }
         out.value = std::move(clone);
@@ -1322,7 +1324,8 @@ buildMainGraph(mlir::MLIRContext &context, Graph &g,
                                     std::vector<uint32_t> &words)
                              -> mlir::LogicalResult {
         ModRef clone = item.get().get().clone();
-        if (mlir::failed(getControlPacketDmaPipeline(&context)->run(*clone))) {
+        if (mlir::failed(runPipeline(*getControlPacketDmaPipeline(&context),
+                                     *clone))) {
           return mlir::failure();
         }
         // DDR-patch ABI: XRT (and CPU) consume the folded firmware ABI; HRX
@@ -1533,7 +1536,7 @@ buildMainGraph(mlir::MLIRContext &context, Graph &g,
         ModRef clone = item.get().module.get().clone();
         auto pm =
             getTransactionPipeline(&context, /*elfDir=*/"", d.getSymName());
-        if (!pm || mlir::failed(pm->run(*clone))) {
+        if (!pm || mlir::failed(runPipeline(*pm, *clone))) {
           return mlir::failure();
         }
         out.value = std::move(clone);
@@ -2095,6 +2098,11 @@ int main(int argc, char **argv) {
   registerLLVMIRTranslations(registry);
   mlir::MLIRContext context(registry);
   context.loadAllAvailableDialects();
+  // The "see current operation" note on every warning/error builds a fresh
+  // AsmState, which re-scans all loaded dialects (all of them, per the call
+  // above) regardless of the printed op's size -- O(dialects) per diagnostic,
+  // paid once per warning instance. The op dump isn't part of the message.
+  context.printOpOnDiagnostic(false);
 
   llvm::SourceMgr sourceMgr;
   unsigned inputBufferId = 0;

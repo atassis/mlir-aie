@@ -302,8 +302,10 @@ node and produces a singleton `Node<File>`.
 
 ![fileInput edge](docs/edges/fileinput.svg)
 
-Mark an edge `.threadSafe()` only when its action touches no shared state
-(external-tool invocations); such edges fan their per-key work across `-j`.
+Mark an edge `.threadSafe()` only when its action reads shared IR without
+mutating it and runs any pass pipeline through `runPipeline()` (external-tool
+invocations and the per-core lowering qualify); such edges fan their per-key
+work across `-j`.
 
 ### Putting it together: scatter / gather
 

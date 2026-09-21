@@ -13,6 +13,7 @@
 #ifndef AIECC_IRTRANSFORMS_H
 #define AIECC_IRTRANSFORMS_H
 
+#include "Actions.h"
 #include "Graph.h"
 #include "StackSizeAnalysis.h"
 #include "Utils.h"
@@ -1173,7 +1174,7 @@ loweringPipeline(mlir::ModuleOp src, llvm::StringRef devName, int col, int row,
   mlir::OwningOpRef<mlir::ModuleOp> clone = src.clone();
   auto pm = getCoreLLVMLoweringPipeline(clone->getContext(), devName, col, row,
                                         detectAIETarget(src, devName));
-  if (mlir::failed(pm->run(*clone))) {
+  if (mlir::failed(runPipeline(*pm, *clone))) {
     return mlir::failure();
   }
   out.value = std::move(clone);
@@ -1273,7 +1274,7 @@ splitLoweredCores(const Item<OpInModule<xilinx::AIE::DeviceOp>> &devItem,
 
     mlir::PassManager pm(clone->getContext());
     pm.addPass(mlir::createSymbolDCEPass());
-    if (mlir::failed(pm.run(*clone))) {
+    if (mlir::failed(runPipeline(pm, *clone))) {
       return mlir::failure();
     }
     out.emplace_back(devName + "_" + keep.str(), std::move(clone));
