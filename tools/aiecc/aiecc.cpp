@@ -2098,11 +2098,6 @@ int main(int argc, char **argv) {
   registerLLVMIRTranslations(registry);
   mlir::MLIRContext context(registry);
   context.loadAllAvailableDialects();
-  // The "see current operation" note on every warning/error builds a fresh
-  // AsmState, which re-scans all loaded dialects (all of them, per the call
-  // above) regardless of the printed op's size -- O(dialects) per diagnostic,
-  // paid once per warning instance. The op dump isn't part of the message.
-  context.printOpOnDiagnostic(false);
 
   llvm::SourceMgr sourceMgr;
   unsigned inputBufferId = 0;
