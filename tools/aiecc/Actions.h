@@ -42,6 +42,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -85,6 +86,37 @@ inline mlir::OwningOpRef<mlir::ModuleOp> asModule(const Item<File> &in,
   return parseModuleFromFile(in.asFile(), ctx);
 }
 
+// Run `pm` on `op` so that pipelines on the shared context may overlap.
+// PassManager::run appends the pipeline's dependent dialects to the context,
+// which MLIRContext::appendDialectRegistry forbids while any other run is in
+// flight; a run whose dependencies are already registered appends nothing.
+// So runs hold this lock shared, and the rare run that grows the registry
+// first does so under it exclusively.
+inline std::shared_mutex &contextRegistryMutex() {
+  static std::shared_mutex m;
+  return m;
+}
+
+inline mlir::LogicalResult runPipeline(mlir::PassManager &pm,
+                                       mlir::Operation *op) {
+  mlir::MLIRContext *ctx = pm.getContext();
+  mlir::DialectRegistry deps;
+  pm.getDependentDialects(deps);
+  {
+    std::shared_lock<std::shared_mutex> shared(contextRegistryMutex());
+    if (deps.isSubsetOf(ctx->getDialectRegistry()))
+      return pm.run(op);
+  }
+  {
+    std::unique_lock<std::shared_mutex> exclusive(contextRegistryMutex());
+    ctx->appendDialectRegistry(deps);
+    for (llvm::StringRef name : deps.getRegisteredDialectNames())
+      ctx->getOrLoadDialect(name);
+  }
+  std::shared_lock<std::shared_mutex> shared(contextRegistryMutex());
+  return pm.run(op);
+}
+
 // Run `pm` on `op` and verify what it produced. MLIR verifies the whole op
 // after every pass by default, which on a large design costs more than the
 // passes themselves; verifying the result once still keeps invalid IR from
@@ -96,7 +128,7 @@ inline bool verifyEachPass = false;
 inline mlir::LogicalResult runPasses(mlir::PassManager &pm,
                                      mlir::Operation *op) {
   pm.enableVerifier(verifyEachPass);
-  if (mlir::failed(pm.run(op))) {
+  if (mlir::failed(runPipeline(pm, op))) {
     return mlir::failure();
   }
   if (!verifyEachPass && mlir::failed(mlir::verify(op))) {
