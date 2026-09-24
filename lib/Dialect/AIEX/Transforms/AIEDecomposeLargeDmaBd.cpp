@@ -325,12 +325,6 @@ struct DecomposeLargeDmaBdPattern : OpRewritePattern<NpuDmaMemcpyNdOp> {
       return failure();
 
     NdDmaPattern pattern = patternFromOp(op);
-    // A length_parameter op must reach the "not implemented" diagnostic below
-    // even when isContiguousTransfer misreads its size-1 d2 dimension as
-    // truly contiguous (see BdLowering.h's hasLengthParameter).
-    if (isContiguousTransfer(pattern.sizes, pattern.strides) &&
-        !hasLengthParameter(op))
-      return failure();
 
     // symbolTable.lookup instead of ShimDMAAllocationOp::getForSymbol's
     // per-call linear device scan -- see the pass's own symbolTable comment.
@@ -347,6 +341,24 @@ struct DecomposeLargeDmaBdPattern : OpRewritePattern<NpuDmaMemcpyNdOp> {
     int row = tile.getRow();
     const AIE::AIETargetModel &targetModel = AIE::getTargetModel(op);
     auto bufferType = cast<BaseMemRefType>(op.getMemref().getType());
+
+    // decomposeRecursive treats a size-1 dimension as free capacity and
+    // discards its stride when redistributing -- a silent miscompile for a
+    // length_parameter BD, whose d2 stride is load-bearing even at d2 size 1
+    // (see BdLowering.h's hasLengthParameter). Never let one reach it: pass
+    // through untouched if it already fits, otherwise fail loudly instead of
+    // going near decomposition.
+    if (hasLengthParameter(op)) {
+      if (patternPassesVerification(op, bufferType, targetModel, col, row,
+                                    pattern))
+        return failure();
+      return op.emitOpError()
+             << "splitting a length_parameter buffer descriptor into "
+                "multiple descriptors is not implemented";
+    }
+
+    if (isContiguousTransfer(pattern.sizes, pattern.strides))
+      return failure();
 
     if (patternPassesVerification(op, bufferType, targetModel, col, row,
                                   pattern))
@@ -367,11 +379,8 @@ struct DecomposeLargeDmaBdPattern : OpRewritePattern<NpuDmaMemcpyNdOp> {
     if (bds.size() > targetModel.getNumBDs(col, row))
       return failure();
 
-    // See emitUpdateBdLengthFromParameter: splitting would patch one slice only.
-    if (bds.size() > 1 && op.getLengthParameterAttr())
-      return op.emitOpError()
-             << "splitting a length_parameter buffer descriptor into "
-                "multiple descriptors is not implemented";
+    // A length_parameter op never reaches here -- handled above, before this
+    // pattern goes near decomposition.
 
     if (bds.size() == 1) {
       rewriter.replaceOpWithNewOp<NpuDmaMemcpyNdOp>(
@@ -443,15 +452,25 @@ struct DecomposeLargeDmaBdTaskPattern : OpRewritePattern<AIE::DMABDOp> {
       return failure();
 
     NdDmaPattern pattern = patternFromDmaBd(op);
-    // See the NpuDmaMemcpyNdOp pattern above.
-    if (isContiguousTransfer(pattern.sizes, pattern.strides) &&
-        !hasLengthParameter(op))
-      return failure();
 
     int col = tile.getCol();
     int row = tile.getRow();
     const AIE::AIETargetModel &targetModel = AIE::getTargetModel(op);
     auto bufferType = cast<BaseMemRefType>(op.getBuffer().getType());
+
+    // See the NpuDmaMemcpyNdOp pattern above: never let a length_parameter BD
+    // reach decomposeRecursive.
+    if (hasLengthParameter(op)) {
+      if (patternPassesVerification(op, bufferType, targetModel, col, row,
+                                    pattern))
+        return failure();
+      return op.emitOpError()
+             << "splitting a length_parameter buffer descriptor into "
+                "multiple descriptors is not implemented";
+    }
+
+    if (isContiguousTransfer(pattern.sizes, pattern.strides))
+      return failure();
 
     if (patternPassesVerification(op, bufferType, targetModel, col, row,
                                   pattern))
@@ -504,11 +523,8 @@ struct DecomposeLargeDmaBdTaskPattern : OpRewritePattern<AIE::DMABDOp> {
       return op.emitOpError() << "splitting an out-of-order buffer descriptor "
                                  "into multiple descriptors is not implemented";
 
-    // See emitUpdateBdLengthFromParameter: splitting would patch one slice only.
-    if (op.getLengthParameterAttr())
-      return op.emitOpError()
-             << "splitting a length_parameter buffer descriptor into "
-                "multiple descriptors is not implemented";
+    // A length_parameter op never reaches here -- handled above, before this
+    // pattern goes near decomposition.
 
     Region *body = getTaskBody(taskOp);
     if (!body || body->empty())
