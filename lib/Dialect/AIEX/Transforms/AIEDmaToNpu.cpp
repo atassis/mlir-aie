@@ -623,7 +623,8 @@ public:
             rewriter, loc, targetModel, fields, op.getMixedSizes(),
             op.getMixedStrides(), op.getElementTypeBitwidth(),
             op.getBurstLength(), op.getAxcacheOrDefault(),
-            /*bufLenOverride=*/Value(), repeatCount, words)))
+            /*bufLenOverride=*/Value(), repeatCount, words,
+            (bool)op.getLengthStateTableIdxAttr())))
       return failure();
     Value bdBase =
         getBdRegisterBase(rewriter, loc, targetModel, tileCol, tileRow,

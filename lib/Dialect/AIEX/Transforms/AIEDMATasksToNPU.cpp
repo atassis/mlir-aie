@@ -643,7 +643,8 @@ struct AIEDMATasksToNPUPass
     if (failed(buildShimBdWords(builder, loc, target_model, f, sizes4, strides4,
                                 elemWidth, bd_op.getBurstLength(),
                                 bd_op.getAxcacheOrDefault(), bufLen,
-                                bdRepeatCount, bdWords)))
+                                bdRepeatCount, bdWords,
+                                (bool)bd_op.getLengthStateTableIdxAttr())))
       return failure();
 
     // One blockwrite carries the whole register block for BD configuration.

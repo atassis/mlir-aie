@@ -14,6 +14,7 @@
 #include "aie/Dialect/AIE/IR/AIEDialect.h"
 #include "aie/Dialect/AIEX/IR/AIEXDialect.h"
 #include "aie/Dialect/AIEX/Transforms/AIEXPasses.h"
+#include "aie/Dialect/AIEX/Utils/BdLowering.h"
 #include "aie/Dialect/AIEX/Utils/DmaDecomposition.h"
 
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -324,7 +325,11 @@ struct DecomposeLargeDmaBdPattern : OpRewritePattern<NpuDmaMemcpyNdOp> {
       return failure();
 
     NdDmaPattern pattern = patternFromOp(op);
-    if (isContiguousTransfer(pattern.sizes, pattern.strides))
+    // A length_parameter op must reach the "not implemented" diagnostic below
+    // even when isContiguousTransfer misreads its size-1 d2 dimension as
+    // truly contiguous (see BdLowering.h's hasLengthParameter).
+    if (isContiguousTransfer(pattern.sizes, pattern.strides) &&
+        !hasLengthParameter(op))
       return failure();
 
     // symbolTable.lookup instead of ShimDMAAllocationOp::getForSymbol's
@@ -438,7 +443,9 @@ struct DecomposeLargeDmaBdTaskPattern : OpRewritePattern<AIE::DMABDOp> {
       return failure();
 
     NdDmaPattern pattern = patternFromDmaBd(op);
-    if (isContiguousTransfer(pattern.sizes, pattern.strides))
+    // See the NpuDmaMemcpyNdOp pattern above.
+    if (isContiguousTransfer(pattern.sizes, pattern.strides) &&
+        !hasLengthParameter(op))
       return failure();
 
     int col = tile.getCol();
