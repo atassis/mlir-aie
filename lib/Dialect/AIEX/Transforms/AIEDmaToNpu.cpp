@@ -348,9 +348,12 @@ public:
     // mode (d0_size=d1_size=0) just like an already-canonical linear transfer.
     // This allows naturally-expressed multidimensional transfers (e.g., a 2D
     // image as [height, width]) without hitting the 10-bit ND wrap-size limit.
-    bool isLinear = op.isLinearTransferWithoutTransformation() ||
-                    (targetModel.isShimNOCTile(tileCol, tileRow) &&
-                     isContiguousTransfer(inputSizes, inputStrides));
+    // See AIENormalizeDmaBdDimsPass: never treat a length_parameter transfer
+    // as linear.
+    bool isLinear = !op.getLengthStateTableIdxAttr() &&
+                    (op.isLinearTransferWithoutTransformation() ||
+                     (targetModel.isShimNOCTile(tileCol, tileRow) &&
+                      isContiguousTransfer(inputSizes, inputStrides)));
     if (failed(verifyStridesWraps(op, bufferType, tileCol, tileRow, inputSizes,
                                   inputStrides, sizes, strides, isLinear))) {
       return failure();

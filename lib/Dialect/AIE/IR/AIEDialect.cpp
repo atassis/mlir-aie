@@ -3788,6 +3788,10 @@ struct LinearizeContiguousBDTransfer : public mlir::OpRewritePattern<DMABDOp> {
     if (!bufferIsExternal && !parentIsShim && !inShimDMA)
       return mlir::failure();
 
+    // See AIENormalizeDmaBdDimsPass: never fold a length_parameter BD linear.
+    if (op.getLengthParameterAttr() || op.getLengthStateTableIdxAttr())
+      return mlir::failure();
+
     // Only ND dimensions that are present and all-constant can be linearized;
     // decline silently on runtime-valued sizes/strides so valid dynamic IR
     // doesn't get a spurious diagnostic.

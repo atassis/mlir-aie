@@ -794,11 +794,13 @@ struct AIEDMATasksToNPUPass
       // A contiguous row-major ND access on a shim NOC tile is also lowered
       // using the wide buffer_length register, exempt from the 10-bit ND
       // wrap-size limit.  Canonicalization zeroes size-1 strides before this
-      // pass runs, so isContiguousTransfer is sufficient.
+      // pass runs, so isContiguousTransfer is sufficient -- except for a
+      // length_parameter BD (see AIENormalizeDmaBdDimsPass).
       bool treatAsLinear =
-          isLinearTransfer(input_sizes, input_strides) ||
-          (target_model.isShimNOCTile(tile.getCol(), tile.getRow()) &&
-           isContiguousTransfer(input_sizes, input_strides));
+          !bd_op.getLengthStateTableIdxAttr() &&
+          (isLinearTransfer(input_sizes, input_strides) ||
+           (target_model.isShimNOCTile(tile.getCol(), tile.getRow()) &&
+            isContiguousTransfer(input_sizes, input_strides)));
 
       if (padDims.has_value()) {
         if (!target_model.isMemTile(tile.getCol(), tile.getRow()))
