@@ -145,11 +145,8 @@ verifyConstBdRealizability(mlir::Operation *op,
 // supplies cst/mul/div/sub and selectGT1/selectGT0/selectLt. Inputs/outputs are
 // 4-element arrays in innermost-first order [d0, d1, d2, d3/iter].
 //
-// `preserveD2Stride`: a length_parameter BD's d2 stride is load-bearing even
-// at d2 size 1 (the runtime extends the d2 wrap count past 1 via
-// buffer_length; see AIENormalizeDmaBdDimsPass), so it must reach hardware
-// even though d2 size <= 1 would otherwise mean the dimension is never
-// stepped. d1 is unaffected (out of scope: no known d1 case).
+// `preserveD2Stride`: see hasLengthParameter. d1 is unaffected (out of
+// scope: no known d1 case).
 template <typename Policy>
 void encodeHardwareStridesWraps(Policy &p, uint64_t elemWidth,
                                 uint32_t addressGranularity,
@@ -294,7 +291,7 @@ struct BdTemplateFields {
 // that is the caller's `getBdRegisterBase` + `npu.blockwrite_values` -- so one
 // routine serves both a pinned bd_id and one drawn from the runtime pool.
 //
-// `hasLengthParameter`: see encodeHardwareStridesWraps's preserveD2Stride --
+// `isLengthParameterBd`: see encodeHardwareStridesWraps's preserveD2Stride --
 // forwarded here and also used to keep the BD out of linear mode.
 mlir::LogicalResult
 buildShimBdWords(mlir::OpBuilder &builder, mlir::Location loc,
@@ -305,7 +302,7 @@ buildShimBdWords(mlir::OpBuilder &builder, mlir::Location loc,
                  uint64_t elemWidth, uint32_t burstLength, uint32_t axcache,
                  mlir::Value bufLenOverride, mlir::Value &repeatCountOut,
                  llvm::SmallVectorImpl<mlir::Value> &wordsOut,
-                 bool hasLengthParameter = false);
+                 bool isLengthParameterBd = false);
 
 } // namespace xilinx::AIEX
 
