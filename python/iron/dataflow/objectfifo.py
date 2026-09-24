@@ -891,6 +891,8 @@ class ObjectFifoHandle(Resolvable):
         managed=True,
         objects=None,
         object_offset=0,
+        length_parameter=None,
+        length_granule=None,
     ):
         """Shared body for fill()/drain().
 
@@ -938,6 +940,8 @@ class ObjectFifoHandle(Resolvable):
             rt_data,
             tap=tap,
             wait=wait,
+            length_parameter=length_parameter,
+            length_granule=length_granule,
             packet=packet,
             offset_parameter=offset_parameter,
             group=group,
@@ -963,6 +967,8 @@ class ObjectFifoHandle(Resolvable):
         managed: bool = True,
         objects: int | None = None,
         object_offset: int = 0,
+        length_parameter=None,
+        length_granule=None,
     ):
         """Fill this producer ObjectFifo with data from the ``source`` runtime buffer.
 
@@ -987,6 +993,8 @@ class ObjectFifoHandle(Resolvable):
             managed,
             objects,
             object_offset,
+            length_parameter,
+            length_granule,
         )
 
     def drain(
@@ -1004,6 +1012,8 @@ class ObjectFifoHandle(Resolvable):
         managed: bool = True,
         objects: int | None = None,
         object_offset: int = 0,
+        length_parameter=None,
+        length_granule=None,
     ):
         """Drain this consumer ObjectFifo, writing data to the ``dest`` runtime buffer.
 
@@ -1028,6 +1038,8 @@ class ObjectFifoHandle(Resolvable):
             managed,
             objects,
             object_offset,
+            length_parameter,
+            length_granule,
         )
 
     def all_of_endpoints(self) -> list[ObjectFifoEndpoint]:

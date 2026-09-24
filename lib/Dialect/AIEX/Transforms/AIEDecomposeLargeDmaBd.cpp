@@ -197,6 +197,8 @@ static AIE::DMABDOp createTaskBd(PatternRewriter &rewriter, Location loc,
     bd.setAxcacheAttr(tmpl.getAxcacheAttr());
   if (tmpl.getOffsetParameterAttr())
     bd.setOffsetParameterAttr(tmpl.getOffsetParameterAttr());
+  // length_parameter is never copied here: splitting a length_parameter BD
+  // into several is rejected before this is reached.
   // out_of_order_id is not copied because slicing an OoO BD is rejected above.
   return bd;
 }
@@ -305,7 +307,8 @@ static NpuDmaMemcpyNdOp createDecomposedOp(PatternRewriter &rewriter,
       op.getD1ZeroBeforeAttr(), op.getD2ZeroBeforeAttr(),
       op.getD0ZeroAfterAttr(), op.getD1ZeroAfterAttr(), op.getD2ZeroAfterAttr(),
       op.getBurstLengthAttr(), op.getAxcacheAttr(), op.getOffsetParameterAttr(),
-      op.getOffsetStateTableIdxAttr());
+      op.getOffsetStateTableIdxAttr(), op.getLengthParameterAttr(),
+      op.getLengthStateTableIdxAttr(), op.getLengthGranuleAttr());
 }
 
 static int64_t allocateNextId(NpuDmaMemcpyNdOp op, int64_t startId,
@@ -392,6 +395,12 @@ struct DecomposeLargeDmaBdPattern : OpRewritePattern<NpuDmaMemcpyNdOp> {
     if (bds.size() > targetModel.getNumBDs(col, row))
       return failure();
 
+    // See emitUpdateBdLengthFromParameter: splitting would patch one slice only.
+    if (bds.size() > 1 && op.getLengthParameterAttr())
+      return op.emitOpError()
+             << "splitting a length_parameter buffer descriptor into "
+                "multiple descriptors is not implemented";
+
     if (bds.size() == 1) {
       rewriter.replaceOpWithNewOp<NpuDmaMemcpyNdOp>(
           op, op.getMemref(), ValueRange{}, ValueRange{}, ValueRange{},
@@ -403,7 +412,9 @@ struct DecomposeLargeDmaBdPattern : OpRewritePattern<NpuDmaMemcpyNdOp> {
           op.getD1ZeroBeforeAttr(), op.getD2ZeroBeforeAttr(),
           op.getD0ZeroAfterAttr(), op.getD1ZeroAfterAttr(),
           op.getD2ZeroAfterAttr(), op.getBurstLengthAttr(), op.getAxcacheAttr(),
-          op.getOffsetParameterAttr(), op.getOffsetStateTableIdxAttr());
+          op.getOffsetParameterAttr(), op.getOffsetStateTableIdxAttr(),
+          op.getLengthParameterAttr(), op.getLengthStateTableIdxAttr(),
+          op.getLengthGranuleAttr());
       return success();
     }
 
@@ -546,6 +557,12 @@ struct DecomposeLargeDmaBdTaskPattern : OpRewritePattern<AIE::DMABDOp> {
     if (op.getOutOfOrderId().has_value())
       return op.emitOpError() << "splitting an out-of-order buffer descriptor "
                                  "into multiple descriptors is not implemented";
+
+    // See emitUpdateBdLengthFromParameter: splitting would patch one slice only.
+    if (op.getLengthParameterAttr())
+      return op.emitOpError()
+             << "splitting a length_parameter buffer descriptor into "
+                "multiple descriptors is not implemented";
 
     // Every member of a chain runs once per task execution, so the one
     // queue-push repeat count is shared by all of them. A slice that also wants

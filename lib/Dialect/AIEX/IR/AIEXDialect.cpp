@@ -457,7 +457,9 @@ struct LinearizeContiguousTransfer
         op.getD1ZeroBeforeAttr(), op.getD2ZeroBeforeAttr(),
         op.getD0ZeroAfterAttr(), op.getD1ZeroAfterAttr(),
         op.getD2ZeroAfterAttr(), op.getBurstLengthAttr(), op.getAxcacheAttr(),
-        op.getOffsetParameterAttr(), op.getOffsetStateTableIdxAttr());
+        op.getOffsetParameterAttr(), op.getOffsetStateTableIdxAttr(),
+        op.getLengthParameterAttr(), op.getLengthStateTableIdxAttr(),
+        op.getLengthGranuleAttr());
     return mlir::success();
   }
 };
@@ -600,6 +602,39 @@ LogicalResult AIEX::NpuDmaMemcpyNdOp::verify() {
     uint64_t elemBitWidth = buffer.getElementTypeBitWidth();
     if (elemBitWidth == 0 || (elemBitWidth % 8) != 0)
       return emitOpError("offset_parameter requires a whole-byte element type");
+  }
+
+  if (getLengthParameterAttr() || getLengthStateTableIdxAttr()) {
+    uint64_t elemBitWidth = buffer.getElementTypeBitWidth();
+    if (elemBitWidth == 0 || (elemBitWidth % 8) != 0)
+      return emitOpError("length_parameter requires a whole-byte element type");
+    uint64_t elemBytes = elemBitWidth / 8;
+
+    auto granuleAttr = getLengthGranuleAttr();
+    if (!granuleAttr || granuleAttr.getInt() <= 0)
+      return emitOpError("length_parameter requires length_granule > 0");
+    uint64_t granuleBytes =
+        static_cast<uint64_t>(granuleAttr.getInt()) * elemBytes;
+    if (granuleBytes % 16 != 0)
+      return emitOpError(
+                 "length_granule * element size must be a multiple of 16 "
+                 "bytes (4 words): got ")
+             << granuleBytes << " bytes";
+
+    bool allSizesConstBase = llvm::all_of(getMixedSizes(), [](OpFoldResult s) {
+      return getConstantIntValue(s).has_value();
+    });
+    if (allSizesConstBase) {
+      uint64_t numElems = 1;
+      for (OpFoldResult s : getMixedSizes())
+        numElems *= static_cast<uint64_t>(*getConstantIntValue(s));
+      uint64_t baseBytes = numElems * elemBytes;
+      if ((baseBytes % 16) != 0)
+        return emitOpError(
+                   "length_parameter requires the static transfer length to "
+                   "be a multiple of 16 bytes (4 words): got ")
+               << baseBytes << " bytes";
+    }
   }
 
   if (getElementTypeBitwidth() > addressGranularity) {

@@ -458,6 +458,19 @@ struct AIEDMATasksToNPUPass
         return failure();
     }
 
+    // length_parameter targets the BD's word-0 (buffer_length) register,
+    // shim-NOC-tile only: mem/core tile BDs use a different field width.
+    if (bd_op.getLengthStateTableIdxAttr()) {
+      if (!target_model.isShimNOCTile(col, row))
+        return bd_op->emitOpError(
+            "length_parameter is only supported on shim NOC tile BDs");
+      auto bufType = llvm::cast<BaseMemRefType>(bd_op.getBuffer().getType());
+      uint64_t bdBaseAddr = target_model.getDmaBdAddress(col, row, bd_id);
+      if (failed(emitUpdateBdLengthFromParameter(builder, bd_op, bufType,
+                                                 bdBaseAddr)))
+        return failure();
+    }
+
     return success();
   }
 
