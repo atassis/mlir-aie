@@ -66,6 +66,15 @@ inline int64_t bdGranuleDivisor(uint64_t elemWidth,
   return addressGranularity / std::gcd(elemWidth, (uint64_t)addressGranularity);
 }
 
+// Whether `op` (a DMABDOp or NpuDmaMemcpyNdOp) carries a length_parameter,
+// pre- or post- --aie-lower-scratchpad-parameters. Its d2 stride is
+// load-bearing even at d2 size 1 (see AIENormalizeDmaBdDimsPass); every site
+// that would otherwise fold/skip/drop that stride checks this first.
+inline bool hasLengthParameter(mlir::Operation *op) {
+  return op->hasAttr("length_parameter") ||
+         op->hasAttr("length_state_table_idx");
+}
+
 // Whether a constant element count is realizable: value * elemWidth is a whole
 // number of granules. Equivalent to value % bdGranuleDivisor(...) == 0.
 inline bool isConstMultipleOfGranule(int64_t value, uint64_t elemWidth,
@@ -135,13 +144,20 @@ verifyConstBdRealizability(mlir::Operation *op,
 // (arith ops) for runtime operands -- keeping them bit-identical. The Policy
 // supplies cst/mul/div/sub and selectGT1/selectGT0/selectLt. Inputs/outputs are
 // 4-element arrays in innermost-first order [d0, d1, d2, d3/iter].
+//
+// `preserveD2Stride`: a length_parameter BD's d2 stride is load-bearing even
+// at d2 size 1 (the runtime extends the d2 wrap count past 1 via
+// buffer_length; see AIENormalizeDmaBdDimsPass), so it must reach hardware
+// even though d2 size <= 1 would otherwise mean the dimension is never
+// stepped. d1 is unaffected (out of scope: no known d1 case).
 template <typename Policy>
 void encodeHardwareStridesWraps(Policy &p, uint64_t elemWidth,
                                 uint32_t addressGranularity,
                                 typename Policy::V inputSizes[4],
                                 typename Policy::V inputStrides[4],
                                 typename Policy::V sizes[4],
-                                typename Policy::V strides[4]) {
+                                typename Policy::V strides[4],
+                                bool preserveD2Stride = false) {
   using V = typename Policy::V;
   // Scale an element-count stride into hardware granules and apply the -1 bias:
   //   stride * elemWidth / addressGranularity - 1
@@ -169,8 +185,11 @@ void encodeHardwareStridesWraps(Policy &p, uint64_t elemWidth,
   strides[1] =
       p.selectGT1(inputSizes[1], biasedStride(inputStrides[1]), p.cst(0));
   sizes[2] = inputSizes[2];
-  strides[2] =
-      p.selectGT1(inputSizes[2], biasedStride(inputStrides[2]), p.cst(0));
+  strides[2] = preserveD2Stride
+                   ? p.selectGT0(inputStrides[2], biasedStride(inputStrides[2]),
+                                 p.cst(0))
+                   : p.selectGT1(inputSizes[2], biasedStride(inputStrides[2]),
+                                 p.cst(0));
 
   // iteration_size, iteration_stride. Size is stored biased by -1. The stride
   // must be positive like the others, but a zero-stride "repeat" is encoded by
@@ -274,6 +293,9 @@ struct BdTemplateFields {
 // The words do not depend on the BD id -- only the register ADDRESS does, and
 // that is the caller's `getBdRegisterBase` + `npu.blockwrite_values` -- so one
 // routine serves both a pinned bd_id and one drawn from the runtime pool.
+//
+// `hasLengthParameter`: see encodeHardwareStridesWraps's preserveD2Stride --
+// forwarded here and also used to keep the BD out of linear mode.
 mlir::LogicalResult
 buildShimBdWords(mlir::OpBuilder &builder, mlir::Location loc,
                  const xilinx::AIE::AIETargetModel &targetModel,
@@ -282,7 +304,8 @@ buildShimBdWords(mlir::OpBuilder &builder, mlir::Location loc,
                  llvm::ArrayRef<mlir::OpFoldResult> mixedStrides,
                  uint64_t elemWidth, uint32_t burstLength, uint32_t axcache,
                  mlir::Value bufLenOverride, mlir::Value &repeatCountOut,
-                 llvm::SmallVectorImpl<mlir::Value> &wordsOut);
+                 llvm::SmallVectorImpl<mlir::Value> &wordsOut,
+                 bool hasLengthParameter = false);
 
 } // namespace xilinx::AIEX
 

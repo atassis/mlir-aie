@@ -241,7 +241,11 @@ bool AIEX::isDecomposableNdDmaPattern(Operation *forOp,
       stridesInnermostFirst.size() != kNdDmaDims)
     return false;
 
-  if (isContiguousTransfer(sizesInnermostFirst, stridesInnermostFirst))
+  // See BdLowering.h's hasLengthParameter: a length_parameter op's d2 stride
+  // is load-bearing even when isContiguousTransfer misreads it as
+  // contiguous.
+  if (isContiguousTransfer(sizesInnermostFirst, stridesInnermostFirst) &&
+      !hasLengthParameter(forOp))
     return false;
 
   NdDmaPattern pattern;
@@ -276,7 +280,9 @@ AIEX::decomposeNdDmaPattern(Operation *forOp, BaseMemRefType referencedBufType,
       pattern.strides.size() != kNdDmaDims)
     return failure();
 
-  if (isContiguousTransfer(pattern.sizes, pattern.strides))
+  // See isDecomposableNdDmaPattern above.
+  if (isContiguousTransfer(pattern.sizes, pattern.strides) &&
+      !hasLengthParameter(forOp))
     return failure();
 
   if (patternPassesVerification(forOp, referencedBufType, targetModel, tileCol,

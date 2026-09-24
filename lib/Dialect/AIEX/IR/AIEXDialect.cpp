@@ -122,19 +122,16 @@ void AIEX::getHardwareStridesWraps(const AIE::AIETargetModel &targetModel,
   int64_t inT[4] = {inputStrides[0], inputStrides[1], inputStrides[2],
                     inputStrides[3]};
   int64_t outS[4], outT[4];
+  // See AIENormalizeDmaBdDimsPass: a length_parameter BD's d2 stride must
+  // reach hardware even at d2 size <= 1.
+  bool hasLengthParameter =
+      op->hasAttr("length_parameter") || op->hasAttr("length_state_table_idx");
   encodeHardwareStridesWraps(policy, elemWidth, addressGranularity, inS, inT,
-                             outS, outT);
+                             outS, outT, hasLengthParameter);
   for (int i = 0; i < 4; i++) {
     sizes[i] = outS[i];
     strides[i] = outT[i];
   }
-
-  // See AIENormalizeDmaBdDimsPass: encodeHardwareStridesWraps gates d2 stride
-  // on size > 1, which drops a length_parameter BD's load-bearing d2 stride.
-  if ((op->hasAttr("length_parameter") ||
-       op->hasAttr("length_state_table_idx")) &&
-      inputSizes[2] == 1 && inputStrides[2] != 0)
-    strides[2] = inT[2] * (int64_t)elemWidth / (int64_t)addressGranularity - 1;
 }
 
 mlir::LogicalResult
