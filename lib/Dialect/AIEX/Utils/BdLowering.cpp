@@ -190,7 +190,7 @@ buildShimBdWords(OpBuilder &builder, Location loc,
                  ArrayRef<OpFoldResult> mixedStrides, uint64_t elemWidth,
                  uint32_t burstLength, uint32_t axcache, Value bufLenOverride,
                  Value &repeatCountOut, SmallVectorImpl<Value> &wordsOut,
-                 bool hasLengthParameter) {
+                 bool isLengthParameterBd) {
   auto i32ty = builder.getIntegerType(32);
 
   // Shim-NOC BDs are 8 registers wide; slots not set below stay zero.
@@ -227,7 +227,7 @@ buildShimBdWords(OpBuilder &builder, Location loc,
   }
   SsaStridePolicy policy(builder, loc);
   encodeHardwareStridesWraps(policy, elemWidth, gran, inS, inT, hwS, hwT,
-                             hasLengthParameter);
+                             isLengthParameterBd);
 
   // buffer_length (word[0]): the caller's runtime len if supplied (dma_task),
   // else the d0*d1*d2 hardware-unit size-product (dma_memcpy_nd). hwS[0]
@@ -264,7 +264,7 @@ buildShimBdWords(OpBuilder &builder, Location loc,
   };
   // See AIENormalizeDmaBdDimsPass: a length_parameter BD must never fold to
   // linear mode, which would drop its load-bearing d2 stride.
-  bool isLinear = !hasLengthParameter && knownContiguous();
+  bool isLinear = !isLengthParameterBd && knownContiguous();
 
   // Guard a RUNTIME size against its narrow BD field (masking would silently
   // truncate); constants are verifier-checked. d0/d1 wrap (10-bit) only in ND
