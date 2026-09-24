@@ -45,6 +45,13 @@ struct AIENormalizeDmaBdDimsPass
       if (op.getPadDimensions() && !op.getPadDimensions()->empty())
         return;
 
+      // A length_parameter BD's d2 stride is load-bearing even at d2 size 1:
+      // the runtime extends the d2 wrap count past 1 via buffer_length.
+      // Dropping the dimension here would drop the only place that stride is
+      // recorded.
+      if (op.getLengthParameterAttr() || op.getLengthStateTableIdxAttr())
+        return;
+
       std::optional<SmallVector<BDDimLayoutAttr>> maybeDims =
           op.getConstantDimensions();
       if (!maybeDims || maybeDims->empty())

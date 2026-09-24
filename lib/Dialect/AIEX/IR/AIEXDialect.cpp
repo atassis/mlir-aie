@@ -128,6 +128,13 @@ void AIEX::getHardwareStridesWraps(const AIE::AIETargetModel &targetModel,
     sizes[i] = outS[i];
     strides[i] = outT[i];
   }
+
+  // See AIENormalizeDmaBdDimsPass: encodeHardwareStridesWraps gates d2 stride
+  // on size > 1, which drops a length_parameter BD's load-bearing d2 stride.
+  if ((op->hasAttr("length_parameter") ||
+       op->hasAttr("length_state_table_idx")) &&
+      inputSizes[2] == 1 && inputStrides[2] != 0)
+    strides[2] = inT[2] * (int64_t)elemWidth / (int64_t)addressGranularity - 1;
 }
 
 mlir::LogicalResult
@@ -407,6 +414,11 @@ struct LinearizeContiguousTransfer
 
     // Skip ops that are already in canonical linear form.
     if (op.isLinearTransferWithoutTransformation())
+      return mlir::failure();
+
+    // See AIENormalizeDmaBdDimsPass: never fold a length_parameter transfer
+    // to linear mode.
+    if (op.getLengthParameterAttr() || op.getLengthStateTableIdxAttr())
       return mlir::failure();
 
     // getMixedSizes/Strides/Offsets return outermost-first; reverse to
