@@ -686,7 +686,16 @@ def AIE_NpuDmaMemcpyNdOp: AIEX_Op<"npu.dma_memcpy_nd", [
       // scratchpad state-table index whose value is used as the BD address
       // offset. After lowering, $offset_parameter is removed in favor of this
       // attribute.
-      OptionalAttr<UI8Attr>:$offset_state_table_idx);
+      OptionalAttr<UI8Attr>:$offset_state_table_idx,
+      // if set, the aiex.scratchpad_parameter value added to the BD's static
+      // length as a run-time extension, in units of $length_granule elements.
+      // Mirrors $offset_parameter; see aie.dma_bd's $length_parameter.
+      OptionalAttr<FlatSymbolRefAttr>:$length_parameter,
+      // Set by --aie-lower-scratchpad-parameters from $length_parameter,
+      // mirroring $offset_state_table_idx.
+      OptionalAttr<UI8Attr>:$length_state_table_idx,
+      // Element count added to $length_parameter's raw value per unit.
+      OptionalAttr<AIEI32Attr>:$length_granule);
 
   let assemblyFormat = [{
     `(` $memref ``

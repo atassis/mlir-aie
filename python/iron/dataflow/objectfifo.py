@@ -892,6 +892,8 @@ class ObjectFifoHandle(Resolvable):
         managed=True,
         objects=None,
         object_offset=0,
+        length_parameter=None,
+        length_granule=None,
     ):
         """Shared body for fill()/drain().
 
@@ -964,14 +966,17 @@ class ObjectFifoHandle(Resolvable):
             self.endpoint = RuntimeEndpoint(self._shim_tile)
         active.note_fifo(self)
 
-        offset_param_name = None
-        if offset_parameter is not None:
-            if isinstance(offset_parameter, ScratchpadParameter):
-                offset_param_name = offset_parameter.name
-                if offset_parameter not in rt._scratchpad_parameters:
-                    rt._scratchpad_parameters.append(offset_parameter)
-            else:
-                offset_param_name = offset_parameter
+        def _resolve_param_name(param):
+            if param is None:
+                return None
+            if isinstance(param, ScratchpadParameter):
+                if param not in rt._scratchpad_parameters:
+                    rt._scratchpad_parameters.append(param)
+                return param.name
+            return param
+
+        offset_param_name = _resolve_param_name(offset_parameter)
+        length_param_name = _resolve_param_name(length_parameter)
 
         task = DMATask(
             self,
@@ -980,6 +985,8 @@ class ObjectFifoHandle(Resolvable):
             task_group=group,
             wait=wait,
             offset_parameter=offset_param_name,
+            length_parameter=length_param_name,
+            length_granule=length_granule,
             packet=packet,
             sizes=sizes,
             strides=strides,
@@ -1010,6 +1017,8 @@ class ObjectFifoHandle(Resolvable):
         managed: bool = True,
         objects: int | None = None,
         object_offset: int = 0,
+        length_parameter=None,
+        length_granule=None,
     ):
         """Fill this producer ObjectFifo with data from the ``source`` runtime buffer.
 
@@ -1034,6 +1043,8 @@ class ObjectFifoHandle(Resolvable):
             managed,
             objects,
             object_offset,
+            length_parameter,
+            length_granule,
         )
 
     def drain(
@@ -1051,6 +1062,8 @@ class ObjectFifoHandle(Resolvable):
         managed: bool = True,
         objects: int | None = None,
         object_offset: int = 0,
+        length_parameter=None,
+        length_granule=None,
     ):
         """Drain this consumer ObjectFifo, writing data to the ``dest`` runtime buffer.
 
@@ -1075,6 +1088,8 @@ class ObjectFifoHandle(Resolvable):
             managed,
             objects,
             object_offset,
+            length_parameter,
+            length_granule,
         )
 
     def all_of_endpoints(self) -> list[ObjectFifoEndpoint]:

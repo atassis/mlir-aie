@@ -70,3 +70,65 @@ aie.device(npu2) {
   %tile = aie.tile(0, 0)
   aie.shim_dma_allocation @dma(%tile, MM2S, 0)
 }
+
+// -----
+
+// Verify that a DMA BD length parameter requires length_granule > 0.
+
+aiex.scratchpad_parameter @len : i32
+aie.device(npu2) {
+  %t = aie.tile(0, 0)
+  aie.runtime_sequence(%arg0 : memref<64xi32>) {
+    %task = aiex.dma_configure_task(%t, MM2S, 0) {
+      // expected-error @+1 {{'aie.dma_bd' op length_parameter requires length_granule > 0}}
+      aie.dma_bd(%arg0 : memref<64xi32> offset = 0 len = 16) {length_parameter = @len}
+      aie.end
+    }
+  }
+}
+
+// -----
+
+// Verify that a DMA BD length_granule * element size must be a multiple of 16 bytes.
+
+aiex.scratchpad_parameter @len : i32
+aie.device(npu2) {
+  %t = aie.tile(0, 0)
+  aie.runtime_sequence(%arg0 : memref<64xi32>) {
+    %task = aiex.dma_configure_task(%t, MM2S, 0) {
+      // expected-error @+1 {{'aie.dma_bd' op length_granule * element size must be a multiple of 16 bytes (4 words): got 4 bytes}}
+      aie.dma_bd(%arg0 : memref<64xi32> offset = 0 len = 16) {length_parameter = @len, length_granule = 1 : i32}
+      aie.end
+    }
+  }
+}
+
+// -----
+
+// Verify that a DMA BD length parameter requires the static length itself to be a multiple of 16 bytes.
+
+aiex.scratchpad_parameter @len : i32
+aie.device(npu2) {
+  %t = aie.tile(0, 0)
+  aie.runtime_sequence(%arg0 : memref<64xi32>) {
+    %task = aiex.dma_configure_task(%t, MM2S, 0) {
+      // expected-error @+1 {{'aie.dma_bd' op length_parameter requires the static transfer length to be a multiple of 16 bytes (4 words): got 12 bytes}}
+      aie.dma_bd(%arg0 : memref<64xi32> offset = 0 len = 3) {length_parameter = @len, length_granule = 4 : i32}
+      aie.end
+    }
+  }
+}
+
+// -----
+
+// Verify that NPU DMA length parameters reject sub-byte element types.
+
+aiex.scratchpad_parameter @len : i32
+aie.device(npu2) {
+  aie.runtime_sequence(%arg0 : memref<64xi1>) {
+    // expected-error @+1 {{'aiex.npu.dma_memcpy_nd' op length_parameter requires a whole-byte element type}}
+    aiex.npu.dma_memcpy_nd(%arg0[0, 0, 0, 0][1, 1, 1, 32][0, 0, 0, 1]) {id = 0 : i64, metadata = @dma, length_parameter = @len, length_granule = 4 : i32} : memref<64xi1>
+  }
+  %tile = aie.tile(0, 0)
+  aie.shim_dma_allocation @dma(%tile, MM2S, 0)
+}

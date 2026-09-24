@@ -26,3 +26,27 @@ module {
     }
   }
 }
+
+// -----
+
+// aie-decompose-large-dma-bd rejects a length_parameter BD that needs
+// splitting: the runtime update targets one BD's word-0 register, so a chain
+// split would patch only one slice's length.
+
+module {
+  aiex.scratchpad_parameter @len : i32
+  aie.device(npu2_1col) {
+    %t = aie.tile(0, 0)
+    aie.shim_dma_allocation @a (%t, MM2S, 0)
+    aie.runtime_sequence @length_param_too_large(%in: memref<4096xi32>) {
+      %tk = aiex.dma_configure_task_for @a {
+        // expected-error@+1 {{splitting a length_parameter buffer descriptor into multiple descriptors is not implemented}}
+        aie.dma_bd(%in : memref<4096xi32> offset = 0 len = 2064 sizes = [1, 1, 1031, 2] strides = [0, 0, 3, 1])
+          {length_parameter = @len, length_granule = 4 : i32}
+        aie.end
+      } {issue_token = true}
+      aiex.dma_start_task(%tk)
+      aiex.dma_await_task(%tk)
+    }
+  }
+}

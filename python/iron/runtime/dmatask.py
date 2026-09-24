@@ -26,6 +26,8 @@ class DMATask(RuntimeTask):
         task_group: TaskGroup | None = None,
         wait: bool = False,
         offset_parameter: str | None = None,
+        length_parameter: str | None = None,
+        length_granule: int | None = None,
         packet: tuple[int, int] | None = None,
         sizes=None,
         strides=None,
@@ -47,6 +49,11 @@ class DMATask(RuntimeTask):
             wait (bool, optional): Whether this task should conclude with a call to await or a call to free. Defaults to False.
             offset_parameter (str | None, optional): Name of a ScratchpadParameter whose
                 value is used as the element offset for this DMA transfer. Defaults to None.
+            length_parameter (str | None, optional): Name of a ScratchpadParameter whose
+                value extends this DMA transfer's static length, in units of
+                ``length_granule`` elements. Defaults to None.
+            length_granule (int | None, optional): Element count per unit of
+                ``length_parameter``. Required when ``length_parameter`` is set.
             packet (tuple[int, int] | None, optional): Stamp the shim DMA's
                 BD with a packet header `(pkt_type, pkt_id)`. Pairs with
                 downstream packet-switched routing (e.g. an
@@ -73,6 +80,8 @@ class DMATask(RuntimeTask):
         self._tap = tap
         self._wait = wait
         self._offset_parameter = offset_parameter
+        self._length_parameter = length_parameter
+        self._length_granule = length_granule
         self._packet = packet
         self._sizes = sizes
         self._strides = strides
@@ -118,6 +127,8 @@ class DMATask(RuntimeTask):
                 tap=self._tap,
                 issue_token=self._wait,
                 offset_parameter=self._offset_parameter,
+                length_parameter=self._length_parameter,
+                length_granule=self._length_granule,
                 packet=self._packet,  # pyright: ignore[reportArgumentType]
             )
         else:
@@ -131,6 +142,8 @@ class DMATask(RuntimeTask):
                 transfer_len=self._transfer_len,
                 issue_token=self._wait,
                 offset_parameter=self._offset_parameter,
+                length_parameter=self._length_parameter,
+                length_granule=self._length_granule,
                 packet=self._packet,  # pyright: ignore[reportArgumentType]
             )
         dma_start_task(self._task)

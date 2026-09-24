@@ -3183,6 +3183,9 @@ void DMABDOp::buildMixed(mlir::OpBuilder &builder, mlir::OperationState &state,
         /*iteration=*/nullptr,
         /*offset_parameter=*/nullptr,
         /*offset_state_table_idx=*/nullptr,
+        /*length_parameter=*/nullptr,
+        /*length_state_table_idx=*/nullptr,
+        /*length_granule=*/nullptr,
         /*next_bd_id=*/nullptr);
 }
 
@@ -3307,6 +3310,34 @@ LogicalResult DMABDOp::verify() {
                                 .getElementTypeBitWidth();
     if (elemBitWidth == 0 || (elemBitWidth % 8) != 0)
       return emitOpError("offset_parameter requires a whole-byte element type");
+  }
+
+  if (getLengthParameterAttr() || getLengthStateTableIdxAttr()) {
+    uint64_t elemBitWidth = llvm::cast<BaseMemRefType>(getBuffer().getType())
+                                .getElementTypeBitWidth();
+    if (elemBitWidth == 0 || (elemBitWidth % 8) != 0)
+      return emitOpError("length_parameter requires a whole-byte element type");
+    uint64_t elemBytes = elemBitWidth / 8;
+
+    auto granuleAttr = getLengthGranuleAttr();
+    if (!granuleAttr || granuleAttr.getInt() <= 0)
+      return emitOpError("length_parameter requires length_granule > 0");
+    uint64_t granuleBytes =
+        static_cast<uint64_t>(granuleAttr.getInt()) * elemBytes;
+    // The firmware masks the length register's sum with 0xFFFFFFFC (4-byte
+    // granularity) but the field itself steps in 4-word (16-byte) units on
+    // shim NOC BDs, so a granule that isn't a 16-byte multiple can carry into
+    // bits the firmware treats as part of an adjacent field.
+    if (granuleBytes % 16 != 0)
+      return emitOpError(
+                 "length_granule * element size must be a multiple of 16 "
+                 "bytes (4 words): got ")
+             << granuleBytes << " bytes";
+    if ((getLenInBytes() % 16) != 0)
+      return emitOpError(
+                 "length_parameter requires the static transfer length to "
+                 "be a multiple of 16 bytes (4 words): got ")
+             << getLenInBytes() << " bytes";
   }
 
   // Skip verification of the BDOp outside of mem operations.

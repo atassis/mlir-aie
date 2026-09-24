@@ -558,6 +558,17 @@ public:
                                                         patchAddr)))
         return failure();
     }
+
+    // length_parameter targets the BD's word-0 (buffer_length) register.
+    // This path is always shim-NOC (it requires a ShimDMAAllocationOp).
+    if (op.getLengthStateTableIdxAttr()) {
+      auto bufType = cast<BaseMemRefType>(op.getMemref().getType());
+      uint64_t bdBaseAddr =
+          targetModel.getDmaBdAddress(tileCol, tileRow, op.getId());
+      if (failed(emitUpdateBdLengthFromParameter(rewriter, op, bufType,
+                                                 bdBaseAddr)))
+        return failure();
+    }
     return success();
   }
 

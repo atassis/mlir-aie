@@ -68,7 +68,9 @@ static bool shouldEmitParameterSyncPreamble(RuntimeSequenceOp seqOp) {
     }
     if (llvm::isa<ReadScratchpadParameterOp>(op) ||
         op->hasAttr("offset_parameter") ||
-        op->hasAttr("offset_state_table_idx")) {
+        op->hasAttr("offset_state_table_idx") ||
+        op->hasAttr("length_parameter") ||
+        op->hasAttr("length_state_table_idx")) {
       found = true;
     }
   });
@@ -321,9 +323,12 @@ struct AIELowerScratchpadParametersPass
     };
     moduleOp.walk([&](NpuDmaMemcpyNdOp op) {
       markAddr(op, op.getOffsetParameterAttr());
+      markAddr(op, op.getLengthParameterAttr());
     });
-    moduleOp.walk(
-        [&](AIE::DMABDOp op) { markAddr(op, op.getOffsetParameterAttr()); });
+    moduleOp.walk([&](AIE::DMABDOp op) {
+      markAddr(op, op.getOffsetParameterAttr());
+      markAddr(op, op.getLengthParameterAttr());
+    });
 
     for (auto p : allParams) {
       StringRef name = p.getSymName();
@@ -348,44 +353,52 @@ struct AIELowerScratchpadParametersPass
           builder.getIntegerType(8, /*isSigned=*/false), i));
     }
 
-    // Step 3b: rewrite DMA `offset_parameter` symbol references to a plain
-    // `offset_state_table_idx` integer attribute, so downstream `aie`-dialect
-    // passes do not need to resolve `aiex.scratchpad_parameter` symbols.
-    auto rewriteOffsetParam = [&](Operation *op, FlatSymbolRefAttr ref) {
+    // Step 3b: rewrite DMA `offset_parameter`/`length_parameter` symbol
+    // references to a plain `*_state_table_idx` integer attribute, so
+    // downstream `aie`-dialect passes do not need to resolve
+    // `aiex.scratchpad_parameter` symbols.
+    auto rewriteParam = [&](Operation *op, FlatSymbolRefAttr ref,
+                            StringRef attrName, StringRef idxAttrName) {
       if (!ref) {
         return success();
       }
       auto paramOp =
           moduleOp.lookupSymbol<ScratchpadParameterOp>(ref.getAttr());
       if (!paramOp) {
-        op->emitOpError("offset_parameter '")
-            << ref.getValue()
+        op->emitOpError(attrName)
+            << " '" << ref.getValue()
             << "' not found. Declare it at module scope with "
                "aiex.scratchpad_parameter.";
         return failure();
       }
       if (!paramOp.getType().isInteger(32)) {
-        auto err = op->emitOpError("offset_parameter '")
-                   << ref.getValue() << "' must have type i32, got "
+        auto err = op->emitOpError(attrName)
+                   << " '" << ref.getValue() << "' must have type i32, got "
                    << paramOp.getType() << ".";
         err.attachNote(paramOp.getLoc()) << "Parameter declared here.";
         return failure();
       }
       uint8_t stateIdx =
           static_cast<uint8_t>(paramOp.getStateTableIdx().value());
-      op->setAttr("offset_state_table_idx",
+      op->setAttr(idxAttrName,
                   builder.getIntegerAttr(
                       builder.getIntegerType(8, /*isSigned=*/false), stateIdx));
-      op->removeAttr("offset_parameter");
+      op->removeAttr(attrName);
       return success();
     };
     WalkResult rewriteResult = moduleOp.walk([&](Operation *op) {
       if (auto dmaOp = dyn_cast<NpuDmaMemcpyNdOp>(op)) {
-        if (failed(rewriteOffsetParam(op, dmaOp.getOffsetParameterAttr()))) {
+        if (failed(rewriteParam(op, dmaOp.getOffsetParameterAttr(),
+                                "offset_parameter", "offset_state_table_idx")) ||
+            failed(rewriteParam(op, dmaOp.getLengthParameterAttr(),
+                                "length_parameter", "length_state_table_idx"))) {
           return WalkResult::interrupt();
         }
       } else if (auto bdOp = dyn_cast<AIE::DMABDOp>(op)) {
-        if (failed(rewriteOffsetParam(op, bdOp.getOffsetParameterAttr()))) {
+        if (failed(rewriteParam(op, bdOp.getOffsetParameterAttr(),
+                                "offset_parameter", "offset_state_table_idx")) ||
+            failed(rewriteParam(op, bdOp.getLengthParameterAttr(),
+                                "length_parameter", "length_state_table_idx"))) {
           return WalkResult::interrupt();
         }
       }

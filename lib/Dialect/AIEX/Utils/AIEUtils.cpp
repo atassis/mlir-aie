@@ -256,6 +256,34 @@ LogicalResult AIEX::emitUpdateBdAddressFromOffsetParameter(
   return success();
 }
 
+LogicalResult AIEX::emitUpdateBdLengthFromParameter(
+    OpBuilder &builder, Operation *bdOp, BaseMemRefType bufType,
+    uint64_t bdBaseAddr) {
+  auto idxAttr = bdOp->getAttrOfType<IntegerAttr>("length_state_table_idx");
+  assert(idxAttr && "emitUpdateBdLengthFromParameter called without "
+                    "length_state_table_idx attribute");
+  auto granuleAttr = bdOp->getAttrOfType<IntegerAttr>("length_granule");
+  assert(granuleAttr && "emitUpdateBdLengthFromParameter called without "
+                       "length_granule attribute");
+
+  uint8_t stateIdx = static_cast<uint8_t>(idxAttr.getUInt());
+  uint32_t elemBytes = bufType.getElementTypeBitWidth() / 8;
+  // The verifier requires length_granule * elemBytes to be a multiple of 16
+  // bytes, so this division is always exact.
+  uint32_t funcArgWords =
+      static_cast<uint32_t>(granuleAttr.getInt()) * elemBytes / 4;
+
+  // Use func=mul with func_arg=funcArgWords so the firmware computes
+  // StateTable[idx] * funcArgWords = word delta, added into the BD's word-0
+  // (buffer_length) register.
+  AIEX::NpuUpdateFromScratchpadOp::create(
+      builder, bdOp->getLoc(), stateIdx, AIEX::StateTableFunc::Mul,
+      /*func_arg=*/funcArgWords,
+      /*address=*/static_cast<uint32_t>(bdBaseAddr),
+      /*buffer=*/nullptr, /*column=*/nullptr, /*row=*/nullptr);
+  return success();
+}
+
 void AIEX::emitScratchpadParamsFile(ModuleOp moduleOp, llvm::raw_ostream &os) {
   SmallVector<AIEX::ScratchpadParameterOp> allParams;
   moduleOp.walk([&](AIEX::ScratchpadParameterOp p) { allParams.push_back(p); });

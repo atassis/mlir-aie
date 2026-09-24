@@ -1148,6 +1148,18 @@ def AIE_DMABDOp: AIE_Op<"dma_bd", [AttrSizedOperandSegments]> {
       // offset. After lowering, $offset_parameter is removed in favor of this
       // attribute.
       OptionalAttr<UI8Attr>:$offset_state_table_idx,
+      // if set, the aiex.scratchpad_parameter value added to the BD's static
+      // length as a run-time extension, in units of $length_granule elements.
+      // The firmware masks the length register with 0xFFFFFFFC (word-aligned),
+      // so length_granule * element_bytes must be a multiple of 4 bytes; the
+      // verifier requires a multiple of 16 bytes (4 words) instead, since the
+      // firmware add can carry into the low 2 bits of the adjacent field.
+      OptionalAttr<FlatSymbolRefAttr>:$length_parameter,
+      // Set by --aie-lower-scratchpad-parameters from $length_parameter, mirroring
+      // $offset_state_table_idx.
+      OptionalAttr<UI8Attr>:$length_state_table_idx,
+      // Element count added to $length_parameter's raw value per unit.
+      OptionalAttr<AIEI32Attr>:$length_granule,
       // should never be assigned by user...
       OptionalAttr<AIEI32Attr>:$next_bd_id);
 
