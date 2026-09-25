@@ -383,3 +383,33 @@ module @linked_fifos_averaged_column {
     // CHECK-NOT: aie.logical_tile
   }
 }
+
+// -----
+
+// Two packet-flagged ObjectFifos from one shim share a single output DMA
+// channel (dedup, mirroring addChannelRequirementsFromFlows' packet-flow
+// handling); a third, ordinary ObjectFifo still needs its own channel. Total
+// demand is 2 output channels, which npu1's shim provides -- without the
+// packet dedup this would read 3 and fail (see
+// @shim_three_outputs_two_packet_one_plain in test_place_errors.mlir).
+// CHECK-LABEL: @shim_packet_objectfifos_share_channel
+module @shim_packet_objectfifos_share_channel {
+  aie.device(npu1) {
+    // CHECK-DAG: %[[SHIM:.*]] = aie.tile(0, 0)
+    %shim = aie.logical_tile<ShimNOCTile>(0, 0)
+    %c1 = aie.logical_tile<CoreTile>(?, ?)
+    %c2 = aie.logical_tile<CoreTile>(?, ?)
+    %c3 = aie.logical_tile<CoreTile>(?, ?)
+
+    aie.objectfifo @payload (%shim, {%c1}, 2 : i32) {packet, packet_id = 0 : i8}
+      : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @scales (%shim, {%c2}, 2 : i32) {packet, packet_id = 1 : i8}
+      : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @plain (%shim, {%c3}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
+
+    aie.core(%c1) { aie.end }
+    aie.core(%c2) { aie.end }
+    aie.core(%c3) { aie.end }
+    // CHECK-NOT: aie.logical_tile
+  }
+}

@@ -616,6 +616,13 @@ SequentialPlacer::buildChannelRequirements(
         linkedAsDest.insert(sym.getValue());
   }
 
+  // Packet-flagged ObjectFifos share one DMA channel per (tile, direction,
+  // pinned channel or -1 for auto-assign), mirroring
+  // addChannelRequirementsFromFlows' (tile, channel) dedup -- done here by
+  // bucket rather than channel because ObjectFifoCreateOps have none
+  // assigned yet at placer time.
+  llvm::DenseSet<std::pair<Operation *, int>> seenPacketOut, seenPacketIn;
+
   // Count channels for every ObjectFifo, omitting only the link-tile side of
   // linked fifos. The off-link-tile endpoint still needs DMA: a shim that
   // produces a linked source fifo consumes an MM2S channel; a core that
@@ -623,6 +630,7 @@ SequentialPlacer::buildChannelRequirements(
   for (auto ofOp : objectFifos) {
     bool skipConsumerSide = linkedAsSource.count(ofOp.getSymName());
     bool skipProducerSide = linkedAsDest.count(ofOp.getSymName());
+    bool isPacket = ofOp.getPacket();
 
     Value producerTile = ofOp.getProducerTile();
     auto *producerOp = producerTile.getDefiningOp();
@@ -631,7 +639,11 @@ SequentialPlacer::buildChannelRequirements(
     // Check if ANY consumer is a different tile type (needs DMA channel)
     bool producerNeedsDMA = false;
 
-    for (Value consumerTile : ofOp.getConsumerTiles()) {
+    std::optional<ArrayRef<int32_t>> consChannels =
+        isPacket ? ofOp.getConsDmaChannels() : std::nullopt;
+
+    for (auto [consumerIndex, consumerTile] :
+         llvm::enumerate(ofOp.getConsumerTiles())) {
       auto *consumerOp = consumerTile.getDefiningOp();
       auto consumerLogicalTile = dyn_cast_or_null<LogicalTileOp>(consumerOp);
 
@@ -644,16 +656,32 @@ SequentialPlacer::buildChannelRequirements(
 
       // This consumer needs a DMA channel (unless it's the link tile, which
       // the link loop credits separately).
-      if (consumerOp && !skipConsumerSide)
-        channelRequirements[consumerOp].first++; // input++
+      if (consumerOp && !skipConsumerSide) {
+        if (isPacket) {
+          int channel = consChannels && consumerIndex < consChannels->size()
+                            ? (*consChannels)[consumerIndex]
+                            : -1;
+          if (seenPacketIn.insert({consumerOp, channel}).second)
+            channelRequirements[consumerOp].first++; // input++
+        } else {
+          channelRequirements[consumerOp].first++; // input++
+        }
+      }
 
       producerNeedsDMA = true;
     }
 
     // Producer needs ONE output channel if any consumer needs DMA (unless the
     // producer IS the link tile of an outgoing linked dest fifo).
-    if (producerNeedsDMA && producerOp && !skipProducerSide)
-      channelRequirements[producerOp].second++; // output++
+    if (producerNeedsDMA && producerOp && !skipProducerSide) {
+      if (isPacket) {
+        int channel = ofOp.getProdDmaChannel().value_or(-1);
+        if (seenPacketOut.insert({producerOp, channel}).second)
+          channelRequirements[producerOp].second++; // output++
+      } else {
+        channelRequirements[producerOp].second++; // output++
+      }
+    }
   }
 
   // For linked ObjectFifos, count channels based on the link structure

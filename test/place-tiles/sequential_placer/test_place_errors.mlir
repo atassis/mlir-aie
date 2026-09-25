@@ -398,3 +398,53 @@ module @buffer_adjacency_star_oversubscribed {
     }
   }
 }
+
+// -----
+
+// Same shape as @shim_packet_objectfifos_share_channel in
+// test_place_objectfifo.mlir, but none of the three ObjectFifos is
+// packet-flagged: no dedup applies, so three producer-side channels are
+// required against the shim's 2, and placement fails.
+module @shim_three_outputs_two_packet_one_plain {
+  aie.device(npu1) {
+    // CHECK: error: tile (0, 0) requires 0 input/3 output DMA channels, but only 2 input/2 output available
+    %shim = aie.logical_tile<ShimNOCTile>(0, 0)
+    %c1 = aie.logical_tile<CoreTile>(?, ?)
+    %c2 = aie.logical_tile<CoreTile>(?, ?)
+    %c3 = aie.logical_tile<CoreTile>(?, ?)
+
+    aie.objectfifo @payload (%shim, {%c1}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @scales (%shim, {%c2}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @plain (%shim, {%c3}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
+
+    aie.core(%c1) { aie.end }
+    aie.core(%c2) { aie.end }
+    aie.core(%c3) { aie.end }
+  }
+}
+
+// -----
+
+// Packet ObjectFifos pinned to DISTINCT producer channels are NOT deduped:
+// each pinned channel is its own bucket, so this is still 3 output channels
+// against the shim's 2. Guards the packet dedup against over-eagerness, the
+// same way @flow_distinct_channels_no_dedup guards the flow dedup.
+module @shim_packet_objectfifos_distinct_pinned_channels_no_dedup {
+  aie.device(npu1) {
+    // CHECK: error: tile (0, 0) requires 0 input/3 output DMA channels, but only 2 input/2 output available
+    %shim = aie.logical_tile<ShimNOCTile>(0, 0)
+    %c1 = aie.logical_tile<CoreTile>(?, ?)
+    %c2 = aie.logical_tile<CoreTile>(?, ?)
+    %c3 = aie.logical_tile<CoreTile>(?, ?)
+
+    aie.objectfifo @payload (%shim, {%c1}, 2 : i32) {packet, packet_id = 0 : i8, prod_dma_channel = 0 : i32}
+      : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @scales (%shim, {%c2}, 2 : i32) {packet, packet_id = 1 : i8, prod_dma_channel = 1 : i32}
+      : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @plain (%shim, {%c3}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
+
+    aie.core(%c1) { aie.end }
+    aie.core(%c2) { aie.end }
+    aie.core(%c3) { aie.end }
+  }
+}
