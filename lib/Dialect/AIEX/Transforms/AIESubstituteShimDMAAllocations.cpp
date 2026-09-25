@@ -65,6 +65,34 @@ struct DMAConfigureTaskForOpPattern
           "shim DMA allocation must reference a valid TileOp");
     }
 
+    // A shared_input_channel group (design note §4 "Substitute"): every
+    // member resolves to the same (tile, dir, channel) by construction
+    // (assignChannels copied it there), so the task keeps the leader's
+    // allocation; each BD gets its OWN member's packet info instead of the
+    // task-wide default, matching the chain 1:1, leader first.
+    ArrayAttr interleave = op.getInterleaveAttr();
+    SmallVector<AIE::PacketInfoAttr> bdPackets;
+    if (interleave && !interleave.empty()) {
+      bdPackets.push_back(alloc_op.getPacket().value_or(nullptr));
+      for (Attribute a : interleave) {
+        auto sym = cast<FlatSymbolRefAttr>(a);
+        AIE::ShimDMAAllocationOp memberAlloc =
+            symbolTable.lookup<AIE::ShimDMAAllocationOp>(sym.getValue());
+        if (!memberAlloc)
+          return op.emitOpError("no shim DMA allocation found for interleave "
+                                "member '")
+                 << sym.getValue() << "'";
+        if (memberAlloc.getTileOp() != tile ||
+            memberAlloc.getChannelDir() != alloc_op.getChannelDir() ||
+            memberAlloc.getChannelIndex() != alloc_op.getChannelIndex())
+          return op.emitOpError("interleave member '")
+                 << sym.getValue()
+                 << "' does not share the leader's (tile, direction, "
+                    "channel)";
+        bdPackets.push_back(memberAlloc.getPacket().value_or(nullptr));
+      }
+    }
+
     DMAConfigureTaskOp new_op = DMAConfigureTaskOp::create(
         rewriter, op.getLoc(), rewriter.getIndexType(), tile.getResult(),
         alloc_op.getChannelDirAttr(),
@@ -76,6 +104,17 @@ struct DMAConfigureTaskForOpPattern
     rewriter.replaceAllUsesWith(op.getResult(), new_op.getResult());
     rewriter.inlineRegionBefore(op.getBody(), new_op.getBody(),
                                 new_op.getBody().begin());
+
+    if (!bdPackets.empty()) {
+      size_t i = 0;
+      for (auto &block : new_op.getBody())
+        block.walk([&](AIE::DMABDOp bd) {
+          if (i < bdPackets.size() && bdPackets[i])
+            bd.setPacketAttr(bdPackets[i]);
+          ++i;
+        });
+    }
+
     rewriter.eraseOp(op);
     return success();
   }

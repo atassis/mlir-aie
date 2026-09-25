@@ -1364,10 +1364,17 @@ def AIE_DMAConfigureTaskForOp
   let summary = "As dma_configure_task, but specify tile, direction and "
                 "channel by reference to a Shim DMA allocation op";
 
-  let arguments = (ins SymbolRefAttr:$alloc,
-      DefaultValuedOptionalAttr<BoolAttr, "false">:$issue_token,
-      DefaultValuedOptionalAttr<I32Attr, "0">:$repeat_count,
-      Optional<I32>:$repeat_count_val);
+  let arguments = (
+    ins SymbolRefAttr:$alloc,
+        DefaultValuedOptionalAttr<BoolAttr, "false">:$issue_token,
+        DefaultValuedOptionalAttr<I32Attr, "0">:$repeat_count,
+        Optional<I32>:$repeat_count_val,
+        // A shared_input_channel group's followers, leader ($alloc) first. When
+        // set, the body is one BD chain with one BD per group member in that
+        // order, replayed in lockstep by $repeat_count (see
+        // DMAConfigureTaskForOp::verifySymbolUses).
+        OptionalAttr<SymbolRefArrayAttr>:$interleave
+  );
 
   let regions = (region AnyRegion:$body);
 

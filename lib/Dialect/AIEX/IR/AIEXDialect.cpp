@@ -1460,6 +1460,120 @@ verifyTaskCoversWholeObjects(Operation *task, AIE::ShimDMAAllocationOp alloc,
             "consumer's acquire never unblocks.";
 }
 
+// A shared_input_channel group's chained fill (design note §3): $alloc names
+// the leader, $interleave the rest in BD order. Checked against the
+// ObjectFifoCreateOps the task was built from, which only exist pre-split --
+// post-split (hand-written) IR skips this and keeps only the BD-chain shape
+// check below, the same deferral DMAConfigureTaskForOp already makes for its
+// plain ShimDMAAllocationOp lookup.
+static LogicalResult verifySharedInputChannelInterleave(
+    AIEX::DMAConfigureTaskForOp op, AIE::DeviceOp dev,
+    SymbolTableCollection &symbolTable) {
+  ArrayAttr interleave = op.getInterleaveAttr();
+  if (!interleave || interleave.empty())
+    return success();
+
+  SmallVector<AIE::DMABDOp> bds;
+  for (auto &block : op.getBody())
+    block.walk([&](AIE::DMABDOp bd) { bds.push_back(bd); });
+
+  size_t groupSize = interleave.size() + 1;
+  if (bds.size() != groupSize)
+    return op.emitOpError("interleave names a group of ")
+           << groupSize << " members but the body has " << bds.size()
+           << " buffer descriptors";
+
+  // Lockstep (design note §5): a BD's outermost size becomes the hardware
+  // iteration register (AIE_DMABDOp's "BD iteration" doc), which must match
+  // repeat_count + 1 on every member or the streams drift apart.
+  if (!op.getRepeatCountVal()) {
+    int64_t wantIteration = op.getRepeatCount() + 1;
+    for (AIE::DMABDOp bd : bds) {
+      SmallVector<OpFoldResult> sizes = bd.getMixedSizes();
+      if (sizes.empty())
+        continue;
+      if (std::optional<int64_t> outer = getConstantIntValue(sizes.front());
+          outer && *outer != wantIteration)
+        return bd.emitOpError("outermost size (")
+               << *outer << ") must equal repeat_count + 1 (" << wantIteration
+               << ") to stay in lockstep with the rest of its "
+                  "shared_input_channel group";
+    }
+  }
+
+  auto lookupFifo = [&](StringRef name) {
+    return symbolTable.lookupSymbolIn<AIE::ObjectFifoCreateOp>(
+        dev, StringAttr::get(dev.getContext(), name));
+  };
+  SmallVector<AIE::ObjectFifoCreateOp> members;
+  AIE::ObjectFifoCreateOp leader =
+      lookupFifo(op.getAlloc().getRootReference());
+  if (!leader)
+    return success(); // post-split; defer
+  members.push_back(leader);
+  for (Attribute a : interleave) {
+    auto sym = dyn_cast<FlatSymbolRefAttr>(a);
+    AIE::ObjectFifoCreateOp fifo = sym ? lookupFifo(sym.getValue()) : nullptr;
+    if (!fifo)
+      return success(); // same deferral
+    members.push_back(fifo);
+  }
+
+  AIE::ObjectFifoLinkOp group;
+  for (auto linkOp : dev.getOps<AIE::ObjectFifoLinkOp>()) {
+    if (!linkOp.getSharedInputChannel())
+      continue;
+    std::vector<AIE::ObjectFifoCreateOp> ins = linkOp.getInputObjectFifos();
+    if (ins.size() == members.size() &&
+        std::equal(ins.begin(), ins.end(), members.begin())) {
+      group = linkOp;
+      break;
+    }
+  }
+  if (!group)
+    return op.emitOpError("alloc and interleave do not name exactly one "
+                          "shared_input_channel group, leader first");
+
+  // Deadlock rule (design note §5): the chunk m a BD invocation moves must
+  // not exceed that member's own consumer depth, or the head-of-line-blocked
+  // channel can wait on a release that sits behind its own next chunk.
+  for (auto [bd, fifo] : llvm::zip_equal(bds, members)) {
+    if (fifo.getConsumerTiles().size() != 1)
+      continue; // v1's single-consumer shape; a malformed group is caught
+                // elsewhere
+    SmallVector<OpFoldResult> sizes = bd.getMixedSizes();
+    if (sizes.size() < 2)
+      continue;
+    int64_t elemsMoved = 1;
+    bool known = true;
+    for (OpFoldResult s : llvm::drop_begin(sizes)) {
+      std::optional<int64_t> c = getConstantIntValue(s);
+      if (!c) {
+        known = false;
+        break;
+      }
+      elemsMoved *= *c;
+    }
+    if (!known)
+      continue;
+    int64_t objElems =
+        cast<MemRefType>(
+            cast<AIE::AIEObjectFifoType>(fifo.getElemType()).getElementType())
+            .getNumElements();
+    if (objElems == 0 || elemsMoved % objElems != 0)
+      continue; // shape doesn't reduce to a whole number of objects; the
+                // per-BD dimension checks elsewhere have the last word
+    int64_t m = elemsMoved / objElems;
+    int64_t depth = fifo.size(1);
+    if (m > depth)
+      return bd.emitOpError("moves ")
+             << m << " objects per invocation, which exceeds its "
+             << "shared_input_channel consumer's depth (" << depth << ")";
+  }
+
+  return success();
+}
+
 // Resolving the allocation symbol through the collection keeps the lookup off
 // the device's linear symbol scan, which a per-op verifier repeats after every
 // pass.
@@ -1471,6 +1585,8 @@ LogicalResult AIEX::DMAConfigureTaskForOp::verifySymbolUses(
   AIE::DeviceOp dev = getOperation()->getParentOfType<AIE::DeviceOp>();
   if (!dev)
     return success();
+  if (failed(verifySharedInputChannelInterleave(*this, dev, symbolTable)))
+    return failure();
   auto allocOp = symbolTable.lookupSymbolIn<AIE::ShimDMAAllocationOp>(
       dev, getAlloc().getRootReference());
   if (!allocOp)
