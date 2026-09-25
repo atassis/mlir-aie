@@ -1059,6 +1059,7 @@ class ObjectFifoHandle(Resolvable):
         dims_from_stream: list[StreamDims] | None = None,
         plio: bool = False,
         repeat_counts: list[int | None] | None = None,
+        share_input_channel: bool = False,
     ) -> list[ObjectFifo]:
         """Construct multiple ObjectFifos which feed data into a ObjectFifoHandle.
 
@@ -1076,6 +1077,12 @@ class ObjectFifoHandle(Resolvable):
                 to None.
             plio (bool, optional): Set plio on each new ObjectFifo. Defaults to False.
             repeat_counts (list[int | None] | None, optional): Per-sub-fifo MemTile DMA repeat count (see ObjectFifo.repeat_count). Defaults to None.
+            share_input_channel (bool, optional): Bill every new subfifo's shim
+                producer against one MM2S channel instead of one each (see
+                ObjectFifoLinkOp's shared_input_channel). Packet-flags every
+                subfifo it creates; the caller still assigns each its own
+                packet_id and shim producer tile via ``.prod()``. Defaults to
+                False.
 
         Raises:
             ValueError: Arguments are validated
@@ -1131,6 +1138,7 @@ class ObjectFifoHandle(Resolvable):
                     dims_to_stream=dims_to_stream[i],
                     plio=plio,
                     repeat_count=repeat_counts[i],
+                    packet=share_input_channel,
                 )
             )
 
@@ -1138,7 +1146,10 @@ class ObjectFifoHandle(Resolvable):
             s.cons(depth=depths[i], dims_from_stream=dims_from_stream[i])
             for i, s in enumerate(subfifos)
         ]
-        _ = ObjectFifoLink(subfifo_cons, self, tile, offsets, [])
+        _ = ObjectFifoLink(
+            subfifo_cons, self, tile, offsets, [],
+            shared_input_channel=share_input_channel,
+        )
         return subfifos
 
     def split(
@@ -1357,6 +1368,7 @@ class ObjectFifoLink(ObjectFifoEndpoint, Resolvable):
         tile: Tile | None = AnyMemTile,
         src_offsets: list[int] | None = None,
         dst_offsets: list[int] | None = None,
+        shared_input_channel: bool = False,
     ):
         """Construct an ObjectFifoLink. This is either a many-to-one, one-to-many, or one-to-one operation.
 
@@ -1368,6 +1380,10 @@ class ObjectFifoLink(ObjectFifoEndpoint, Resolvable):
                 is required to split the destination. Defaults to None (empty list).
             dst_offsets (list[int] | None, optional): If many destinations, one offset per
                 destination is required to split the source. Defaults to None (empty list).
+            shared_input_channel (bool, optional): A join whose sources are all
+                packet-flagged fifos of one shim producer bills one MM2S channel
+                instead of one per source (see ObjectFifoLinkOp's
+                shared_input_channel). Defaults to False.
 
         Raises:
             ValueError: Arguments are validated.
@@ -1376,6 +1392,7 @@ class ObjectFifoLink(ObjectFifoEndpoint, Resolvable):
         self._dsts = single_elem_or_list_to_list(dsts)
         self._src_offsets = src_offsets if src_offsets is not None else []
         self._dst_offsets = dst_offsets if dst_offsets is not None else []
+        self._shared_input_channel = shared_input_channel
         self._resolving = False
 
         if len(self._srcs) < 1:
@@ -1434,5 +1451,9 @@ class ObjectFifoLink(ObjectFifoEndpoint, Resolvable):
             src_ops = [s.op for s in self._srcs]
             dst_ops = [d.op for d in self._dsts]
             self._op = object_fifo_link(
-                src_ops, dst_ops, self._src_offsets, self._dst_offsets
+                src_ops,
+                dst_ops,
+                self._src_offsets,
+                self._dst_offsets,
+                shared_input_channel=self._shared_input_channel or None,
             )
