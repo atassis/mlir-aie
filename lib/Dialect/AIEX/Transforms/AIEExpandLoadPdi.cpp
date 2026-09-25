@@ -597,15 +597,28 @@ static void applyElideIdenticalPmWrites(ModuleOp module) {
           tracker.known.erase(*addr);
         return;
       }
-      if (isa<NpuBlockWriteValuesOp, NpuAddressPatchOp>(op)) {
-        // Same opacity policy as applyDifferentialReset's
-        // collectWrittenAddresses: these can target an address this pass
-        // cannot read at compile time.
+      if (isa<NpuBlockWriteValuesOp>(op)) {
+        // Its address is a runtime SSA value (unlike NpuAddressPatchOp's
+        // fixed BD-register slot below), so it could target anything.
         tracker.known.clear();
+        return;
       }
+      // NpuAddressPatchOp (DDR_PATCH) writes a runtime-resolved host-buffer
+      // address into an already-existing shim DMA BD register -- a real but
+      // non-program-memory target (aiebu: regaddr is BD word 1 or 2), so it
+      // is left out of the tracker, same as every other op kind below.
+      // Unlike applyDifferentialReset's collectWrittenAddresses (which marks
+      // it opaque to keep a REGISTER RESET conservative at that one
+      // boundary), invalidating the whole tracker here is the wrong scope:
+      // DDR_PATCH appears on nearly every configure, so treating it as
+      // opaque silently discarded every elision opportunity in real decode
+      // control code -- caught by an aiecc end-to-end build producing a
+      // byte-identical ELF with the flag on.
+      //
       // Every other op kind (TCT/sync, scratchpad/state-table, control flow,
-      // arith/memref bookkeeping) does not write array registers by
-      // compile-time address -- same model collectWrittenAddresses uses.
+      // arith/memref bookkeeping) does not write program memory by a
+      // compile-time address -- same model collectWrittenAddresses uses for
+      // the address kinds it tracks.
     });
 
     for (Operation *op : toErase)

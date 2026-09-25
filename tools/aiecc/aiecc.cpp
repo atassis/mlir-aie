@@ -1320,16 +1320,18 @@ buildMainGraph(mlir::MLIRContext &context, Graph &g,
   // DMA lowering: the extraction point for the control-packet binary.
   bool ctrlPkt = loadPdiToCtrlPkt.getValue();
   bool registerResetOn = registerReset.getValue();
+  bool elideIdenticalPmWritesOn = elideIdenticalPmWrites.getValue();
   auto expandPipeline =
-      [&context, ctrlPkt, registerResetOn](
+      [&context, ctrlPkt, registerResetOn, elideIdenticalPmWritesOn](
           EdgeWithTypedOutput<ModRef> &src) -> EdgeWithTypedOutput<ModRef> & {
     return src.map<ModRef>(
         "npu_expanded.mlir",
         PassPipeline{&context,
-                     [ctrlPkt, registerResetOn](mlir::MLIRContext *ctx,
-                                                mlir::ModuleOp) {
-                       return getExpandLoadPdiPipeline(ctx, ctrlPkt,
-                                                       registerResetOn);
+                     [ctrlPkt, registerResetOn, elideIdenticalPmWritesOn](
+                         mlir::MLIRContext *ctx, mlir::ModuleOp) {
+                       return getExpandLoadPdiPipeline(
+                           ctx, ctrlPkt, registerResetOn,
+                           elideIdenticalPmWritesOn);
                      }});
   };
 
@@ -1407,15 +1409,16 @@ buildMainGraph(mlir::MLIRContext &context, Graph &g,
           ? static_cast<EdgeWithTypedOutput<ModRef> &>(npuPartsDma.map<ModRef>(
                 "npu_expanded_{0}.mlir",
                 PassPipeline{&context,
-                             [registerResetOn](mlir::MLIRContext *ctx,
-                                               mlir::ModuleOp mod)
+                             [registerResetOn, elideIdenticalPmWritesOn](
+                                 mlir::MLIRContext *ctx, mlir::ModuleOp mod)
                                  -> std::unique_ptr<mlir::PassManager> {
                                if (mlir::failed(
                                        checkPartitionLoadPdiParity(mod))) {
                                  return nullptr;
                                }
                                return getExpandLoadPdiPipeline(
-                                   ctx, /*ctrlPkt=*/false, registerResetOn);
+                                   ctx, /*ctrlPkt=*/false, registerResetOn,
+                                   elideIdenticalPmWritesOn);
                              }}))
           : npuPartsDma;
   auto &npuPartsLowered =
@@ -2255,6 +2258,14 @@ int main(int argc, char **argv) {
   // own it would be silently inert; the pass rejects the ctrl-pkt pairing.
   if (registerReset.getValue() && !expandLoadPdis.getValue()) {
     llvm::errs() << "aiecc: --register-reset requires --expand-load-pdis\n";
+    return 1;
+  }
+
+  // Same reason as --register-reset above: this option only changes what the
+  // load_pdi expansion emits.
+  if (elideIdenticalPmWrites.getValue() && !expandLoadPdis.getValue()) {
+    llvm::errs()
+        << "aiecc: --elide-identical-pm-writes requires --expand-load-pdis\n";
     return 1;
   }
 

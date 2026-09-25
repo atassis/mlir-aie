@@ -1763,12 +1763,15 @@ getNpuDmaLoweringPipeline(mlir::MLIRContext *ctx) {
 // than a `load_pdi @empty_N` firmware partition reset.
 inline std::unique_ptr<mlir::PassManager>
 getExpandLoadPdiPipeline(mlir::MLIRContext *ctx, bool ctrlPkt = false,
-                         bool registerReset = false) {
+                         bool registerReset = false,
+                         bool elideIdenticalPmWrites = false) {
   auto pm = std::make_unique<mlir::PassManager>(ctx);
   std::string expandPipeline =
       std::string("aie-expand-load-pdi{ctrl-pkt=") +
       (ctrlPkt ? "true" : "false") +
-      " register-reset=" + (registerReset ? "true" : "false") + "}";
+      " register-reset=" + (registerReset ? "true" : "false") +
+      " elide-identical-pm-writes=" +
+      (elideIdenticalPmWrites ? "true" : "false") + "}";
   if (mlir::failed(mlir::parsePassPipeline(expandPipeline, *pm))) {
     return nullptr;
   }

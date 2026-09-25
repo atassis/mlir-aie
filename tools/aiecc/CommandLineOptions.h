@@ -139,6 +139,11 @@ inline cl::opt<bool> registerReset(
              "outgoing device wrote instead of reloading an empty device "
              "(implies a partial reset; incompatible with "
              "--load-pdi-to-ctrl-pkt)"));
+inline cl::opt<bool> elideIdenticalPmWrites(
+    "elide-identical-pm-writes",
+    cl::desc("With --expand-load-pdis, drop a run of >= 8 consecutive "
+             "program-memory blockwrite words whose value a prior segment "
+             "of the same runtime sequence already wrote at that address"));
 inline cl::opt<bool> loadPdiToCtrlPkt(
     "load-pdi-to-ctrl-pkt",
     cl::desc("Rewrite `load_pdi { device_ref }` ops into DMA tasks that stream "
