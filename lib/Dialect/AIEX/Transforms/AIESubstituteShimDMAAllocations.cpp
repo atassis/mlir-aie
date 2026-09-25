@@ -65,11 +65,11 @@ struct DMAConfigureTaskForOpPattern
           "shim DMA allocation must reference a valid TileOp");
     }
 
-    // A shared_input_channel group (design note §4 "Substitute"): every
-    // member resolves to the same (tile, dir, channel) by construction
-    // (assignChannels copied it there), so the task keeps the leader's
-    // allocation; each BD gets its OWN member's packet info instead of the
-    // task-wide default, matching the chain 1:1, leader first.
+    // A shared_input_channel group's members resolve to the same
+    // (tile, dir, channel) by construction (assignChannels copied it there;
+    // see ObjectFifoLinkOp::verify, AIEDialect.cpp). Each BD gets its OWN
+    // member's packet info instead of the task-wide default, matching the
+    // chain 1:1, leader first.
     ArrayAttr interleave = op.getInterleaveAttr();
     SmallVector<AIE::PacketInfoAttr> bdPackets;
     if (interleave && !interleave.empty()) {

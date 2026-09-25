@@ -1,0 +1,23 @@
+// Copyright (C) 2026 Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+// REQUIRES: ryzen_ai_npu2, peano
+//
+// A shared_input_channel join:
+// one shim MM2S channel interleaves a payload and a scale packet stream into
+// a memtile join, a core copies each joined object back out to DDR. Built
+// straight from ObjectFifo-level source through --get-full-elf, no
+// hand-edited IR -- reproduces the device-proven encoding (2026-09-25) via the
+// shared_input_channel/interleave lowering instead of manual packet_flow
+// and shim_dma_allocation surgery.
+//
+// aie_negctl.mlir is the same design with both BDs' outer stride zeroed, so
+// every repeat re-reads slice 0: a negative control proving the byte-exact
+// check has power to fail, not that it always reads OK.
+
+// RUN: %aiecc --get-full-elf %S/aie.mlir
+// RUN: %host_clang -o test.exe %S/test_elf.cpp -std=c++17 %host_link_flags %xrt_flags
+// RUN: ./test.exe --elf aie.elf --n 8 --timeout-ms 5000
+
+// RUN: %aiecc --get-full-elf --full-elf-name=aie_negctl.elf %S/aie_negctl.mlir
+// RUN: not ./test.exe --elf aie_negctl.elf --n 8 --timeout-ms 5000
