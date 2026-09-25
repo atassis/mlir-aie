@@ -288,7 +288,8 @@ struct AIEObjectFifoSplitPass
         WireBundleAttr::get(builder.getContext(), bundle),
         channelIndex ? builder.getI32IntegerAttr(*channelIndex) : IntegerAttr(),
         /*packet=*/PacketInfoAttr(),
-        builder.getStringAttr(from.name().getValue()));
+        builder.getStringAttr(from.name().getValue()),
+        /*sharesChannel=*/FlatSymbolRefAttr());
   }
 
   /// External buffers registered against a fifo's shim end form a pool in DDR.
@@ -449,6 +450,11 @@ struct AIEObjectFifoSplitPass
     return success();
   }
 
+  /// A `shared_input_channel` join's non-leader source fifos, mapped to the
+  /// `<leader>_prod_dma` symbol whose RouteEndpoint they billed against
+  /// (declared on the link; see ObjectFifoLinkOp::verify).
+  DenseMap<Operation *, std::string> sharedChannelLeaderName;
+
   /// Ends of a linked fifo that resolve to the link's shared pool.
   DenseMap<Operation *, PoolRef> linkedProducerEnd;
   DenseMap<Operation *, PoolRef> linkedConsumerEnd;
@@ -465,6 +471,14 @@ struct AIEObjectFifoSplitPass
 /// segment.
 void AIEObjectFifoSplitPass::createLinkPools() {
   for (auto linkOp : device.getOps<ObjectFifoLinkOp>()) {
+    if (linkOp.getSharedInputChannel()) {
+      std::vector<ObjectFifoCreateOp> ins = linkOp.getInputObjectFifos();
+      std::string leaderProdDmaName =
+          (ins.front().name().getValue() + "_prod_dma").str();
+      for (ObjectFifoCreateOp follower : llvm::drop_begin(ins))
+        sharedChannelLeaderName[follower.getOperation()] = leaderProdDmaName;
+    }
+
     auto sharedTile = linkOp.getOptionalSharedTile();
     if (!sharedTile) {
       continue;
@@ -702,12 +716,23 @@ void AIEObjectFifoSplitPass::runOnOperation() {
           loc, prodDmaName, prodTile, *prodRef, ObjectFifoRole::Drain, fifo,
           fifo.getDimensionsToStreamAttr(), fifo.getProdDmaChannel());
     } else {
-      createRouteEndpoint(
+      auto leader = sharedChannelLeaderName.find(fifo.getOperation());
+      bool isFollower = leader != sharedChannelLeaderName.end();
+      // A follower's channel comes from sharesChannel below, so its own pin
+      // (if any -- the link verifier only requires it to agree with the
+      // leader's) would be redundant on this op and is left off.
+      RouteEndpointOp prodEp = createRouteEndpoint(
           loc, prodDmaName, prodTile,
           prodStreamPort   ? WireBundle::Core
           : fifo.getPlio() ? WireBundle::PLIO
                            : WireBundle::DMA,
-          prodStreamPort ? prodStreamPort : fifo.getProdDmaChannel(), fifo);
+          isFollower ? std::nullopt
+                     : (prodStreamPort ? prodStreamPort
+                                       : fifo.getProdDmaChannel()),
+          fifo);
+      if (isFollower)
+        prodEp.setSharesChannelAttr(
+            FlatSymbolRefAttr::get(builder.getContext(), leader->second));
     }
     if (prodIsShim) {
       shimEndpointName[fifo] = prodDmaName;

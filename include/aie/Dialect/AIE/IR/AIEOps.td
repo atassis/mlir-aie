@@ -2019,6 +2019,12 @@ def AIE_RouteEndpointOp
     and writes directly and which needs no DMA. Setting `channelIndex` pins the
     channel instead of leaving it to allocation.
 
+    `sharesChannel` names another RouteEndpoint (the `shared_input_channel`
+    group's leader; see `objectfifo.link`) whose assigned channel this one
+    reuses instead of drawing its own. `--aie-objectfifo-allocate` copies the
+    leader's channel here rather than counting this endpoint against the
+    tile's DMA budget.
+
     Example:
     ```
       aie.route_endpoint @in(%shim) DMA {fifoName = "in"}
@@ -2031,7 +2037,8 @@ def AIE_RouteEndpointOp
       OptionalAttr<PacketInfoAttr>:$packet,
       // If lowered from a high-level ObjectFifo, the name of that fifo.
       // Used to group ops lowered by the same ObjectFifo.
-      OptionalAttr<StrAttr>:$fifoName);
+      OptionalAttr<StrAttr>:$fifoName,
+      OptionalAttr<FlatSymbolRefAttr>:$sharesChannel);
 
   let assemblyFormat = [{
     $sym_name `(` $tile `)` $bundle attr-dict

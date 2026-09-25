@@ -1060,6 +1060,12 @@ LogicalResult RouteEndpointOp::verify() {
                        "but it is named ")
            << flows << " times";
   }
+  // channelIndex on a sharesChannel endpoint is not a conflict: allocation
+  // writes the resolved (copied) channel there once assignChannels runs, the
+  // same way it does for every other endpoint (see assignChannels).
+  if (getSharesChannel() && getBundle() != WireBundle::DMA)
+    return emitOpError("sharesChannel is only meaningful on a DMA end");
+
   switch (getBundle()) {
   case WireBundle::DMA:
   case WireBundle::PLIO:

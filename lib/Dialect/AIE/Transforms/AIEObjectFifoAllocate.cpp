@@ -556,7 +556,16 @@ struct AIEObjectFifoAllocatePass
     channelAssignments.clear();
     channelFailure = nullptr;
     SmallVector<RouteEndpoint> pending;
+    // shared_input_channel followers (see objectfifo.link): their channel is
+    // copied from the leader's below instead of drawn from the tile's DMA
+    // budget, so they never reach the pinned/pending logic at all.
+    SmallVector<RouteEndpointOp> sharedChannelFollowers;
     for (auto endpoint : device.getOps<RouteEndpoint>()) {
+      if (auto routeEp = dyn_cast<RouteEndpointOp>(endpoint.getOperation());
+          routeEp && routeEp.getSharesChannel()) {
+        sharedChannelFollowers.push_back(routeEp);
+        continue;
+      }
       DMAChannelDir dir = endpoint.getRouteDirection();
       std::optional<int> channel = endpoint.getRouteChannel();
       // A core's stream port is named by the design, not drawn from the tile's
@@ -635,6 +644,22 @@ struct AIEObjectFifoAllocatePass
         return failure();
       }
       channelAssignments[endpoint.getOperation()] = channel;
+    }
+
+    for (RouteEndpointOp follower : sharedChannelFollowers) {
+      StringRef leaderName = *follower.getSharesChannel();
+      Operation *leaderOp =
+          SymbolTable::lookupSymbolIn(device, leaderName);
+      auto it = leaderOp ? channelAssignments.find(leaderOp)
+                         : channelAssignments.end();
+      if (it == channelAssignments.end()) {
+        channelFailure = dyn_cast<RouteEndpoint>(follower.getOperation());
+        if (!diagnose)
+          return failure();
+        return follower->emitOpError("sharesChannel names '@")
+               << leaderName << "', which has no assigned channel";
+      }
+      channelAssignments[follower.getOperation()] = it->second;
     }
     return success();
   }
