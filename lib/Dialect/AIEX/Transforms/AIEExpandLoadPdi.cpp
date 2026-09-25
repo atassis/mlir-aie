@@ -424,6 +424,195 @@ static void applyDifferentialReset(ModuleOp module) {
   });
 }
 
+//===----------------------------------------------------------------------===//
+// Elide identical program-memory writes
+//===----------------------------------------------------------------------===//
+//
+// A design switch rewrites the incoming design's whole program memory, even
+// for words an earlier segment already left there -- measured at 34.4% of a
+// decode's program-memory word writes. A device probe confirmed the
+// `@empty_N` firmware reset leaves program memory in place (see the PR
+// description). PmTracker tracks that per-address state across a runtime
+// sequence, including across `@empty_N` resets, never across a real PDI
+// load it did not read.
+
+namespace {
+
+constexpr unsigned kMinElideRun = 8;
+
+/// Conservative by construction: any write whose target or payload is not a
+/// compile-time constant invalidates `known` entirely rather than risk
+/// eliding against a stale guess.
+struct PmTracker {
+  llvm::DenseMap<uint32_t, uint32_t> known;
+};
+
+/// The next unused `pm_elide_<N>` global name for `device`, scanning once so
+/// a design with many elided runs does not repeat AIEAssignBuffers' old
+/// per-symbol SymbolTable probe (see generateUniqueSymbolName's history in
+/// this same pass).
+static unsigned nextPmElideId(AIE::DeviceOp device) {
+  unsigned next = 0;
+  for (auto g : device.getOps<memref::GlobalOp>()) {
+    StringRef suffix = g.getSymName();
+    unsigned idx;
+    if (suffix.consume_front("pm_elide_") && !suffix.getAsInteger(10, idx))
+      next = std::max(next, idx + 1);
+  }
+  return next;
+}
+
+/// Drops runs of >= `kMinElideRun` words `tracker` already proves correct,
+/// records every word (elided or not) into `tracker`, and returns true if it
+/// replaced `op` with new ops inserted before it -- the caller erases `op`.
+static bool elidePmBlockWrite(NpuBlockWriteOp op, PmTracker &tracker,
+                              unsigned &nameId) {
+  DenseIntElementsAttr wordsAttr = op.getDataWords();
+  std::optional<uint32_t> addr = op.getAbsoluteAddress();
+  if (!wordsAttr || !addr)
+    return false; // caller treats an unreadable write as opaque
+
+  SmallVector<uint32_t> words(wordsAttr.getValues<uint32_t>());
+  unsigned n = words.size();
+  SmallVector<bool> elide(n, false);
+  bool anyElided = false;
+  {
+    SmallVector<bool> same(n);
+    for (unsigned i = 0; i < n; ++i) {
+      auto it = tracker.known.find(*addr + 4 * i);
+      same[i] = it != tracker.known.end() && it->second == words[i];
+    }
+    unsigned i = 0;
+    while (i < n) {
+      unsigned j = i;
+      while (j < n && same[j] == same[i])
+        ++j;
+      if (same[i] && (j - i) >= kMinElideRun) {
+        for (unsigned k = i; k < j; ++k)
+          elide[k] = true;
+        anyElided = true;
+      }
+      i = j;
+    }
+  }
+
+  // An elided word's value is unchanged by definition; a kept word's is what
+  // this op writes. Either way the tracker now knows it.
+  for (unsigned k = 0; k < n; ++k)
+    tracker.known[*addr + 4 * k] = words[k];
+
+  if (!anyElided)
+    return false;
+
+  OpBuilder builder(op);
+  Location loc = op.getLoc();
+  AIE::DeviceOp device = op->getParentOfType<AIE::DeviceOp>();
+  unsigned i = 0;
+  while (i < n) {
+    unsigned j = i;
+    while (j < n && elide[j] == elide[i])
+      ++j;
+    if (!elide[i]) {
+      SmallVector<int32_t> chunk(words.begin() + i, words.begin() + j);
+      MemRefType memrefType =
+          MemRefType::get({(int64_t)chunk.size()}, builder.getI32Type());
+      TensorType tensorType = RankedTensorType::get(
+          {(int64_t)chunk.size()}, builder.getI32Type());
+      std::string name = "pm_elide_" + std::to_string(nameId++);
+      memref::GlobalOp global;
+      {
+        OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPointToStart(device.getBody());
+        global = memref::GlobalOp::create(
+            builder, loc, name, builder.getStringAttr("private"), memrefType,
+            DenseElementsAttr::get<int32_t>(tensorType, chunk), true,
+            nullptr);
+      }
+      auto getGlobal = memref::GetGlobalOp::create(builder, loc, memrefType,
+                                                    global.getName());
+      NpuBlockWriteOp::create(builder, loc,
+                              builder.getUI32IntegerAttr(*addr + 4 * i),
+                              getGlobal.getResult(), nullptr, nullptr,
+                              nullptr);
+    }
+    i = j;
+  }
+  return true;
+}
+
+} // namespace
+
+static void applyElideIdenticalPmWrites(ModuleOp module) {
+  module.walk([&](AIE::RuntimeSequenceOp seq) {
+    const AIE::AIETargetModel &tm = AIE::getTargetModel(seq.getOperation());
+    AIE::DeviceOp device = seq->getParentOfType<AIE::DeviceOp>();
+    PmTracker tracker;
+    unsigned nameId = device ? nextPmElideId(device) : 0;
+    SmallVector<Operation *> toErase;
+
+    seq.walk([&](Operation *op) {
+      if (auto loadPdi = dyn_cast<NpuLoadPdiOp>(op)) {
+        // Our own `@empty_N` reset is proven not to clear program memory, so
+        // tracking survives it. Any other load_pdi is a real PDI whose
+        // content this pass never read, which can silently overwrite
+        // program memory at addresses the tracker thinks it knows.
+        if (!isEmptyResetPreload(loadPdi))
+          tracker.known.clear();
+        return;
+      }
+      if (auto bw = dyn_cast<NpuBlockWriteOp>(op)) {
+        std::optional<uint32_t> addr = bw.getAbsoluteAddress();
+        if (!addr) {
+          tracker.known.clear(); // unreadable target: opaque write, same
+                                 // policy as applyDifferentialReset
+          return;
+        }
+        if (!isProgramMemoryAddress(tm, *addr))
+          return; // not this tracker's business
+        if (elidePmBlockWrite(bw, tracker, nameId))
+          toErase.push_back(op);
+        return;
+      }
+      if (auto w = dyn_cast<NpuWrite32Op>(op)) {
+        std::optional<uint32_t> addr = w.getAbsoluteAddress();
+        if (!addr || !isProgramMemoryAddress(tm, *addr))
+          return;
+        if (auto v = getConstantIntOperand(w.getValue()))
+          tracker.known[*addr] = *v;
+        else
+          tracker.known.erase(*addr);
+        return;
+      }
+      if (auto m = dyn_cast<NpuMaskWrite32Op>(op)) {
+        std::optional<uint32_t> addr = m.getAbsoluteAddress();
+        if (!addr || !isProgramMemoryAddress(tm, *addr))
+          return;
+        auto mask = getConstantIntOperand(m.getMask());
+        auto val = getConstantIntOperand(m.getValue());
+        // A partial-bit mask leaves the address's full value unknown to
+        // this tracker; only a full-word mask makes it a known write.
+        if (mask && val && *mask == 0xFFFFFFFFu)
+          tracker.known[*addr] = *val;
+        else
+          tracker.known.erase(*addr);
+        return;
+      }
+      if (isa<NpuBlockWriteValuesOp, NpuAddressPatchOp>(op)) {
+        // Same opacity policy as applyDifferentialReset's
+        // collectWrittenAddresses: these can target an address this pass
+        // cannot read at compile time.
+        tracker.known.clear();
+      }
+      // Every other op kind (TCT/sync, scratchpad/state-table, control flow,
+      // arith/memref bookkeeping) does not write array registers by
+      // compile-time address -- same model collectWrittenAddresses uses.
+    });
+
+    for (Operation *op : toErase)
+      op->erase();
+  });
+}
+
 struct AIEExpandLoadPdiPass
     : public xilinx::AIEX::impl::AIEExpandLoadPdiBase<AIEExpandLoadPdiPass> {
   using AIEExpandLoadPdiBase::AIEExpandLoadPdiBase;
@@ -442,6 +631,14 @@ struct AIEExpandLoadPdiPass
     // before doing any work rather than silently mis-lowering.
     if (clRegisterReset && clCtrlPkt) {
       module.emitError("register-reset and ctrl-pkt are mutually exclusive");
+      signalPassFailure();
+      return;
+    }
+    // Same reason as register-reset above: ctrl-pkt mode never emits the
+    // blockwrite ops this pass tracks, so it would find nothing to elide.
+    if (clElideIdenticalPmWrites && clCtrlPkt) {
+      module.emitError(
+          "elide-identical-pm-writes and ctrl-pkt are mutually exclusive");
       signalPassFailure();
       return;
     }
@@ -537,6 +734,8 @@ struct AIEExpandLoadPdiPass
     }
     if (clRegisterReset)
       applyDifferentialReset(module);
+    if (clElideIdenticalPmWrites)
+      applyElideIdenticalPmWrites(module);
   }
 };
 

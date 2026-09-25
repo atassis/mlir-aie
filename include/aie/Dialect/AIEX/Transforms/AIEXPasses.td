@@ -645,6 +645,14 @@ def AIEExpandLoadPdi : Pass<"aie-expand-load-pdi", "mlir::ModuleOp"> {
               "one does not, using reset values from the register database. A "
               "boundary carrying an address the database does not know keeps "
               "its firmware reset.">,
+       Option<"clElideIdenticalPmWrites", "elide-identical-pm-writes", "bool",
+              /*default=*/"false",
+              "Within one runtime sequence, drop a run of >= 8 consecutive "
+              "program-memory blockwrite words whose value a prior segment "
+              "already wrote at the same address. Tracking starts empty at "
+              "each runtime sequence and is never assumed to survive across "
+              "dispatches; a write with no compile-time-readable address or "
+              "data keeps its bytes.">,
   ];
 }
 
