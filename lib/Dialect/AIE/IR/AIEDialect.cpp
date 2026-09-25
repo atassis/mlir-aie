@@ -1459,9 +1459,6 @@ LogicalResult ObjectFifoLinkOp::verify() {
     if (!isJoin())
       return emitError("shared_input_channel requires a join (v1 does not "
                        "support distribute)");
-    if (getTargetModel(getOperation()).getMaxRepeatCount() == 0)
-      return emitError("shared_input_channel requires task-queue repeat, "
-                       "which this device lacks");
 
     std::vector<ObjectFifoCreateOp> ins = getInputObjectFifos();
     Value leaderProdTile = ins.front().getProducerTile();
