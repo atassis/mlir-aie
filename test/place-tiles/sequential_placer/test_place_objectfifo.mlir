@@ -387,12 +387,13 @@ module @linked_fifos_averaged_column {
 // -----
 
 // Two packet-flagged ObjectFifos from one shim are the inputs of the same
-// objectfifo.link (a memtile join): the join declares producer-side sharing
-// (v1 design note, 2026-09-25), so they bill one MM2S channel. A third,
-// ordinary ObjectFifo from the same shim still needs its own channel. Total
-// demand is 2 output channels, which npu1's shim provides -- without the
-// join-group dedup this would read 3 and fail (see
-// @shim_packet_objectfifos_no_join_no_dedup in test_place_errors.mlir).
+// objectfifo.link (a memtile join), and the link opts into producer-side
+// sharing with `shared_input_channel` (v1 design note, 2026-09-25), so they
+// bill one MM2S channel. A third, ordinary ObjectFifo from the same shim
+// still needs its own channel. Total demand is 2 output channels, which
+// npu1's shim provides -- without the join-group dedup this would read 3 and
+// fail (see @shim_packet_objectfifos_no_join_no_dedup and
+// @shim_packet_join_no_attribute_no_dedup in test_place_errors.mlir).
 // CHECK-LABEL: @shim_packet_join_inputs_share_channel
 module @shim_packet_join_inputs_share_channel {
   aie.device(npu1) {
@@ -407,7 +408,7 @@ module @shim_packet_join_inputs_share_channel {
     aie.objectfifo @scales (%shim, {%mem}, 2 : i32) {packet, packet_id = 1 : i8}
       : !aie.objectfifo<memref<16xi32>>
     aie.objectfifo @joined (%mem, {%core}, 2 : i32) : !aie.objectfifo<memref<32xi32>>
-    aie.objectfifo.link [@payload, @scales] -> [@joined] ([0, 16][])
+    aie.objectfifo.link [@payload, @scales] -> [@joined] ([0, 16][]) {shared_input_channel}
 
     aie.objectfifo @plain (%shim, {%c3}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
 

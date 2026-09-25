@@ -223,3 +223,107 @@ aie.device(xcve2302) {
    aie.objectfifo @of_out2 (%tile11, {%tile23}, 2 : i32) : !aie.objectfifo<memref<56xi32>>
    aie.objectfifo.link [ @of_in ] -> [ @of_out1, @of_out2 ] ([] [0, 200])
 }
+
+// -----
+
+// shared_input_channel requires a join (v1 does not support distribute).
+
+// CHECK: error: shared_input_channel requires a join (v1 does not support distribute)
+
+aie.device(npu2) {
+    %shim = aie.tile(0, 0)
+    %mem = aie.tile(0, 1)
+    %core1 = aie.tile(0, 2)
+    %core2 = aie.tile(0, 3)
+
+    aie.objectfifo @of_in (%shim, {%mem}, 2 : i32) {packet, packet_id = 0 : i8} : !aie.objectfifo<memref<48xi32>>
+    aie.objectfifo @of_out1 (%mem, {%core1}, 2 : i32) : !aie.objectfifo<memref<24xi32>>
+    aie.objectfifo @of_out2 (%mem, {%core2}, 2 : i32) : !aie.objectfifo<memref<24xi32>>
+    aie.objectfifo.link [@of_in] -> [@of_out1, @of_out2] ([] [0, 24]) {shared_input_channel}
+}
+
+// -----
+
+// shared_input_channel's producer must be a shim NOC tile.
+
+// CHECK: error: shared_input_channel requires a shim NOC tile producer
+
+aie.device(npu2) {
+    %core0 = aie.tile(0, 2)
+    %mem = aie.tile(0, 1)
+    %core1 = aie.tile(0, 3)
+
+    aie.objectfifo @payload (%core0, {%mem}, 2 : i32) {packet, packet_id = 0 : i8} : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @scales (%core0, {%mem}, 2 : i32) {packet, packet_id = 1 : i8} : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @joined (%mem, {%core1}, 2 : i32) : !aie.objectfifo<memref<32xi32>>
+    aie.objectfifo.link [@payload, @scales] -> [@joined] ([0, 16][]) {shared_input_channel}
+}
+
+// -----
+
+// Every shared_input_channel group member must be packet-flagged.
+
+// CHECK: error: 'aie.objectfifo' op must be packet-flagged to join a shared_input_channel group
+
+aie.device(npu2) {
+    %shim = aie.tile(0, 0)
+    %mem = aie.tile(0, 1)
+    %core = aie.tile(0, 2)
+
+    aie.objectfifo @payload (%shim, {%mem}, 2 : i32) {packet, packet_id = 0 : i8} : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @scales (%shim, {%mem}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @joined (%mem, {%core}, 2 : i32) : !aie.objectfifo<memref<32xi32>>
+    aie.objectfifo.link [@payload, @scales] -> [@joined] ([0, 16][]) {shared_input_channel}
+}
+
+// -----
+
+// Every shared_input_channel group member must share one producer tile.
+
+// CHECK: error: 'aie.objectfifo' op shared_input_channel group members must share one producer tile
+
+aie.device(npu2) {
+    %shim0 = aie.tile(0, 0)
+    %shim1 = aie.tile(1, 0)
+    %mem = aie.tile(0, 1)
+    %core = aie.tile(0, 2)
+
+    aie.objectfifo @payload (%shim0, {%mem}, 2 : i32) {packet, packet_id = 0 : i8} : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @scales (%shim1, {%mem}, 2 : i32) {packet, packet_id = 1 : i8} : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @joined (%mem, {%core}, 2 : i32) : !aie.objectfifo<memref<32xi32>>
+    aie.objectfifo.link [@payload, @scales] -> [@joined] ([0, 16][]) {shared_input_channel}
+}
+
+// -----
+
+// Pinned prod_dma_channels within a shared_input_channel group must agree.
+
+// CHECK: error: 'aie.objectfifo' op pins a prod_dma_channel that differs from another shared_input_channel group member
+
+aie.device(npu2) {
+    %shim = aie.tile(0, 0)
+    %mem = aie.tile(0, 1)
+    %core = aie.tile(0, 2)
+
+    aie.objectfifo @payload (%shim, {%mem}, 2 : i32) {packet, packet_id = 0 : i8, prod_dma_channel = 0 : i32} : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @scales (%shim, {%mem}, 2 : i32) {packet, packet_id = 1 : i8, prod_dma_channel = 1 : i32} : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @joined (%mem, {%core}, 2 : i32) : !aie.objectfifo<memref<32xi32>>
+    aie.objectfifo.link [@payload, @scales] -> [@joined] ([0, 16][]) {shared_input_channel}
+}
+
+// -----
+
+// Pinned packet_ids within a shared_input_channel group must be distinct.
+
+// CHECK: error: 'aie.objectfifo' op shared_input_channel group members must have distinct pinned packet_id values
+
+aie.device(npu2) {
+    %shim = aie.tile(0, 0)
+    %mem = aie.tile(0, 1)
+    %core = aie.tile(0, 2)
+
+    aie.objectfifo @payload (%shim, {%mem}, 2 : i32) {packet, packet_id = 0 : i8} : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @scales (%shim, {%mem}, 2 : i32) {packet, packet_id = 0 : i8} : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @joined (%mem, {%core}, 2 : i32) : !aie.objectfifo<memref<32xi32>>
+    aie.objectfifo.link [@payload, @scales] -> [@joined] ([0, 16][]) {shared_input_channel}
+}

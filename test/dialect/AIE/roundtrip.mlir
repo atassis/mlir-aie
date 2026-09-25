@@ -32,3 +32,17 @@ aie.device(npu1) {
   aie.objectfifo @obj3(%tile_0_1 dimensionsToStream [<size = 8, stride = 4>, <size = 32, stride = 32>, <size = 4, stride = 1>], {%tile_1_2, %tile_1_3}, 4 : i32) : !aie.objectfifo<memref<1024xi32, 1>>
   aie.objectfifo.link [@obj1] -> [@obj2, @obj3]([] [0, 1024])
 }
+
+// -----
+
+// aie.objectfifo.link join with shared_input_channel
+// CHECK: aie.objectfifo.link [@payload, @scales] -> [@joined]([0, 1024] []) {shared_input_channel}
+aie.device(npu2) {
+  %shim = aie.tile(0, 0)
+  %mem = aie.tile(0, 1)
+  %core = aie.tile(0, 2)
+  aie.objectfifo @payload(%shim, {%mem}, 2 : i32) {packet, packet_id = 0 : i8} : !aie.objectfifo<memref<1024xi8>>
+  aie.objectfifo @scales(%shim, {%mem}, 2 : i32) {packet, packet_id = 1 : i8} : !aie.objectfifo<memref<128xi8>>
+  aie.objectfifo @joined(%mem, {%core}, 2 : i32) : !aie.objectfifo<memref<1152xi8>>
+  aie.objectfifo.link [@payload, @scales] -> [@joined]([0, 1024] []) {shared_input_channel}
+}

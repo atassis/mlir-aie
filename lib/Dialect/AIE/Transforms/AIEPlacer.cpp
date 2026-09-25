@@ -617,16 +617,20 @@ SequentialPlacer::buildChannelRequirements(
   }
 
   // Producer-side packet channel sharing is declared on the LINK (v1,
-  // 2026-09-25 design note): source fifos of one objectfifo.link that are
-  // packet-flagged and share a producer tile form one sharing group, billed
-  // as a single MM2S channel. Map each such source fifo's name to its link
-  // op. An unpinned packet fifo outside any join still counts its own
-  // channel -- it is not a group of one, it is simply unshared.
+  // 2026-09-25 design note): a join whose `shared_input_channel` attribute
+  // is set bills its packet-flagged, same-producer-tile source fifos as one
+  // MM2S channel. The attribute is the opt-in; the dialect verifier
+  // (ObjectFifoLinkOp::verify) checks packet/tile/pin/id consistency, so the
+  // placer only needs to read it. An unpinned packet fifo outside a
+  // shared_input_channel join still counts its own channel.
   llvm::DenseMap<llvm::StringRef, Operation *> packetJoinGroup;
-  for (auto linkOp : objectFifoLinks)
+  for (auto linkOp : objectFifoLinks) {
+    if (!linkOp.getSharedInputChannel())
+      continue;
     for (auto srcFifoAttr : linkOp.getFifoIns())
       if (auto sym = dyn_cast<FlatSymbolRefAttr>(srcFifoAttr))
         packetJoinGroup[sym.getValue()] = linkOp.getOperation();
+  }
 
   // Explicitly pinned producer channels still dedup by the literal channel
   // number: two fifos pinned to the same value require the same physical

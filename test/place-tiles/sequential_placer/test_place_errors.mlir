@@ -481,6 +481,36 @@ module @shim_packet_objectfifos_no_join_no_dedup {
 
 // -----
 
+// Same shape as @shim_packet_join_inputs_share_channel in
+// test_place_objectfifo.mlir (two packet fifos, same shim producer, joined
+// at a memtile), but the link does not set `shared_input_channel`: the
+// attribute is the opt-in for sharing (v1 design note, 2026-09-25), so an
+// unadorned join still bills 2 producer-side channels, 3 total against the
+// shim's 2, and placement fails.
+module @shim_packet_join_no_attribute_no_dedup {
+  aie.device(npu1) {
+    // CHECK: error: tile (0, 0) requires 0 input/3 output DMA channels, but only 2 input/2 output available
+    %shim = aie.logical_tile<ShimNOCTile>(0, 0)
+    %mem = aie.logical_tile<MemTile>(?, ?)
+    %core = aie.logical_tile<CoreTile>(?, ?)
+    %c3 = aie.logical_tile<CoreTile>(?, ?)
+
+    aie.objectfifo @payload (%shim, {%mem}, 2 : i32) {packet, packet_id = 0 : i8}
+      : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @scales (%shim, {%mem}, 2 : i32) {packet, packet_id = 1 : i8}
+      : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @joined (%mem, {%core}, 2 : i32) : !aie.objectfifo<memref<32xi32>>
+    aie.objectfifo.link [@payload, @scales] -> [@joined] ([0, 16][])
+
+    aie.objectfifo @plain (%shim, {%c3}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
+
+    aie.core(%core) { aie.end }
+    aie.core(%c3) { aie.end }
+  }
+}
+
+// -----
+
 // Consumer-side packet ObjectFifos are never merged (sharing is a
 // producer-side property, v1 design note): three packet-flagged fifos from
 // three different shims into one core require 3 input channels against the

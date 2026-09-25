@@ -1451,6 +1451,49 @@ LogicalResult ObjectFifoLinkOp::verify() {
                        "semaphore locks, which this device lacks");
   }
 
+  // shared_input_channel (v1 design note, 2026-09-25): the join's inputs
+  // share one packet-switched shim MM2S channel, interleaved object by
+  // object by the runtime sequence. Declared on the link, not on the
+  // fifos, so it is checkable in one place.
+  if (getSharedInputChannel()) {
+    if (!isJoin())
+      return emitError("shared_input_channel requires a join (v1 does not "
+                       "support distribute)");
+    if (getTargetModel(getOperation()).getMaxRepeatCount() == 0)
+      return emitError("shared_input_channel requires task-queue repeat, "
+                       "which this device lacks");
+
+    std::vector<ObjectFifoCreateOp> ins = getInputObjectFifos();
+    Value leaderProdTile = ins.front().getProducerTile();
+    TileLike leaderTile =
+        llvm::dyn_cast<TileLike>(leaderProdTile.getDefiningOp());
+    if (!leaderTile || !leaderTile.isShimNOCTile())
+      return emitError("shared_input_channel requires a shim NOC tile "
+                       "producer");
+
+    std::optional<int32_t> pinned;
+    llvm::SmallSet<int8_t, 4> packetIds;
+    for (ObjectFifoCreateOp in : ins) {
+      if (!in.getPacket())
+        return in.emitOpError(
+            "must be packet-flagged to join a shared_input_channel group");
+      if (in.getProducerTile() != leaderProdTile)
+        return in.emitOpError("shared_input_channel group members must "
+                              "share one producer tile");
+      if (auto ch = in.getProdDmaChannel()) {
+        if (pinned && *pinned != *ch)
+          return in.emitOpError(
+              "pins a prod_dma_channel that differs from another "
+              "shared_input_channel group member");
+        pinned = ch;
+      }
+      if (auto id = in.getPacketId(); id && !packetIds.insert(*id).second)
+        return in.emitOpError(
+            "shared_input_channel group members must have distinct "
+            "pinned packet_id values");
+    }
+  }
+
   if (isJoin()) {
     if (getFifoIns().size() != getSrcOffsets().size())
       return emitOpError("number of provided src offsets must be equal "

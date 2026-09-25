@@ -2473,11 +2473,27 @@ def AIE_ObjectFifoLinkOp : AIE_Op<"objectfifo.link", [HasParent<"DeviceOp">]> {
 
     Join and distribute hand each participant its own slice of the shared object, so the link point must have a memory module
     to hold that object and the device must have counting locks to guard the slices independently.
+
+    `shared_input_channel` declares that the join's input objectFifos share one producer-side MM2S
+    channel, packet-switched and interleaved object by object. It requires a join (v1 does not
+    support distribute), every input packet-flagged, one shared shim NOC producer tile, and a
+    device with task-queue repeat (AIE1 lacks it).
+
+    ```
+      aie.objectfifo @payload (%shim, {%mem}, 2 : i32) {packet, packet_id = 0 : i8} : !aie.objectfifo<memref<1024xi8>>
+      aie.objectfifo @scales  (%shim, {%mem}, 2 : i32) {packet, packet_id = 1 : i8} : !aie.objectfifo<memref<128xi8>>
+      aie.objectfifo @joined  (%mem, {%core}, 2 : i32) : !aie.objectfifo<memref<1152xi8>>
+      aie.objectfifo.link [@payload, @scales] -> [@joined] ([0, 1024][]) {shared_input_channel}
+    ```
   }];
 
-  let arguments = (ins SymbolRefArrayAttr:$fifoIns,
-      SymbolRefArrayAttr:$fifoOuts, I64ArrayAttr:$src_offsets,
-      I64ArrayAttr:$dst_offsets);
+  let arguments = (
+    ins SymbolRefArrayAttr:$fifoIns,
+        SymbolRefArrayAttr:$fifoOuts,
+        I64ArrayAttr:$src_offsets,
+        I64ArrayAttr:$dst_offsets,
+        UnitAttr:$shared_input_channel
+  );
 
   let hasCustomAssemblyFormat = 1;
 
