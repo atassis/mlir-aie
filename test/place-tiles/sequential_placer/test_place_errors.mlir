@@ -401,7 +401,7 @@ module @buffer_adjacency_star_oversubscribed {
 
 // -----
 
-// Same shape as @shim_packet_objectfifos_share_channel in
+// Same shape as @shim_packet_join_inputs_share_channel in
 // test_place_objectfifo.mlir, but none of the three ObjectFifos is
 // packet-flagged: no dedup applies, so three producer-side channels are
 // required against the shim's 2, and placement fails.
@@ -446,5 +446,61 @@ module @shim_packet_objectfifos_distinct_pinned_channels_no_dedup {
     aie.core(%c1) { aie.end }
     aie.core(%c2) { aie.end }
     aie.core(%c3) { aie.end }
+  }
+}
+
+
+// -----
+
+// Two packet-flagged ObjectFifos from one shim, each going to a SEPARATE
+// consumer with no objectfifo.link between them: sharing is declared on a
+// join (v1 design note, 2026-09-25), so being packet-flagged and unpinned is
+// not by itself enough to share a channel. Still 3 output channels against
+// the shim's 2, and placement fails -- this is the case
+// @shim_packet_join_inputs_share_channel in test_place_objectfifo.mlir
+// reverses by adding the join.
+module @shim_packet_objectfifos_no_join_no_dedup {
+  aie.device(npu1) {
+    // CHECK: error: tile (0, 0) requires 0 input/3 output DMA channels, but only 2 input/2 output available
+    %shim = aie.logical_tile<ShimNOCTile>(0, 0)
+    %c1 = aie.logical_tile<CoreTile>(?, ?)
+    %c2 = aie.logical_tile<CoreTile>(?, ?)
+    %c3 = aie.logical_tile<CoreTile>(?, ?)
+
+    aie.objectfifo @payload (%shim, {%c1}, 2 : i32) {packet, packet_id = 0 : i8}
+      : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @scales (%shim, {%c2}, 2 : i32) {packet, packet_id = 1 : i8}
+      : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @plain (%shim, {%c3}, 2 : i32) : !aie.objectfifo<memref<16xi32>>
+
+    aie.core(%c1) { aie.end }
+    aie.core(%c2) { aie.end }
+    aie.core(%c3) { aie.end }
+  }
+}
+
+// -----
+
+// Consumer-side packet ObjectFifos are never merged (sharing is a
+// producer-side property, v1 design note): three packet-flagged fifos from
+// three different shims into one core require 3 input channels against the
+// core's 2, and placement fails.
+module @packet_consumer_side_not_merged {
+  aie.device(npu1) {
+    %shim1 = aie.logical_tile<ShimNOCTile>(?, ?)
+    %shim2 = aie.logical_tile<ShimNOCTile>(?, ?)
+    %shim3 = aie.logical_tile<ShimNOCTile>(?, ?)
+
+    // CHECK: error: tile (0, 3) requires 3 input/0 output DMA channels, but only 2 input/2 output available
+    %core = aie.logical_tile<CoreTile>(?, ?)
+
+    aie.objectfifo @in1 (%shim1, {%core}, 2 : i32) {packet, packet_id = 0 : i8}
+      : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @in2 (%shim2, {%core}, 2 : i32) {packet, packet_id = 1 : i8}
+      : !aie.objectfifo<memref<16xi32>>
+    aie.objectfifo @in3 (%shim3, {%core}, 2 : i32) {packet, packet_id = 2 : i8}
+      : !aie.objectfifo<memref<16xi32>>
+
+    aie.core(%core) { aie.end }
   }
 }

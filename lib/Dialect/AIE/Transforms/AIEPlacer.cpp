@@ -616,12 +616,23 @@ SequentialPlacer::buildChannelRequirements(
         linkedAsDest.insert(sym.getValue());
   }
 
-  // Packet-flagged ObjectFifos share one DMA channel per (tile, direction,
-  // pinned channel or -1 for auto-assign), mirroring
-  // addChannelRequirementsFromFlows' (tile, channel) dedup -- done here by
-  // bucket rather than channel because ObjectFifoCreateOps have none
-  // assigned yet at placer time.
-  llvm::DenseSet<std::pair<Operation *, int>> seenPacketOut, seenPacketIn;
+  // Producer-side packet channel sharing is declared on the LINK (v1,
+  // 2026-09-25 design note): source fifos of one objectfifo.link that are
+  // packet-flagged and share a producer tile form one sharing group, billed
+  // as a single MM2S channel. Map each such source fifo's name to its link
+  // op. An unpinned packet fifo outside any join still counts its own
+  // channel -- it is not a group of one, it is simply unshared.
+  llvm::DenseMap<llvm::StringRef, Operation *> packetJoinGroup;
+  for (auto linkOp : objectFifoLinks)
+    for (auto srcFifoAttr : linkOp.getFifoIns())
+      if (auto sym = dyn_cast<FlatSymbolRefAttr>(srcFifoAttr))
+        packetJoinGroup[sym.getValue()] = linkOp.getOperation();
+
+  // Explicitly pinned producer channels still dedup by the literal channel
+  // number: two fifos pinned to the same value require the same physical
+  // channel by construction, independent of the join grouping above.
+  llvm::DenseSet<std::pair<Operation *, int>> seenPinnedPacketOut;
+  llvm::DenseSet<std::pair<Operation *, Operation *>> seenPacketJoinGroup;
 
   // Count channels for every ObjectFifo, omitting only the link-tile side of
   // linked fifos. The off-link-tile endpoint still needs DMA: a shim that
@@ -639,11 +650,7 @@ SequentialPlacer::buildChannelRequirements(
     // Check if ANY consumer is a different tile type (needs DMA channel)
     bool producerNeedsDMA = false;
 
-    std::optional<ArrayRef<int32_t>> consChannels =
-        isPacket ? ofOp.getConsDmaChannels() : std::nullopt;
-
-    for (auto [consumerIndex, consumerTile] :
-         llvm::enumerate(ofOp.getConsumerTiles())) {
+    for (Value consumerTile : ofOp.getConsumerTiles()) {
       auto *consumerOp = consumerTile.getDefiningOp();
       auto consumerLogicalTile = dyn_cast_or_null<LogicalTileOp>(consumerOp);
 
@@ -655,18 +662,12 @@ SequentialPlacer::buildChannelRequirements(
         continue;
 
       // This consumer needs a DMA channel (unless it's the link tile, which
-      // the link loop credits separately).
-      if (consumerOp && !skipConsumerSide) {
-        if (isPacket) {
-          int channel = consChannels && consumerIndex < consChannels->size()
-                            ? (*consChannels)[consumerIndex]
-                            : -1;
-          if (seenPacketIn.insert({consumerOp, channel}).second)
-            channelRequirements[consumerOp].first++; // input++
-        } else {
-          channelRequirements[consumerOp].first++; // input++
-        }
-      }
+      // the link loop credits separately). Packet or not: sharing is a
+      // producer-side property (v1 design note), so each consumer endpoint
+      // still draws its own channel -- a join's two S2MM inputs are real,
+      // distinct channels.
+      if (consumerOp && !skipConsumerSide)
+        channelRequirements[consumerOp].first++; // input++
 
       producerNeedsDMA = true;
     }
@@ -675,9 +676,16 @@ SequentialPlacer::buildChannelRequirements(
     // producer IS the link tile of an outgoing linked dest fifo).
     if (producerNeedsDMA && producerOp && !skipProducerSide) {
       if (isPacket) {
-        int channel = ofOp.getProdDmaChannel().value_or(-1);
-        if (seenPacketOut.insert({producerOp, channel}).second)
+        if (std::optional<int32_t> pinned = ofOp.getProdDmaChannel()) {
+          if (seenPinnedPacketOut.insert({producerOp, *pinned}).second)
+            channelRequirements[producerOp].second++; // output++
+        } else if (Operation *joinOp =
+                       packetJoinGroup.lookup(ofOp.getSymName())) {
+          if (seenPacketJoinGroup.insert({producerOp, joinOp}).second)
+            channelRequirements[producerOp].second++; // output++
+        } else {
           channelRequirements[producerOp].second++; // output++
+        }
       } else {
         channelRequirements[producerOp].second++; // output++
       }
