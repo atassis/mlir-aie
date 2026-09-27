@@ -154,6 +154,15 @@ struct AIEObjectFifoAllocatePass
                         [&](Value user) { return canAccess(user, tile); });
   }
 
+  /// How many buffers a pool lowers to and the bytes of each: one per object,
+  /// or a single ring holding every object for a pool using iterate_bds.
+  std::pair<int, int64_t> bufferShape(ObjectFifoPoolOp pool) {
+    int64_t objectBytes = pool.getObjectSizeInBytes();
+    if (pool.getIterateBds())
+      return {1, objectBytes * pool.getDepth()};
+    return {pool.getDepth(), objectBytes};
+  }
+
   Value lockPlacement(ObjectFifoPoolOp pool, Operation *group) {
     if (Value placed = lockPlacements.lookup(group))
       return placed;
@@ -172,8 +181,9 @@ struct AIEObjectFifoAllocatePass
       if (!localPools.contains(pool))
         continue;
       Value tile = localPools.lookup(pool);
-      int count = pool.getBuffers() ? 0 : pool.getDepth();
-      int64_t size = pool.getObjectSizeInBytes();
+      auto [count, size] = bufferShape(pool);
+      if (pool.getBuffers())
+        count = 0;
       if (!canAccess(pool.getTile(), tile) ||
           !canPlace(pool, tile, size, count)) {
         bufferFailure = pool;
@@ -199,17 +209,17 @@ struct AIEObjectFifoAllocatePass
       }
       if (pool.getTileLike().isShimTile())
         continue;
-      for (int i = 0; i < pool.getDepth(); ++i) {
-        Value tile = localPools.contains(pool)
-                         ? localPools.lookup(pool)
-                         : placementFor(pool, pool.getObjectSizeInBytes());
+      auto [count, size] = bufferShape(pool);
+      for (int i = 0; i < count; ++i) {
+        Value tile = localPools.contains(pool) ? localPools.lookup(pool)
+                                               : placementFor(pool, size);
         if (!tile) {
           bufferFailure = pool;
           return failure();
         }
         bufferPlacements[pool].push_back(tile);
         if (!localPools.contains(pool))
-          plannedMemory[tile].push_back(pool.getObjectSizeInBytes());
+          plannedMemory[tile].push_back(size);
       }
     }
     return success();
@@ -231,7 +241,8 @@ struct AIEObjectFifoAllocatePass
     if (canPlace(pool, homeTile, sizeBytes)) {
       return homeTile;
     }
-    if (!home.isMemTile())
+    // A ring buffer is addressed as one run, so it cannot spill in parts.
+    if (!home.isMemTile() || pool.getIterateBds())
       return {};
 
     auto homeOp = dyn_cast<TileOp>(home.getOperation());
@@ -288,17 +299,23 @@ struct AIEObjectFifoAllocatePass
 
     auto initValues = pool.getInitValues();
     StringRef base = pool.getBaseName();
+    bool ring = pool.getIterateBds();
+    MemRefType type = pool.getElemType();
+    if (ring)
+      type = MemRefType::get({pool.getDepth() * pool.getObjectSize()},
+                             type.getElementType());
 
     SmallVector<Attribute> names;
-    for (int i = 0; i < pool.getDepth(); i++) {
+    for (int i = 0, e = bufferShape(pool).first; i < e; i++) {
       ElementsAttr init =
           initValues ? cast<ElementsAttr>((*initValues)[i]) : nullptr;
-      std::string name = (base + "_buff_" + std::to_string(i)).str();
+      std::string name = ring ? (base + "_buff").str()
+                              : (base + "_buff_" + std::to_string(i)).str();
       Value placement = bufferPlacements[pool][i];
       setInsertionPointOn(placement);
       lastPlaced[placement] = BufferOp::create(
-          builder, pool.getLoc(), pool.getElemType(), placement,
-          builder.getStringAttr(name), /*address=*/nullptr, init,
+          builder, pool.getLoc(), type, placement, builder.getStringAttr(name),
+          /*address=*/nullptr, init,
           /*mem_bank=*/nullptr, /*core_data=*/nullptr, /*aligned=*/nullptr,
           // Every slot of one pool is live at once -- that is what depth
           // means -- so they all take the pool's group and are laid out one
@@ -866,6 +883,7 @@ struct AIEObjectFifoAllocatePass
     for (auto &[fifoName, users] : usersByFifo) {
       SmallVector<Value> channelTiles, lockValues;
       SmallVector<int32_t> channelDirs, channelIndices, lockInits;
+      bool iterating = false;
 
       for (auto endpoint : device.getOps<RouteEndpoint>()) {
         std::optional<int> channel = endpoint.getRouteChannel();
@@ -873,6 +891,9 @@ struct AIEObjectFifoAllocatePass
             tileOf(endpoint).isShimTile() || !channel) {
           continue;
         }
+        if (auto dma =
+                dyn_cast<ObjectFifoDmaEndpointOp>(endpoint.getOperation()))
+          iterating |= dma.getPoolOp().getIterateBds();
         channelTiles.push_back(endpoint.getTile());
         channelDirs.push_back(
             static_cast<int32_t>(endpoint.getRouteDirection()));
@@ -882,10 +903,21 @@ struct AIEObjectFifoAllocatePass
         if (pool.getFifoName() != fifoName || pool.getTileLike().isShimTile()) {
           continue;
         }
+        iterating |= pool.getIterateBds();
         for (LockOp lock : pool.getLockOps()) {
           lockValues.push_back(lock.getResult());
           lockInits.push_back(lock.getInit().value_or(0));
         }
+      }
+
+      // Re-arming restores locks and head BDs, not where each BD's iteration
+      // has stepped to.
+      if (iterating) {
+        for (Operation *user : users) {
+          user->emitOpError()
+              << "cannot re-arm a fifo whose pool uses iterate_bds";
+        }
+        return failure();
       }
 
       if (channelTiles.empty() && lockValues.empty()) {
@@ -1101,9 +1133,10 @@ struct AIEObjectFifoAllocatePass
         memTilePools.push_back(pool);
       }
     }
-    llvm::stable_sort(memTilePools, [](ObjectFifoPoolOp a, ObjectFifoPoolOp b) {
-      return a.getObjectSizeInBytes() > b.getObjectSizeInBytes();
-    });
+    llvm::stable_sort(memTilePools,
+                      [&](ObjectFifoPoolOp a, ObjectFifoPoolOp b) {
+                        return bufferShape(a).second > bufferShape(b).second;
+                      });
     for (auto [slot, pool] : llvm::zip(memTileSlots, memTilePools)) {
       pools[slot] = pool;
     }
@@ -1140,9 +1173,18 @@ struct AIEObjectFifoAllocatePass
     if (failed(allocated)) {
       localPools.clear();
       if (failed(planBuffers(pools))) {
-        bufferFailure.emitOpError(
-            "could not place buffers in accessible memory with available "
-            "capacity");
+        if (bufferFailure.getIterateBds()) {
+          int64_t capacity = device.getTargetModel().getMemTileSize();
+          bufferFailure.emitOpError("iterate_bds needs one ")
+              << bufferShape(bufferFailure).second
+              << "-byte buffer on its MemTile, which has "
+              << capacity - memoryUsed(bufferFailure.getTile())
+              << " bytes free";
+        } else {
+          bufferFailure.emitOpError(
+              "could not place buffers in accessible memory with available "
+              "capacity");
+        }
       } else if (failed(planLocks(pools))) {
         if (lockAccessFailure)
           lockAccessFailure->emitOpError("cannot access pool locks");
