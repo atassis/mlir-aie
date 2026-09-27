@@ -101,7 +101,8 @@ struct AIEObjectFifoLowerDMAsPass
   }
 
   /// Buffer-major, segment-minor: the DMA walks the objects in turn, and within
-  /// each object the slices this endpoint is responsible for.
+  /// each object the slices this endpoint is responsible for. An iterate_bds
+  /// pool has one buffer, so this is one descriptor per segment.
   SmallVector<Descriptor> descriptorsFor(ObjectFifoDmaEndpointOp endpoint,
                                          ArrayRef<Value> buffers, bool drains) {
     std::vector<ObjectFifoSegmentOp> segments = endpoint.getSelectedSegments();
@@ -166,17 +167,24 @@ struct AIEObjectFifoLowerDMAsPass
                             packet->getPktId());
     }
 
+    DMABDOp bd;
     if (descriptor.dimensions && drains && descriptor.padding) {
-      DMABDOp::create(builder, loc, descriptor.buffer, descriptor.offset,
-                      paddedSize(descriptor.dimensions, descriptor.padding,
-                                 descriptor.size),
-                      descriptor.dimensions, descriptor.padding);
+      bd = DMABDOp::create(builder, loc, descriptor.buffer, descriptor.offset,
+                           paddedSize(descriptor.dimensions, descriptor.padding,
+                                      descriptor.size),
+                           descriptor.dimensions, descriptor.padding);
     } else if (descriptor.dimensions) {
-      DMABDOp::create(builder, loc, descriptor.buffer, descriptor.offset,
-                      descriptor.size, descriptor.dimensions);
+      bd = DMABDOp::create(builder, loc, descriptor.buffer, descriptor.offset,
+                           descriptor.size, descriptor.dimensions);
     } else {
-      DMABDOp::create(builder, loc, descriptor.buffer, descriptor.offset,
-                      descriptor.size);
+      bd = DMABDOp::create(builder, loc, descriptor.buffer, descriptor.offset,
+                           descriptor.size);
+    }
+    // Each execution of the BD steps to the next object in the ring.
+    if (pool.getIterateBds() && pool.getDepth() > 1) {
+      bd.setIterationAttr(BDIterationAttr::get(
+          builder.getContext(), pool.getDepth(), pool.getObjectSize(),
+          /*current=*/0));
     }
 
     if (releaseLock) {

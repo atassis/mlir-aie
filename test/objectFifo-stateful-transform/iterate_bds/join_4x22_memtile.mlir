@@ -27,7 +27,7 @@
 // CHECK-NEXT: ^[[IN1]]:
 // CHECK-NEXT: arith.constant 1 : i32
 // CHECK-NEXT: aie.use_lock(%[[P1:[a-z0-9_]+]], AcquireGreaterEqual, %{{.*}})
-// CHECK-NEXT: aie.dma_bd(%[[BUF]] : memref<253440xi8> offset = 0 len = 2304) {iteration = #aie.bd_iteration<size = 22, stride = 11520, current = 0>}
+// CHECK-NEXT: aie.dma_bd(%[[BUF]] : memref<253440xi8> offset = 2304 len = 2304) {iteration = #aie.bd_iteration<size = 22, stride = 11520, current = 0>}
 // CHECK-NEXT: arith.constant 1 : i32
 // CHECK-NEXT: aie.use_lock(%[[C1:[a-z0-9_]+]], Release, %{{.*}})
 // CHECK-NEXT: aie.next_bd ^[[IN1]]
@@ -36,7 +36,7 @@
 // CHECK-NEXT: ^[[IN2]]:
 // CHECK-NEXT: arith.constant 1 : i32
 // CHECK-NEXT: aie.use_lock(%[[P2:[a-z0-9_]+]], AcquireGreaterEqual, %{{.*}})
-// CHECK-NEXT: aie.dma_bd(%[[BUF]] : memref<253440xi8> offset = 0 len = 2304) {iteration = #aie.bd_iteration<size = 22, stride = 11520, current = 0>}
+// CHECK-NEXT: aie.dma_bd(%[[BUF]] : memref<253440xi8> offset = 4608 len = 2304) {iteration = #aie.bd_iteration<size = 22, stride = 11520, current = 0>}
 // CHECK-NEXT: arith.constant 1 : i32
 // CHECK-NEXT: aie.use_lock(%[[C2:[a-z0-9_]+]], Release, %{{.*}})
 // CHECK-NEXT: aie.next_bd ^[[IN2]]
@@ -45,7 +45,7 @@
 // CHECK-NEXT: ^[[IN3]]:
 // CHECK-NEXT: arith.constant 1 : i32
 // CHECK-NEXT: aie.use_lock(%[[P3:[a-z0-9_]+]], AcquireGreaterEqual, %{{.*}})
-// CHECK-NEXT: aie.dma_bd(%[[BUF]] : memref<253440xi8> offset = 0 len = 4608) {iteration = #aie.bd_iteration<size = 22, stride = 11520, current = 0>}
+// CHECK-NEXT: aie.dma_bd(%[[BUF]] : memref<253440xi8> offset = 6912 len = 4608) {iteration = #aie.bd_iteration<size = 22, stride = 11520, current = 0>}
 // CHECK-NEXT: arith.constant 1 : i32
 // CHECK-NEXT: aie.use_lock(%[[C3:[a-z0-9_]+]], Release, %{{.*}})
 // CHECK-NEXT: aie.next_bd ^[[IN3]]
