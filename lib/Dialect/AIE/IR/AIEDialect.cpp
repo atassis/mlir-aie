@@ -633,6 +633,12 @@ LogicalResult ObjectFifoCreateOp::verify() {
       return emitError("`iter_count` must be between 1 and 256");
   }
 
+  if (getIterateBds()) {
+    if (std::optional<StringRef> conflict = getIterateBdsConflict())
+      return emitOpError("`") << *conflict
+                              << "` cannot be combined with `iterate_bds`";
+  }
+
   if (auto consumerElemType = getConsumerElemType()) {
     auto consType = llvm::dyn_cast<AIEObjectFifoType>(*consumerElemType);
     if (!consType)
@@ -661,6 +667,22 @@ LogicalResult ObjectFifoCreateOp::verify() {
 
 TileOp ObjectFifoCreateOp::getProducerTileOp() {
   return cast<TileOp>(getProducerTile().getDefiningOp());
+}
+
+std::optional<StringRef> ObjectFifoCreateOp::getIterateBdsConflict() {
+  if (getRepeatCount())
+    return StringRef("repeat_count");
+  if (getIterCount())
+    return StringRef("iter_count");
+  if (getInitValues())
+    return StringRef("init_values");
+  if (getPadDimensions())
+    return StringRef("padDimensions");
+  if (getDisableSynchronization())
+    return StringRef("disable_synchronization");
+  if (getPacket())
+    return StringRef("packet");
+  return std::nullopt;
 }
 
 //===----------------------------------------------------------------------===//
@@ -710,7 +732,36 @@ LogicalResult ObjectFifoPoolOp::verify() {
     }
   }
 
-  if (auto buffers = getBuffers()) {
+  if (getIterateBds()) {
+    TileLike tile = getTileLike();
+    if (!tile || !tile.isMemTile()) {
+      return emitOpError("iterate_bds requires a pool on a MemTile");
+    }
+    if (!target.hasProperty(AIETargetModel::UsesBDIteration)) {
+      return emitOpError("iterate_bds requires BD iteration, which this "
+                         "device lacks");
+    }
+    int64_t steps = int64_t(1)
+                    << target.getDmaBdIterBits(AIETileType::MemTile);
+    if (getDepth() > steps) {
+      return emitOpError("iterate_bds depth ")
+             << getDepth() << " exceeds the " << steps
+             << " steps of a BD's iteration";
+    }
+    for (auto [set, name] :
+         {std::pair{getRepeatCount().has_value(), "repeatCount"},
+          std::pair{getInitValues().has_value(), "initValues"},
+          std::pair{getDisableSynchronization(), "disableSynchronization"}}) {
+      if (set) {
+        return emitOpError("iterate_bds cannot be combined with '")
+               << name << "'";
+      }
+    }
+    if (auto buffers = getBuffers(); buffers && buffers->size() != 1) {
+      return emitOpError("iterate_bds expects one buffer holding every "
+                         "object");
+    }
+  } else if (auto buffers = getBuffers()) {
     if (static_cast<int64_t>(buffers->size()) != getDepth()) {
       return emitOpError("expects 'depth' buffers");
     }
@@ -883,6 +934,11 @@ LogicalResult ObjectFifoCoreEndpointOp::verify() {
   if (!pool) {
     return emitOpError("references undefined pool '") << getPool() << "'";
   }
+  if (pool.getIterateBds()) {
+    return emitOpError("cannot access pool '")
+           << getPool() << "': its iterate_bds objects are addressed only by "
+           << "a DMA";
+  }
   if (failed(verifyEndpoint(*this, pool, getSegments()))) {
     return failure();
   }
@@ -954,6 +1010,17 @@ LogicalResult ObjectFifoDmaEndpointOp::verify() {
 
   if (failed(verifyEndpoint(*this, pool, getSegments()))) {
     return failure();
+  }
+
+  if (pool.getIterateBds()) {
+    if (getPadDimensions() || getIterCount()) {
+      return emitOpError(getPadDimensions() ? "padDimensions" : "iterCount")
+             << " cannot be combined with a pool using iterate_bds";
+    }
+    if (getPacket()) {
+      return emitOpError(
+          "packet header cannot be combined with a pool using iterate_bds");
+    }
   }
 
   std::optional<ArrayAttr> segmentNames = getSegments();

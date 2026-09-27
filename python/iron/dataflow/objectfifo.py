@@ -134,6 +134,7 @@ class ObjectFifo(Resolvable):
         stream_len_decoupled: bool = False,
 
         alloc_group: str | None = None,
+        iterate_bds: bool = False,
     ):
         """Construct an ObjectFifo.
 
@@ -213,6 +214,10 @@ class ObjectFifo(Resolvable):
                 groups share one region sized at the largest group's total. That is what lets
                 a second mode-selected topology coexist without paying full L1. Only
                 ``basic-sequential`` allocation implements the overlay. Defaults to None.
+            iterate_bds (bool, optional): Hold the MemTile pool of the link this fifo takes
+                part in (a ``join()``, ``split()`` or ``forward()``) in one buffer, moved by one
+                iterating buffer descriptor per DMA channel and segment instead of one per
+                object. Flagging any fifo of the link flags its pool. Defaults to False.
 
         Raises:
             ValueError: If ``depth`` is provided and is less than 1.
@@ -252,6 +257,7 @@ class ObjectFifo(Resolvable):
         self._stream_len_decoupled: bool = stream_len_decoupled
 
         self._alloc_group: str | None = alloc_group
+        self._iterate_bds: bool = iterate_bds
 
     @property
     def depth(self) -> int | None:
@@ -548,6 +554,9 @@ class ObjectFifo(Resolvable):
 
             if self._alloc_group is not None:
                 op.set_alloc_group(self._alloc_group)
+
+            if self._iterate_bds:
+                op.set_iterate_bds()
 
             # Pin DMA channels requested on the handles. The producer channel
             # and one channel per consumer (-1 = auto-assign that consumer) are

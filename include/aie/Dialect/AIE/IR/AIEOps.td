@@ -2299,6 +2299,12 @@ def AIE_ObjectFifoCreateOp
     through all of its buffers. The total number of objects transferred is
     `iter_count * elemNumber * repeat_count`, which for `repeat_count == 1`
     simplifies to `iter_count * elemNumber`.
+
+    `iterate_bds` asks for the pool of the link this fifo takes part in, which
+    must sit on a MemTile, to hold its objects in one buffer and to be moved by
+    one iterating buffer descriptor per DMA channel and segment rather than one
+    per object. It cannot be combined with `repeat_count`, `iter_count`,
+    `init_values`, `padDimensions`, `disable_synchronization` or `packet`.
   }];
 
   let arguments = (ins SymbolNameAttr:$sym_name, Index:$producerTile,
@@ -2351,7 +2357,8 @@ def AIE_ObjectFifoCreateOp
       // at the same time, so the allocator overlays them and they share one
       // region sized at the larger fifo's total. See aie.buffer's alloc_group
       // for what is asserted and what is checked.
-      OptionalAttr<StrAttr>:$alloc_group);
+      OptionalAttr<StrAttr>:$alloc_group,
+      UnitAttr:$iterate_bds);
 
   let assemblyFormat = [{
     $sym_name
@@ -2394,6 +2401,10 @@ def AIE_ObjectFifoCreateOp
         return ct.value();
       return getElemType();
     }
+
+    /// The first attribute set here that a link pool using `iterate_bds`
+    /// cannot honour, if any.
+    std::optional<llvm::StringRef> getIterateBdsConflict();
   }];
 
   let builders = [OpBuilder<
@@ -2576,6 +2587,11 @@ def AIE_ObjectFifoPoolOp
     `buffers` and `locks` are filled in by `--aie-objectfifo-allocate`, which
     leaves alone whatever is already named.
 
+    A pool marked `iterateBds` sits on a MemTile and holds its objects back to
+    back in a single buffer; each endpoint moves it with one buffer descriptor
+    per segment whose `iteration` steps through the objects, so no core may
+    access it.
+
     Example:
     ```
       aie.objectfifo.pool @pool(%tile) {
@@ -2607,7 +2623,8 @@ def AIE_ObjectFifoPoolOp
       // Allocation group carried down from the objectFifo, stamped onto every
       // buffer `--aie-objectfifo-allocate` creates here. See aie.buffer's
       // alloc_group for what it asserts.
-      OptionalAttr<StrAttr>:$allocGroup);
+      OptionalAttr<StrAttr>:$allocGroup,
+      UnitAttr:$iterateBds);
 
   let regions = (region SizedRegion<1>:$segments);
 

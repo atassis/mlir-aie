@@ -715,6 +715,9 @@ class object_fifo(ObjectFifoCreateOp):
     def set_alloc_group(self, group):
         self.attributes["alloc_group"] = StringAttr.get(group)
 
+    def set_iterate_bds(self):
+        self.attributes["iterate_bds"] = UnitAttr.get()
+
     def set_prod_dma_channel(self, channel):
         self.attributes["prod_dma_channel"] = IntegerAttr.get(T.i32(), channel)
 

@@ -145,6 +145,20 @@ int objectCountOn(DeviceOp device, Value tile, ObjectFifoCreateOp objFifo) {
   return maxAcquire + 1;
 }
 
+std::vector<ObjectFifoCreateOp> linkParticipants(ObjectFifoLinkOp linkOp) {
+  std::vector<ObjectFifoCreateOp> fifos = linkOp.getInputObjectFifos();
+  llvm::append_range(fifos, linkOp.getOutputObjectFifos());
+  return fifos;
+}
+
+/// One pool serves the whole link, so a flag on any participant is a flag on
+/// that pool.
+bool linkIteratesBds(ObjectFifoLinkOp linkOp) {
+  return llvm::any_of(linkParticipants(linkOp), [](ObjectFifoCreateOp fifo) {
+    return fifo.getIterateBds();
+  });
+}
+
 bool hasCoreAccess(DeviceOp device, Value tile, ObjectFifoCreateOp objFifo,
                    ObjectFifoPort port) {
   for (auto coreOp : device.getOps<CoreOp>()) {
@@ -455,6 +469,50 @@ struct AIEObjectFifoSplitPass
   /// (declared on the link; see ObjectFifoLinkOp::verify).
   DenseMap<Operation *, std::string> sharedChannelLeaderName;
 
+  /// iterate_bds describes a link's pool on a MemTile, where no core reaches
+  /// the objects, and that pool has to honour every fifo of the link.
+  LogicalResult verifyIterateBds() {
+    for (auto fifo : device.getOps<ObjectFifoCreateOp>()) {
+      if (!fifo.getIterateBds()) {
+        continue;
+      }
+      bool viaMemTile = false;
+      for (auto linkOp : device.getOps<ObjectFifoLinkOp>()) {
+        if (!llvm::is_contained(linkParticipants(linkOp), fifo)) {
+          continue;
+        }
+        auto sharedTile = linkOp.getOptionalSharedTile();
+        viaMemTile = sharedTile &&
+                     cast<TileLike>(sharedTile->getDefiningOp()).isMemTile();
+        if (!viaMemTile) {
+          break;
+        }
+      }
+      if (!viaMemTile) {
+        return fifo.emitOpError(
+            "iterate_bds applies only to a link through a MemTile");
+      }
+    }
+
+    for (auto linkOp : device.getOps<ObjectFifoLinkOp>()) {
+      if (!linkIteratesBds(linkOp)) {
+        continue;
+      }
+      for (ObjectFifoCreateOp fifo : linkParticipants(linkOp)) {
+        if (std::optional<StringRef> conflict = fifo.getIterateBdsConflict()) {
+          return fifo.emitOpError("`")
+                 << *conflict
+                 << "` cannot be combined with a link using `iterate_bds`";
+        }
+        if (auto alloc = getOptionalAllocateOp(fifo)) {
+          return alloc->emitOpError(
+              "cannot be combined with a link using `iterate_bds`");
+        }
+      }
+    }
+    return success();
+  }
+
   /// Ends of a linked fifo that resolve to the link's shared pool.
   DenseMap<Operation *, PoolRef> linkedProducerEnd;
   DenseMap<Operation *, PoolRef> linkedConsumerEnd;
@@ -571,6 +629,7 @@ void AIEObjectFifoSplitPass::createLinkPools() {
                            /*holdsInitialContents=*/ownerIsOutput,
                            linkOp.getRepeatCount(), streamLenDecoupled,
                            disableSynchronization);
+    pool.setIterateBds(linkIteratesBds(linkOp));
     linkPoolOwner.insert(owner);
 
     SmallVector<int32_t> allSegments;
@@ -598,7 +657,7 @@ void AIEObjectFifoSplitPass::runOnOperation() {
   SmallVector<ObjectFifoCreateOp> fifos(device.getOps<ObjectFifoCreateOp>());
 
   if (failed(verifyTilesArePlaced()) || failed(verifyStreamPortAccesses()) ||
-      failed(verifyLinkAccesses())) {
+      failed(verifyLinkAccesses()) || failed(verifyIterateBds())) {
     return signalPassFailure();
   }
 
