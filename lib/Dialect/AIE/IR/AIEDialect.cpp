@@ -635,8 +635,8 @@ LogicalResult ObjectFifoCreateOp::verify() {
 
   if (getIterateBds()) {
     if (std::optional<StringRef> conflict = getIterateBdsConflict())
-      return emitOpError("`") << *conflict
-                              << "` cannot be combined with `iterate_bds`";
+      return emitOpError("`")
+             << *conflict << "` cannot be combined with `iterate_bds`";
   }
 
   if (auto consumerElemType = getConsumerElemType()) {
@@ -741,8 +741,7 @@ LogicalResult ObjectFifoPoolOp::verify() {
       return emitOpError("iterate_bds requires BD iteration, which this "
                          "device lacks");
     }
-    int64_t steps = int64_t(1)
-                    << target.getDmaBdIterBits(AIETileType::MemTile);
+    int64_t steps = int64_t(1) << target.getDmaBdIterBits(AIETileType::MemTile);
     if (getDepth() > steps) {
       return emitOpError("iterate_bds depth ")
              << getDepth() << " exceeds the " << steps
