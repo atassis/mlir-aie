@@ -264,12 +264,13 @@ struct AIEAssignRuntimeSequenceBDIDsPass
         op.walk<WalkOrder::PreOrder>([&](AIE::DMABDOp bd_op) {
           if (bd_op.getBdId().has_value())
             return WalkResult::advance();
-          // channelIndex only affects allocation on MemTiles, where the AIE2
-          // model partitions BDs by channel parity (isBdChannelAccessible).
-          // Runtime sequences configure BDs on shim (and compute) tiles only,
-          // which are channel-agnostic (always accessible), so passing 0 is
-          // correct here.
-          std::optional<int32_t> next_id = gen.nextBdId(/*channelIndex=*/0);
+          // channelIndex partitions BDs by parity on MemTiles
+          // (isBdChannelAccessible): even channels reach 0-23, odd 24-47. Pass
+          // the task's own channel -- shim/core tiles are channel-agnostic, so
+          // this is a no-op there, but a MemTile task on an odd channel handed
+          // an even-bank id could never run it (K045).
+          std::optional<int32_t> next_id =
+              gen.nextBdId(static_cast<int>(op.getChannel()));
           if (!next_id) {
             const AIETargetModel &tm =
                 tile->getParentOfType<AIE::DeviceOp>().getTargetModel();
