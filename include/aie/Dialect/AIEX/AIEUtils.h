@@ -74,12 +74,13 @@ LogicalResult emitUpdateBdAddressFromOffsetParameter(OpBuilder &builder,
 // extension (held in the scratchpad slot referenced by `bdOp`'s
 // `length_state_table_idx` attribute, multiplied by `bufType`'s element size
 // and `bdOp`'s `length_granule`) into the BD's word-0 (buffer_length)
-// register at `bdBaseAddr`. Shim-NOC-tile BDs only; the caller checks the
-// tile kind before calling this.
+// register at `bdBaseAddr`. `lengthFieldWidth` is
+// AIETargetModel::getDmaBdLengthFieldWidth at this tile.
 LogicalResult emitUpdateBdLengthFromParameter(OpBuilder &builder,
                                               Operation *bdOp,
                                               BaseMemRefType bufType,
-                                              uint64_t bdBaseAddr);
+                                              uint64_t bdBaseAddr,
+                                              uint32_t lengthFieldWidth = 32);
 
 // Emit the params.txt description of every `aiex.scratchpad_parameter` in
 // `moduleOp` (with their assigned `state_table_idx`/`kind`) to `os`.

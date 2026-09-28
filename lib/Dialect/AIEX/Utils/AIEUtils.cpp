@@ -237,7 +237,7 @@ LogicalResult AIEX::emitUpdateBdAddressFromOffsetParameter(
 
 LogicalResult AIEX::emitUpdateBdLengthFromParameter(
     OpBuilder &builder, Operation *bdOp, BaseMemRefType bufType,
-    uint64_t bdBaseAddr) {
+    uint64_t bdBaseAddr, uint32_t lengthFieldWidth) {
   auto idxAttr = bdOp->getAttrOfType<IntegerAttr>("length_state_table_idx");
   assert(idxAttr && "emitUpdateBdLengthFromParameter called without "
                     "length_state_table_idx attribute");
@@ -251,6 +251,19 @@ LogicalResult AIEX::emitUpdateBdLengthFromParameter(
   // bytes, so this division is always exact.
   uint32_t funcArgWords =
       static_cast<uint32_t>(granuleAttr.getInt()) * elemBytes / 4;
+
+  // The hardware add is unconditional: on a narrower-than-32-bit field a
+  // single scratchpad step already exceeding it carries into the bits above
+  // on the very first update. Checkable at lowering time; how many steps a
+  // run applies is not.
+  assert(lengthFieldWidth > 0 && lengthFieldWidth <= 32 &&
+        "lengthFieldWidth must be a real register field");
+  if (lengthFieldWidth < 32 && funcArgWords >= (1u << lengthFieldWidth)) {
+    bdOp->emitOpError() << "length_granule step of " << funcArgWords
+                        << " words does not fit the " << lengthFieldWidth
+                        << "-bit buffer_length field at this tile";
+    return failure();
+  }
 
   // Use func=mul with func_arg=funcArgWords so the firmware computes
   // StateTable[idx] * funcArgWords = word delta, added into the BD's word-0

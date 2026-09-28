@@ -482,6 +482,15 @@ public:
   /// descriptor.
   virtual uint32_t getDmaBdAddressOffset(int col, int row) const = 0;
 
+  /// Return the bit width of a DMA BD's word-0 buffer_length field at (col,
+  /// row): the whole word on a tile whose word-0 holds nothing else, narrower
+  /// where it shares the word with other fields (e.g. a MemTile BD's word-0
+  /// packs buffer_length below its lock/dimension bits). LSB is 0 on every
+  /// known variant. Default is the full word; overridden where it is not.
+  virtual uint32_t getDmaBdLengthFieldWidth(int col, int row) const {
+    return 32;
+  }
+
   /// Return the array address of the dma task queue register for the given
   /// col, row, channel and direction
   virtual uint32_t getDmaControlAddress(int col, int row, int channel,
@@ -900,6 +909,15 @@ public:
                       AIE::DMAChannelDir direction) const override;
   // Task_Queue_Size, bits 22:20 of the DMA_{MM2S,S2MM}_Status_N register.
   uint32_t getDmaTaskQueueSizeMask() const override { return 0x7u << 20; }
+
+  // A MemTile BD's word-0 packs buffer_length below other fields (17 bits,
+  // XAIE2PGBL_MEM_TILE_MODULE_DMA_BD0_0_BUFFER_LENGTH_WIDTH); shim/core keep
+  // the base class's full-word default.
+  uint32_t getDmaBdLengthFieldWidth(int col, int row) const override {
+    if (isMemTile(col, row))
+      return 17;
+    return AIETargetModel::getDmaBdLengthFieldWidth(col, row);
+  }
 
   uint32_t getMemTileSize() const override { return 0x00080000; }
 
