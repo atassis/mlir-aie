@@ -33,6 +33,22 @@ def ScratchpadParameterKind : I32EnumAttr<"ScratchpadParameterKind",
   let cppNamespace = "::xilinx::AIEX";
 }
 
+// DMA_S2MM_*_Ctrl.FoT_Mode: what an S2MM channel does when it sees TLAST.
+// Values and encoding match aie_registers_aie2.json's FoT_Mode bit field
+// (bits 17:16 of the channel's Ctrl register).
+def FoTModeDisabled : I32EnumAttrCase<"Disabled", 0, "disabled">;
+def FoTModeNoCounts : I32EnumAttrCase<"NoCounts", 1, "no_counts">;
+def FoTModeCountsWithTaskTokens
+    : I32EnumAttrCase<"CountsWithTaskTokens", 2, "counts_with_task_tokens">;
+def FoTModeCountsFromMMRegister
+    : I32EnumAttrCase<"CountsFromMMRegister", 3, "counts_from_mm_register">;
+
+def FoTMode : I32EnumAttr<"FoTMode", "DMA S2MM finish-on-TLAST mode",
+    [FoTModeDisabled, FoTModeNoCounts, FoTModeCountsWithTaskTokens,
+     FoTModeCountsFromMMRegister]> {
+  let cppNamespace = "::xilinx::AIEX";
+}
+
 // How a `load_pdi` op should be expanded by the `aie-expand-load-pdi` pass.
 def AIEX_ExpandNone : I32EnumAttrCase<"none", 0>;
 def AIEX_ExpandWrite32 : I32EnumAttrCase<"write32", 1>;

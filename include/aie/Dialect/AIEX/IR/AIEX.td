@@ -1308,7 +1308,11 @@ def AIE_DMAConfigureTaskOp
       DefaultValuedOptionalAttr<I32Attr, "0">:$repeat_count,
       Optional<I32>:$repeat_count_val, OptionalAttr<PacketInfoAttr>:$packet,
       // Put the channel into out-of-order mode (S2MM only).
-      UnitAttr:$out_of_order);
+      UnitAttr:$out_of_order,
+      // DMA_S2MM_*_Ctrl.FoT_Mode for this channel (S2MM only). Lowered to a
+      // maskwrite32 of the channel's Ctrl register bits 17:16, replacing a
+      // hand-written one at the register's raw address.
+      OptionalAttr<FoTMode>:$fot_mode);
 
   let regions = (region AnyRegion:$body);
 
@@ -1352,7 +1356,7 @@ def AIE_DMAConfigureTaskOp
             xilinx::AIE::DMAChannelDirAttr::get(odsBuilder.getContext(), dir),
             $_builder.getI32IntegerAttr(channel_index), $_builder.getBoolAttr(token),
             $_builder.getI32IntegerAttr(repeat), /*repeat_count_val=*/nullptr,
-            /*packet=*/nullptr, /*out_of_order=*/nullptr);
+            /*packet=*/nullptr, /*out_of_order=*/nullptr, /*fot_mode=*/nullptr);
     }]>];
 }
 

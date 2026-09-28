@@ -1389,6 +1389,10 @@ LogicalResult AIEX::DMAConfigureTaskOp::verify() {
       bds.push_back(bd);
     });
   }
+  if (getFotMode() && getDirection() != AIE::DMAChannelDir::S2MM) {
+    emitOpError("fot_mode is only supported on S2MM channels");
+    result = failure();
+  }
   if (getOutOfOrder()) {
     // Out-of-order mode rejects task completion token (bits are aliased).
     if (getIssueToken()) {

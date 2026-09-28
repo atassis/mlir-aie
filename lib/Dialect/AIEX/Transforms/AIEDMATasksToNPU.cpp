@@ -458,16 +458,23 @@ struct AIEDMATasksToNPUPass
         return failure();
     }
 
-    // length_parameter targets the BD's word-0 (buffer_length) register,
-    // shim-NOC-tile only: mem/core tile BDs use a different field width.
+    // length_parameter targets the BD's word-0 (buffer_length) register.
+    // Supported on shim NOC and MemTile BDs; getDmaBdLengthFieldWidth tells
+    // the emitter how wide that field actually is at this tile (a MemTile
+    // BD's word-0 is narrower than a shim BD's, see rf-memtile-bd-runtime-
+    // length).
     if (bd_op.getLengthStateTableIdxAttr()) {
-      if (!target_model.isShimNOCTile(col, row))
+      if (!target_model.isShimNOCTile(col, row) &&
+          !target_model.isMemTile(col, row))
         return bd_op->emitOpError(
-            "length_parameter is only supported on shim NOC tile BDs");
+            "length_parameter is only supported on shim NOC and MemTile "
+            "BDs");
       auto bufType = llvm::cast<BaseMemRefType>(bd_op.getBuffer().getType());
       uint64_t bdBaseAddr = target_model.getDmaBdAddress(col, row, bd_id);
-      if (failed(emitUpdateBdLengthFromParameter(builder, bd_op, bufType,
-                                                 bdBaseAddr)))
+      uint32_t lengthFieldWidth =
+          target_model.getDmaBdLengthFieldWidth(col, row);
+      if (failed(emitUpdateBdLengthFromParameter(
+              builder, bd_op, bufType, bdBaseAddr, lengthFieldWidth)))
         return failure();
     }
 
@@ -1047,6 +1054,53 @@ struct AIEDMATasksToNPUPass
     return success();
   }
 
+  // Mirrors emitOutOfOrderChannelEnable: FoT_Mode lives in the same Ctrl
+  // register, so this is the maskwrite32 a design used to write by hand at
+  // the register's raw address (e.g. 0x1DE08 for a core tile's S2MM channel
+  // 1) instead of through fot_mode.
+  LogicalResult emitFoTModeWrite(OpBuilder &builder, DMAConfigureTaskOp op,
+                                 AIE::TileOp tile) {
+    const AIE::AIETargetModel &tm = AIE::getTargetModel(op);
+    int col = tile.getCol();
+    int row = tile.getRow();
+    int channel = op.getChannel();
+
+    uint32_t ctrlAddrLocal = tm.getLocalDmaControlAddress(
+        col, row, channel, AIE::DMAChannelDir::S2MM);
+    std::string ctrlRegName = "DMA_S2MM_" + std::to_string(channel) + "_Ctrl";
+    const AIE::RegisterInfo *ctrlReg =
+        tm.lookupRegister(ctrlRegName, tile.getTileID(), /*isMem=*/true);
+    if (!ctrlReg)
+      return op.emitOpError("target has no ")
+             << ctrlRegName << " register in its register database";
+    const AIE::BitFieldInfo *fotField = ctrlReg->getField("FoT_Mode");
+    if (!fotField)
+      return op.emitOpError()
+             << ctrlRegName << " has no FoT_Mode field in the register "
+                              "database";
+    std::optional<uint32_t> fotMask = tm.getFieldMask(*fotField);
+    if (!fotMask)
+      return op.emitOpError()
+             << ctrlRegName << " FoT_Mode field does not fit in a 32-bit "
+                              "register";
+    uint32_t mode = static_cast<uint32_t>(*op.getFotMode());
+    std::optional<uint32_t> fotVal = tm.encodeFieldValue(*fotField, mode);
+    if (!fotVal)
+      return op.emitOpError()
+             << ctrlRegName << " FoT_Mode field cannot encode the value "
+             << mode;
+
+    Location loc = op.getLoc();
+    IntegerAttr colAttr = builder.getI32IntegerAttr(col);
+    IntegerAttr rowAttr = builder.getI32IntegerAttr(row);
+    Value addr = createConstantI32(builder, loc, ctrlAddrLocal);
+    Value val = createConstantI32(builder, loc, *fotVal);
+    Value mask = createConstantI32(builder, loc, *fotMask);
+    NpuMaskWrite32Op::create(builder, loc, addr, val, mask, nullptr, colAttr,
+                             rowAttr);
+    return success();
+  }
+
   LogicalResult rewriteSingleDMAConfigureTaskOp(DMAConfigureTaskOp op) {
     OpBuilder builder(op);
     AIE::TileOp tile = op.tryGetTileOp();
@@ -1083,6 +1137,11 @@ struct AIEDMATasksToNPUPass
 
     if (op.getOutOfOrder()) {
       if (failed(emitOutOfOrderChannelEnable(builder, op, tile)))
+        return failure();
+    }
+
+    if (op.getFotMode()) {
+      if (failed(emitFoTModeWrite(builder, op, tile)))
         return failure();
     }
 
