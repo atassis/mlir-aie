@@ -188,7 +188,8 @@ public:
     // control packet for issuing token
     if (op.getIssueToken()) {
       // set the task-complete-token controller ID field in the dma control
-      // register
+      // register; the tile need not be a shim (any tile with an assigned
+      // controller_id can be a token's target).
       AIE::TileOp shimTile = AIE::TileOp::getOrCreate(
           rewriter, op->getParentOfType<AIE::DeviceOp>(), op.getColumn(),
           op.getRow());
@@ -203,6 +204,18 @@ public:
             createConstantI32(rewriter, op->getLoc(), data),
             createConstantI32(rewriter, op->getLoc(), mask), nullptr, nullptr,
             nullptr);
+      } else if (!tm.isShimNOCTile(op.getColumn(), op.getRow())) {
+        // Shim-tile pushes with no controller_id are tolerated for isolated
+        // unit tests; a core/mem-tile push has no such precedent, and
+        // silently skipping this write leaves a later dma_await_task waiting
+        // on a token that is never stamped.
+        auto err = op.emitOpError(
+            "issues a task-completion token on tile (" +
+            Twine(op.getColumn()) + ", " + Twine(op.getRow()) +
+            "), which has no controller_id attribute.");
+        err.attachNote() << "Run the `--aie-assign-tile-controller-ids` pass "
+                            "before `--aie-dma-to-npu`.";
+        return err;
       }
     }
 
