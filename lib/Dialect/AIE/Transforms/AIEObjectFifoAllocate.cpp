@@ -14,6 +14,8 @@
 #include "mlir/Interfaces/DataLayoutInterfaces.h"
 #include "mlir/Pass/Pass.h"
 
+#include "llvm/ADT/MapVector.h"
+
 #include <set>
 
 using namespace mlir;
@@ -43,7 +45,9 @@ struct AIEObjectFifoAllocatePass
   SmallVector<Operation *> loweredFlows;
   /// Passes the longest-running drainer of each pool makes over it.
   DenseMap<Operation *, int> drainerIterations;
-  DenseMap<Value, SmallVector<int64_t>> plannedMemory;
+  // Each entry is one planned buffer's size and its pool's alloc_group (null
+  // when the pool set none).
+  DenseMap<Value, SmallVector<std::pair<int64_t, StringAttr>>> plannedMemory;
   DenseMap<Operation *, SmallVector<Value>> bufferPlacements;
   DenseMap<Operation *, int> channelAssignments;
   DenseMap<Operation *, Value> localPools;
@@ -65,10 +69,15 @@ struct AIEObjectFifoAllocatePass
     return ac && ar && bc && br && ac == bc && ar == br;
   }
 
-  int64_t memoryUsed(Value tile, int64_t extraSize = 0, int extraCount = 0) {
+  int64_t memoryUsed(Value tile, int64_t extraSize = 0, int extraCount = 0,
+                     StringAttr extraGroup = nullptr) {
     SmallVector<BufferAllocation> layout;
     int64_t alignment =
         device.getTargetModel().getMemTileLoadStoreBusWidth() / 8;
+    // Pools sharing one alloc_group overlay each other (see
+    // AIEAssignBuffers.cpp's buildAllocUnits): sizes WITHIN a group add up,
+    // but only the largest group on the tile costs anything, not their sum.
+    llvm::MapVector<StringAttr, int64_t> groupTotals;
     // Generated buffers are inserted immediately after their tile, before
     // existing buffers. Preserve that order for equal-sized aligned/unaligned
     // buffers, including coordinate-equivalent tile references.
@@ -76,17 +85,34 @@ struct AIEObjectFifoAllocatePass
       if (auto placed = dyn_cast<TileLike>(op);
           placed && sameTile(tile, placed->getResult(0))) {
         Value value = placed->getResult(0);
-        for (int64_t size : plannedMemory[value])
-          layout.push_back({size, alignment, std::nullopt});
-        if (value == tile)
-          for (int i = 0; i < extraCount; ++i)
-            layout.push_back({extraSize, alignment, std::nullopt});
+        for (auto &planned : plannedMemory[value]) {
+          if (planned.second)
+            groupTotals[planned.second] += planned.first;
+          else
+            layout.push_back({planned.first, alignment, std::nullopt});
+        }
+        if (value == tile) {
+          if (extraGroup)
+            groupTotals[extraGroup] += extraSize * extraCount;
+          else
+            for (int i = 0; i < extraCount; ++i)
+              layout.push_back({extraSize, alignment, std::nullopt});
+        }
       } else if (auto buffer = dyn_cast<BufferOp>(op);
                  buffer && sameTile(tile, buffer.getTile())) {
-        layout.push_back({buffer.getAllocationSize(),
-                          buffer.getAligned() ? alignment : 1,
-                          buffer.getAddress()});
+        if (auto group = buffer.getAllocGroupAttr())
+          groupTotals[group] += buffer.getAllocationSize();
+        else
+          layout.push_back({buffer.getAllocationSize(),
+                            buffer.getAligned() ? alignment : 1,
+                            buffer.getAddress()});
       }
+    }
+    if (!groupTotals.empty()) {
+      int64_t largest = 0;
+      for (auto &group : groupTotals)
+        largest = std::max(largest, group.second);
+      layout.push_back({largest, alignment, std::nullopt});
     }
     return assignSequentialBufferAddresses(layout);
   }
@@ -147,7 +173,7 @@ struct AIEObjectFifoAllocatePass
   bool canPlace(ObjectFifoPoolOp pool, Value tile, int64_t sizeBytes,
                 int count = 1) {
     if (cast<TileLike>(tile.getDefiningOp()).isMemTile() &&
-        memoryUsed(tile, sizeBytes, count) >
+        memoryUsed(tile, sizeBytes, count, pool.getAllocGroupAttr()) >
             device.getTargetModel().getMemTileSize())
       return false;
     return llvm::all_of(poolUsers[pool],
@@ -189,7 +215,8 @@ struct AIEObjectFifoAllocatePass
         bufferFailure = pool;
         return failure();
       }
-      plannedMemory[tile].append(count, size);
+      for (int i = 0; i < count; ++i)
+        plannedMemory[tile].emplace_back(size, pool.getAllocGroupAttr());
     }
     for (auto pool : pools) {
       if (pool.getBuffers()) {
@@ -219,7 +246,7 @@ struct AIEObjectFifoAllocatePass
         }
         bufferPlacements[pool].push_back(tile);
         if (!localPools.contains(pool))
-          plannedMemory[tile].push_back(size);
+          plannedMemory[tile].emplace_back(size, pool.getAllocGroupAttr());
       }
     }
     return success();
