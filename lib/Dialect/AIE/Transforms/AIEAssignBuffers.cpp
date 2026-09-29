@@ -1621,8 +1621,7 @@ struct AIEAssignBufferAddressesPass
 
   void runOnOperation() override {
     DeviceOp device = getOperation();
-    if (failed(applySignatureBankConstraints(device)) ||
-        failed(checkAllocGroups(device))) {
+    if (failed(applySignatureBankConstraints(device))) {
       return signalPassFailure();
     }
     materializeCoreDataBuffers(device);
@@ -1676,6 +1675,11 @@ struct AIEPrepareBuffersPass
         return signalPassFailure();
       }
     });
+    // Before control-flow lowering, while the selectors that separate
+    // alloc_group references still exist.
+    if (failed(checkAllocGroups(device))) {
+      return signalPassFailure();
+    }
   }
 };
 } // namespace

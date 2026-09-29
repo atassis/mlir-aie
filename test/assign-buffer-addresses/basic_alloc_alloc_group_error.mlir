@@ -8,7 +8,7 @@
 // them would alias live data. That half of the contract is decidable, and is
 // rejected.
 
-// RUN: not aie-opt --aie-assign-buffer-addresses %s 2>&1 | FileCheck %s
+// RUN: not aie-opt --aie-prepare-buffers %s 2>&1 | FileCheck %s
 // CHECK: error: {{.*}}is in alloc_group 'b' while this aie.core also references a buffer in alloc_group 'a'
 module @test_alloc_group_same_core {
   aie.device(xcvc1902) {

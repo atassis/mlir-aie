@@ -13,6 +13,8 @@
 // references and the same annotation is rejected.
 
 // RUN: aie-opt --aie-assign-buffer-addresses %s | FileCheck %s
+// aiecc places buffers after control-flow lowering; the mode check has run by then.
+// RUN: aie-opt --aie-prepare-buffers --aie-scf-to-control-flow --aie-assign-buffer-addresses %s | FileCheck %s
 // CHECK: aie.buffer({{.*}}) {address = 1024 : i32, alloc_group = "a", mem_bank = 0 : i32, sym_name = "big"} : memref<512xi32>
 // CHECK: aie.buffer({{.*}}) {address = 1024 : i32, alloc_group = "b", mem_bank = 0 : i32, sym_name = "small"} : memref<64xi32>
 // CHECK: aie.buffer({{.*}}) {address = 8192 : i32, mem_bank = 1 : i32, sym_name = "other"} : memref<128xi32>
