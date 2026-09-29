@@ -15,11 +15,11 @@
 // sum): with the bug, "other" lands at 160, inside a1's [128,192) range, and
 // the allocator reports a false overlap instead of succeeding.
 
-// RUN: aie-opt --aie-assign-buffer-addresses="alloc-scheme=basic-sequential" %s | FileCheck %s
-// CHECK: aie.buffer({{.*}}) {address = 0 : i32, alloc_group = "a", sym_name = "a2"} : memref<20xi32>
-// CHECK: aie.buffer({{.*}}) {address = 128 : i32, alloc_group = "a", sym_name = "a1"} : memref<16xi32>
-// CHECK: aie.buffer({{.*}}) {address = 0 : i32, alloc_group = "b", sym_name = "b1"} : memref<4xi32>
-// CHECK: aie.buffer({{.*}}) {address = 192 : i32, sym_name = "other"} : memref<2xi32>
+// RUN: aie-opt --aie-assign-buffer-addresses %s | FileCheck %s
+// CHECK: aie.buffer({{.*}}) {address = 0 : i32, alloc_group = "a", mem_bank = 0 : i32, sym_name = "a2"} : memref<20xi32>
+// CHECK: aie.buffer({{.*}}) {address = 128 : i32, alloc_group = "a", mem_bank = 0 : i32, sym_name = "a1"} : memref<16xi32>
+// CHECK: aie.buffer({{.*}}) {address = 0 : i32, alloc_group = "b", mem_bank = 0 : i32, sym_name = "b1"} : memref<4xi32>
+// CHECK: aie.buffer({{.*}}) {address = 16384 : i32, mem_bank = 1 : i32, sym_name = "other"} : memref<2xi32>
 module @test_alloc_group_alignment_padding {
   aie.device(npu2) {
     %0 = aie.tile(0, 2)

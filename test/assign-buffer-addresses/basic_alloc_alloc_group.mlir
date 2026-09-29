@@ -10,9 +10,9 @@
 // Without the groups it would be at 3328.
 
 // RUN: aie-opt --aie-assign-buffer-addresses %s | FileCheck %s
-// CHECK: aie.buffer({{.*}}) {address = 1024 : i32, alloc_group = "a", sym_name = "big"} : memref<512xi32>
-// CHECK: aie.buffer({{.*}}) {address = 1024 : i32, alloc_group = "b", sym_name = "small"} : memref<64xi32>
-// CHECK: aie.buffer({{.*}}) {address = 3072 : i32, sym_name = "other"} : memref<128xi32>
+// CHECK: aie.buffer({{.*}}) {address = 1024 : i32, alloc_group = "a", mem_bank = 0 : i32, sym_name = "big"} : memref<512xi32>
+// CHECK: aie.buffer({{.*}}) {address = 1024 : i32, alloc_group = "b", mem_bank = 0 : i32, sym_name = "small"} : memref<64xi32>
+// CHECK: aie.buffer({{.*}}) {address = 8192 : i32, mem_bank = 1 : i32, sym_name = "other"} : memref<128xi32>
 module @test_alloc_group {
   aie.device(xcvc1902) {
     %0 = aie.tile(3, 3)

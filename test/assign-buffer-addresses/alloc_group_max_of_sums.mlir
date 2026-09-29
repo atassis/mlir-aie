@@ -18,11 +18,11 @@
 // group places its 2048 B member at the base and its 256 B member above it. The
 // two groups overlay, which is why a2 and b1 share 3072.
 
-// CHECK: aie.buffer({{.*}}) {address = 1024 : i32, alloc_group = "a", sym_name = "a1"} : memref<512xi32>
-// CHECK: aie.buffer({{.*}}) {address = 3072 : i32, alloc_group = "a", sym_name = "a2"} : memref<64xi32>
-// CHECK: aie.buffer({{.*}}) {address = 3072 : i32, alloc_group = "b", sym_name = "b1"} : memref<64xi32>
-// CHECK: aie.buffer({{.*}}) {address = 1024 : i32, alloc_group = "b", sym_name = "b2"} : memref<512xi32>
-// CHECK: aie.buffer({{.*}}) {address = 3328 : i32, sym_name = "other"} : memref<128xi32>
+// CHECK: aie.buffer({{.*}}) {address = 1024 : i32, alloc_group = "a", mem_bank = 0 : i32, sym_name = "a1"} : memref<512xi32>
+// CHECK: aie.buffer({{.*}}) {address = 3072 : i32, alloc_group = "a", mem_bank = 0 : i32, sym_name = "a2"} : memref<64xi32>
+// CHECK: aie.buffer({{.*}}) {address = 1024 : i32, alloc_group = "b", mem_bank = 0 : i32, sym_name = "b1"} : memref<64xi32>
+// CHECK: aie.buffer({{.*}}) {address = 1280 : i32, alloc_group = "b", mem_bank = 0 : i32, sym_name = "b2"} : memref<512xi32>
+// CHECK: aie.buffer({{.*}}) {address = 8192 : i32, mem_bank = 1 : i32, sym_name = "other"} : memref<128xi32>
 module @test_alloc_group_max_of_sums {
   aie.device(xcvc1902) {
     %0 = aie.tile(3, 3)

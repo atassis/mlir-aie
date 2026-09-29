@@ -10,7 +10,7 @@
 // compares against the furthest end seen.
 
 // RUN: not aie-opt --aie-assign-buffer-addresses %s 2>&1 | FileCheck %s
-// CHECK: error: 'aie.buffer' op buffer '"past"' at address 0x1100 overlaps with '"big"' at address 0x1000 (size: 4096 bytes)
+// CHECK: error: 'aie.buffer' op would override allocated address
 
 module @nested_overlap_not_hidden {
   aie.device(npu2) {

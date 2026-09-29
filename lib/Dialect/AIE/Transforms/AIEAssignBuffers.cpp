@@ -1498,7 +1498,7 @@ static LogicalResult allocateTile(TileOp tile, PlacementStats &stats) {
         /*alloc_group=*/nullptr);
     buffersToAlloc.push_back(overlayBuffer);
   }
-  auto eraseOverlay = llvm::make_scope_exit([&] {
+  llvm::scope_exit eraseOverlay([&] {
     if (overlayBuffer)
       overlayBuffer.erase();
   });
