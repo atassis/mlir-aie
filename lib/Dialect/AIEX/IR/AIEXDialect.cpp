@@ -1855,7 +1855,10 @@ LogicalResult AIEX::BufferClearOp::verify() {
                          << ")'s local data memory size (" << memSize
                          << " bytes)";
 
+  return success();
+}
 
+//===----------------------------------------------------------------------===//
 // NpuReadRegOp
 //===----------------------------------------------------------------------===//
 
