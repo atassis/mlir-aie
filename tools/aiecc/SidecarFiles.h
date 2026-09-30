@@ -22,14 +22,17 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/Format.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/SHA256.h"
 
 #include <algorithm>
+#include <array>
 #include <optional>
-#include <random>
 #include <string>
 
 namespace xilinx::aiecc {
@@ -196,23 +199,47 @@ inline llvm::json::Value makeKernelsJson(llvm::StringRef kernelName,
               {"instances", llvm::json::Array{O{{"name", instanceName}}}}}}}}}};
 }
 
-// v4 UUID used as the PDI uuid in the partition JSON.
-inline std::string generatePdiUUID() {
-  static std::random_device rd;
-  static std::mt19937 gen(rd());
-  static std::uniform_int_distribution<uint32_t> dis(0, 0xFFFFFFFF);
-  uint32_t data[4];
-  for (int i = 0; i < 4; ++i)
-    data[i] = dis(gen);
-  data[1] = (data[1] & 0xFFFF0FFF) | 0x4000;
-  data[2] = (data[2] & 0x3FFFFFFF) | 0x80000000;
-  return llvm::formatv("{0:x-8}-{1:x-4}-{2:x-4}-{3:x-4}-{4:x-12}", data[0],
-                       data[1] >> 16, data[1] & 0xFFFF, data[2] >> 16,
-                       ((uint64_t)(data[2] & 0xFFFF) << 32) | data[3]);
+// RFC 9562 version-8 UUID from the SHA-256 of `content`: equal inputs give
+// equal UUIDs.
+inline std::string contentUUID(llvm::StringRef content) {
+  std::array<uint8_t, 32> h =
+      llvm::SHA256::hash(llvm::arrayRefFromStringRef(content));
+  h[6] = (h[6] & 0x0F) | 0x80;
+  h[8] = (h[8] & 0x3F) | 0x80;
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  for (int i = 0; i < 16; ++i) {
+    if (i == 4 || i == 6 || i == 8 || i == 10)
+      os << '-';
+    os << llvm::format_hex_no_prefix(h[i], 2);
+  }
+  return s;
+}
+
+// UUID of what xclbinutil packs, minus the PDI's on-disk path, which names
+// the tmpdir.
+inline std::string
+xclbinContentUUID(llvm::ArrayRef<const llvm::json::Value *> parts,
+                  llvm::StringRef extra) {
+  std::string text;
+  llvm::raw_string_ostream os(text);
+  for (const llvm::json::Value *p : parts) {
+    llvm::json::Value v = *p;
+    if (auto *o = v.getAsObject())
+      if (auto *ap = o->getObject("aie_partition"))
+        if (auto *pdis = ap->getArray("PDIs"))
+          for (llvm::json::Value &e : *pdis)
+            if (auto *eo = e.getAsObject())
+              eo->erase("file_name");
+    os << v << '\0';
+  }
+  os << extra;
+  return contentUUID(text);
 }
 
 inline llvm::json::Value makePartitionJson(xilinx::AIE::DeviceOp devOp,
                                            llvm::StringRef pdiPath,
+                                           llvm::StringRef pdiUuid,
                                            llvm::StringRef kernelId) {
   using O = llvm::json::Object;
   const auto &targetModel = devOp.getTargetModel();
@@ -229,7 +256,7 @@ inline llvm::json::Value makePartitionJson(xilinx::AIE::DeviceOp devOp,
          {"partition", O{{"column_width", numCols},
                          {"start_columns", std::move(startColumns)}}},
          {"PDIs", llvm::json::Array{
-                      O{{"uuid", generatePdiUUID()},
+                      O{{"uuid", pdiUuid.str()},
                         {"file_name", pdiPath.str()},
                         {"cdo_groups",
                          llvm::json::Array{O{

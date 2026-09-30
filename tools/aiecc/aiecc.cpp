@@ -1977,9 +1977,32 @@ static std::vector<EdgeBase *> buildMainGraph(mlir::MLIRContext &context,
           .map<llvm::json::Value>(
               "partition_{0}.json",
               [kId](const Item<OpInModule<DeviceOp>> &devItem,
-                    const Item<File> &pdiItem, Item<llvm::json::Value> &out) {
+                    const Item<File> &pdiItem,
+                    Item<llvm::json::Value> &out) -> mlir::LogicalResult {
+                auto pdiBytes = llvm::MemoryBuffer::getFile(pdiItem.asFile());
+                if (!pdiBytes) {
+                  llvm::errs() << "aiecc: cannot read " << pdiItem.asFile()
+                               << "\n";
+                  return mlir::failure();
+                }
                 out.value = makePartitionJson(
-                    devItem.get().op, absolutePath(pdiItem.asFile()), kId);
+                    devItem.get().op, absolutePath(pdiItem.asFile()),
+                    contentUUID((*pdiBytes)->getBuffer()), kId);
+                return mlir::success();
+              });
+
+  // UUID of the from-scratch xclbin's own content (memory topology + kernel
+  // metadata + PDI partition, minus the PDI's on-disk path).
+  auto &xclbinUuid =
+      bundle(memTopo.out, kernels.out, partition.out)
+          .map<std::string>(
+              "xclbin_uuid_{0}",
+              [](const Item<llvm::json::Value> &mem,
+                  const Item<llvm::json::Value> &kern,
+                  const Item<llvm::json::Value> &part,
+                  Item<std::string> &out) -> mlir::LogicalResult {
+                out.value =
+                    xclbinContentUUID({&mem.get(), &kern.get(), &part.get()}, "");
                 return mlir::success();
               });
 
@@ -1990,7 +2013,7 @@ static std::vector<EdgeBase *> buildMainGraph(mlir::MLIRContext &context,
 
   // From-scratch flow
   EdgeWithTypedOutput<File> &xclbinFromScratch =
-      bundle(memTopo.out, kernels.out, partition.out)
+      bundle(memTopo.out, kernels.out, partition.out, xclbinUuid.out)
           .map<File>(xclbinName.getValue(), ShellCommand{"xclbinutil"}
                                                 .arg("--add-replace-section")
                                                 .input("MEM_TOPOLOGY:JSON:")
@@ -1998,6 +2021,8 @@ static std::vector<EdgeBase *> buildMainGraph(mlir::MLIRContext &context,
                                                 .input()
                                                 .arg("--add-replace-section")
                                                 .input("AIE_PARTITION:JSON:")
+                                                .arg("--key-value")
+                                                .value("SYS:XclbinUUID:")
                                                 .arg("--force")
                                                 .arg("--output")
                                                 .output());
@@ -2052,8 +2077,28 @@ static std::vector<EdgeBase *> buildMainGraph(mlir::MLIRContext &context,
                 return mlir::success();
               });
 
-  EdgeWithTypedOutput<File> &xclbinExtended =
+  // UUID of the extended xclbin: this design's kernel + merged partition,
+  // layered onto the input xclbin's own bytes so a different --xclbin-input
+  // also moves the UUID.
+  auto &extendedUuid =
       bundle(kernels.out, mergedPartition.out)
+          .map<std::string>(
+              "xclbin_extended_uuid_{0}",
+              [inXclbin](const Item<llvm::json::Value> &kern,
+                            const Item<llvm::json::Value> &part,
+                            Item<std::string> &out) -> mlir::LogicalResult {
+                auto in = llvm::MemoryBuffer::getFile(inXclbin);
+                if (!in) {
+                  llvm::errs() << "aiecc: cannot read " << inXclbin << "\n";
+                  return mlir::failure();
+                }
+                out.value = xclbinContentUUID({&kern.get(), &part.get()},
+                                              (*in)->getBuffer());
+                return mlir::success();
+              });
+
+  EdgeWithTypedOutput<File> &xclbinExtended =
+      bundle(kernels.out, mergedPartition.out, extendedUuid.out)
           .map<File>(xclbinName.getValue(), ShellCommand{"xclbinutil"}
                                                 .arg("--input")
                                                 .arg(inXclbin)
@@ -2061,6 +2106,8 @@ static std::vector<EdgeBase *> buildMainGraph(mlir::MLIRContext &context,
                                                 .input()
                                                 .arg("--add-replace-section")
                                                 .input("AIE_PARTITION:JSON:")
+                                                .arg("--key-value")
+                                                .value("SYS:XclbinUUID:")
                                                 .arg("--force")
                                                 .arg("--output")
                                                 .output());
