@@ -177,10 +177,11 @@ Value getBdRegisterBase(OpBuilder &builder, Location loc,
   uint64_t bdStride =
       targetModel.getDmaBdAddress(tileCol, tileRow, 1) - addrForId0;
   Value bdIdVal = getAsValue(builder, loc, bdId, i32ty);
+  Value addrForId0Val = createConstantI32(builder, loc, addrForId0);
+  Value bdStrideVal = createConstantI32(builder, loc, bdStride);
   return arith::AddIOp::create(
-      builder, loc, createConstantI32(builder, loc, addrForId0),
-      arith::MulIOp::create(builder, loc, bdIdVal,
-                            createConstantI32(builder, loc, bdStride)));
+      builder, loc, addrForId0Val,
+      arith::MulIOp::create(builder, loc, bdIdVal, bdStrideVal));
 }
 
 LogicalResult

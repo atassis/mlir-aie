@@ -105,10 +105,12 @@ struct AIEInlineTraceConfigPass
         }
 
         // Generate aiex.npu.write32 operation with col/row
+        Value regOffsetVal =
+            AIEX::createConstantI32(builder, regOp.getLoc(), regInfo->offset);
+        Value regValueVal =
+            AIEX::createConstantI32(builder, regOp.getLoc(), value);
         AIEX::NpuWrite32Op::create(
-            builder, regOp.getLoc(),
-            AIEX::createConstantI32(builder, regOp.getLoc(), regInfo->offset),
-            AIEX::createConstantI32(builder, regOp.getLoc(), value),
+            builder, regOp.getLoc(), regOffsetVal, regValueVal,
             nullptr,                        // buffer
             builder.getI32IntegerAttr(col), // column
             builder.getI32IntegerAttr(row)  // row

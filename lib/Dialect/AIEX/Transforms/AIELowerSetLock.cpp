@@ -56,10 +56,11 @@ public:
     auto localLockAddress = *localLockAddressOpt;
 
     Location loc = op.getLoc();
+    Value lockAddrVal = createConstantI32(rewriter, loc, localLockAddress);
+    Value lockValueVal = createConstantI32(
+        rewriter, loc, static_cast<uint32_t>(op.getValue()));
     rewriter.replaceOpWithNewOp<NpuWrite32Op>(
-        op, createConstantI32(rewriter, loc, localLockAddress),
-        createConstantI32(rewriter, loc, static_cast<uint32_t>(op.getValue())),
-        nullptr, rewriter.getI32IntegerAttr(col),
+        op, lockAddrVal, lockValueVal, nullptr, rewriter.getI32IntegerAttr(col),
         rewriter.getI32IntegerAttr(row));
 
     return success();

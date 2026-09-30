@@ -268,9 +268,10 @@ struct AIELowerScratchpadParametersPass
 
     for (auto &[stateIdx, bufRef] : paramEntries) {
       // Zero the destination before the additive UpdateScratchpad.
-      NpuWrite32Op::create(builder, loc,
-                           /*address=*/createConstantI32(builder, loc, 0),
-                           /*value=*/createConstantI32(builder, loc, 0), bufRef,
+      Value zeroAddrVal = createConstantI32(builder, loc, 0);
+      Value zeroValueVal = createConstantI32(builder, loc, 0);
+      NpuWrite32Op::create(builder, loc, /*address=*/zeroAddrVal,
+                           /*value=*/zeroValueVal, bufRef,
                            /*column=*/nullptr, /*row=*/nullptr);
       NpuUpdateFromScratchpadOp::create(
           builder, loc, stateIdx, StateTableFunc::Incr,

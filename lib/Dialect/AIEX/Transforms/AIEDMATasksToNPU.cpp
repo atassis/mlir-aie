@@ -398,14 +398,16 @@ struct AIEDMATasksToNPUPass
       buf_addr = *bufferAddr;
       buf_addr += bd_op.getOffsetInBytes();
       if (target_model.isCoreTile(col, row)) {
-        NpuMaskWrite32Op::create(
+        Value regAddrVal = createConstantI32(
+            builder, bd_op.getLoc(), static_cast<uint32_t>(register_addr));
+        Value shiftedBufAddrVal = createConstantI32(
             builder, bd_op.getLoc(),
-            createConstantI32(builder, bd_op.getLoc(),
-                              static_cast<uint32_t>(register_addr)),
-            createConstantI32(builder, bd_op.getLoc(),
-                              static_cast<uint32_t>((buf_addr / 4) << 14)),
-            createConstantI32(builder, bd_op.getLoc(), 0x0fffc000), nullptr,
-            nullptr, nullptr);
+            static_cast<uint32_t>((buf_addr / 4) << 14));
+        Value maskVal =
+            createConstantI32(builder, bd_op.getLoc(), 0x0fffc000);
+        NpuMaskWrite32Op::create(builder, bd_op.getLoc(), regAddrVal,
+                                 shiftedBufAddrVal, maskVal, nullptr, nullptr,
+                                 nullptr);
       } else if (target_model.isMemTile(col, row)) {
         // On AIE2p (NPU2), memtile DMAs use an offset-based address
         // space where the base depends on the relative position of the
@@ -419,22 +421,22 @@ struct AIEDMATasksToNPUPass
           if (addrOffset)
             buf_addr += addrOffset.value();
         }
-        NpuMaskWrite32Op::create(
-            builder, bd_op.getLoc(),
-            createConstantI32(builder, bd_op.getLoc(),
-                              static_cast<uint32_t>(register_addr)),
-            createConstantI32(builder, bd_op.getLoc(),
-                              static_cast<uint32_t>(buf_addr / 4)),
-            createConstantI32(builder, bd_op.getLoc(), 0x0007FFFF), nullptr,
-            nullptr, nullptr);
+        Value regAddrVal = createConstantI32(
+            builder, bd_op.getLoc(), static_cast<uint32_t>(register_addr));
+        Value bufAddrVal = createConstantI32(
+            builder, bd_op.getLoc(), static_cast<uint32_t>(buf_addr / 4));
+        Value maskVal =
+            createConstantI32(builder, bd_op.getLoc(), 0x0007FFFF);
+        NpuMaskWrite32Op::create(builder, bd_op.getLoc(), regAddrVal,
+                                 bufAddrVal, maskVal, nullptr, nullptr,
+                                 nullptr);
       } else {
-        NpuWrite32Op::create(
-            builder, bd_op.getLoc(),
-            createConstantI32(builder, bd_op.getLoc(),
-                              static_cast<uint32_t>(register_addr)),
-            createConstantI32(builder, bd_op.getLoc(),
-                              static_cast<uint32_t>(buf_addr)),
-            nullptr, nullptr, nullptr);
+        Value regAddrVal = createConstantI32(
+            builder, bd_op.getLoc(), static_cast<uint32_t>(register_addr));
+        Value bufAddrVal = createConstantI32(
+            builder, bd_op.getLoc(), static_cast<uint32_t>(buf_addr));
+        NpuWrite32Op::create(builder, bd_op.getLoc(), regAddrVal, bufAddrVal,
+                             nullptr, nullptr, nullptr);
       }
     } else {
       return bd_op->emitOpError(
@@ -634,11 +636,11 @@ struct AIEDMATasksToNPUPass
       lenOfr = builder.getI32IntegerAttr(*constLen);
     }
     Value lenVal = getAsValue(builder, loc, lenOfr, i32ty);
+    Value elemWidthVal = createConstantI32(builder, loc, elemWidth);
+    Value granVal = createConstantI32(builder, loc, gran);
     Value bufLen = arith::DivUIOp::create(
         builder, loc,
-        arith::MulIOp::create(builder, loc, lenVal,
-                              createConstantI32(builder, loc, elemWidth)),
-        createConstantI32(builder, loc, gran));
+        arith::MulIOp::create(builder, loc, lenVal, elemWidthVal), granVal);
 
     // The BD-level repeat_count (encoder output) is unused here: the dma_task
     // queue push is emitted separately by DMAStartTaskOpPattern from the task

@@ -788,11 +788,12 @@ struct AIEInsertTraceFlowsPass
         llvm::report_fatal_error("Broadcast event does not fit in "
                                  "Timer_Control's Reset_Event field");
 
+      Value timerCtrlAddrVal =
+          AIEX::createConstantI32(builder, runtimeSeq.getLoc(), timerCtrlAddr);
+      Value timerCtrlValueVal = AIEX::createConstantI32(
+          builder, runtimeSeq.getLoc(), *timerCtrlValue);
       xilinx::AIEX::NpuWrite32Op::create(
-          builder, runtimeSeq.getLoc(),
-          AIEX::createConstantI32(builder, runtimeSeq.getLoc(), timerCtrlAddr),
-          AIEX::createConstantI32(builder, runtimeSeq.getLoc(),
-                                  *timerCtrlValue),
+          builder, runtimeSeq.getLoc(), timerCtrlAddrVal, timerCtrlValueVal,
           nullptr, builder.getI32IntegerAttr(col),
           builder.getI32IntegerAttr(row));
     }
@@ -873,12 +874,15 @@ struct AIEInsertTraceFlowsPass
         if (!ctrlIdMask)
           llvm::report_fatal_error(
               "Controller_ID field does not fit in 32-bit register");
+        Value ctrlAddrVal =
+            AIEX::createConstantI32(builder, runtimeSeq.getLoc(), ctrlAddr);
+        Value ctrlIdValueVal =
+            AIEX::createConstantI32(builder, runtimeSeq.getLoc(), *ctrlIdValue);
+        Value ctrlIdMaskVal =
+            AIEX::createConstantI32(builder, runtimeSeq.getLoc(), *ctrlIdMask);
         xilinx::AIEX::NpuMaskWrite32Op::create(
-            builder, runtimeSeq.getLoc(),
-            AIEX::createConstantI32(builder, runtimeSeq.getLoc(), ctrlAddr),
-            AIEX::createConstantI32(builder, runtimeSeq.getLoc(), *ctrlIdValue),
-            AIEX::createConstantI32(builder, runtimeSeq.getLoc(), *ctrlIdMask),
-            nullptr, builder.getI32IntegerAttr(shimCol),
+            builder, runtimeSeq.getLoc(), ctrlAddrVal, ctrlIdValueVal,
+            ctrlIdMaskVal, nullptr, builder.getI32IntegerAttr(shimCol),
             builder.getI32IntegerAttr(0));
 
         // Push BD to task queue
@@ -908,11 +912,12 @@ struct AIEInsertTraceFlowsPass
                                    "field of " +
                                    llvm::Twine(taskQueueRegName));
         uint32_t queueValue = *tokenValue | *bdIdValue;
+        Value queueOffsetVal = AIEX::createConstantI32(
+            builder, runtimeSeq.getLoc(), queueReg->offset);
+        Value queueValueVal =
+            AIEX::createConstantI32(builder, runtimeSeq.getLoc(), queueValue);
         xilinx::AIEX::NpuWrite32Op::create(
-            builder, runtimeSeq.getLoc(),
-            AIEX::createConstantI32(builder, runtimeSeq.getLoc(),
-                                    queueReg->offset),
-            AIEX::createConstantI32(builder, runtimeSeq.getLoc(), queueValue),
+            builder, runtimeSeq.getLoc(), queueOffsetVal, queueValueVal,
             nullptr, builder.getI32IntegerAttr(shimCol),
             builder.getI32IntegerAttr(0));
       }
@@ -941,13 +946,13 @@ struct AIEInsertTraceFlowsPass
         if (!shimTimerCtrlValue)
           llvm::report_fatal_error("USER_EVENT_1 does not fit in shim "
                                    "Timer_Control's Reset_Event field");
+        Value shimTimerCtrlAddrVal = AIEX::createConstantI32(
+            builder, runtimeSeq.getLoc(), shimTimerCtrlAddr);
+        Value shimTimerCtrlValueVal = AIEX::createConstantI32(
+            builder, runtimeSeq.getLoc(), *shimTimerCtrlValue);
         xilinx::AIEX::NpuWrite32Op::create(
-            builder, runtimeSeq.getLoc(),
-            AIEX::createConstantI32(builder, runtimeSeq.getLoc(),
-                                    shimTimerCtrlAddr),
-            AIEX::createConstantI32(builder, runtimeSeq.getLoc(),
-                                    *shimTimerCtrlValue),
-            nullptr, builder.getI32IntegerAttr(shimCol),
+            builder, runtimeSeq.getLoc(), shimTimerCtrlAddrVal,
+            shimTimerCtrlValueVal, nullptr, builder.getI32IntegerAttr(shimCol),
             builder.getI32IntegerAttr(0));
 
         // Configure broadcast register with USER_EVENT_1
@@ -958,11 +963,12 @@ struct AIEInsertTraceFlowsPass
         if (!broadcastReg)
           llvm::report_fatal_error(llvm::Twine("Failed to lookup ") +
                                    broadcastRegName);
+        Value broadcastRegOffsetVal = AIEX::createConstantI32(
+            builder, runtimeSeq.getLoc(), broadcastReg->offset);
+        Value userEvent1Val =
+            AIEX::createConstantI32(builder, runtimeSeq.getLoc(), *userEvent1);
         xilinx::AIEX::NpuWrite32Op::create(
-            builder, runtimeSeq.getLoc(),
-            AIEX::createConstantI32(builder, runtimeSeq.getLoc(),
-                                    broadcastReg->offset),
-            AIEX::createConstantI32(builder, runtimeSeq.getLoc(), *userEvent1),
+            builder, runtimeSeq.getLoc(), broadcastRegOffsetVal, userEvent1Val,
             nullptr, builder.getI32IntegerAttr(shimCol),
             builder.getI32IntegerAttr(0));
 
@@ -971,12 +977,13 @@ struct AIEInsertTraceFlowsPass
             "Event_Generate", shimInfo.shimTile.getTileID());
         if (!eventGenReg)
           llvm::report_fatal_error("Failed to lookup Event_Generate register");
+        Value eventGenRegOffsetVal = AIEX::createConstantI32(
+            builder, runtimeSeq.getLoc(), eventGenReg->offset);
+        Value userEvent1AgainVal =
+            AIEX::createConstantI32(builder, runtimeSeq.getLoc(), *userEvent1);
         xilinx::AIEX::NpuWrite32Op::create(
-            builder, runtimeSeq.getLoc(),
-            AIEX::createConstantI32(builder, runtimeSeq.getLoc(),
-                                    eventGenReg->offset),
-            AIEX::createConstantI32(builder, runtimeSeq.getLoc(), *userEvent1),
-            nullptr, builder.getI32IntegerAttr(shimCol),
+            builder, runtimeSeq.getLoc(), eventGenRegOffsetVal,
+            userEvent1AgainVal, nullptr, builder.getI32IntegerAttr(shimCol),
             builder.getI32IntegerAttr(0));
       }
     }
@@ -1005,24 +1012,26 @@ struct AIEInsertTraceFlowsPass
       if (!broadcastReg)
         llvm::report_fatal_error(llvm::Twine("Failed to lookup ") +
                                  broadcastRegName);
+      Value stopBroadcastRegOffsetVal = AIEX::createConstantI32(
+          builder, runtimeSeq.getLoc(), broadcastReg->offset);
+      Value userEvent0Val =
+          AIEX::createConstantI32(builder, runtimeSeq.getLoc(), *userEvent0);
       xilinx::AIEX::NpuWrite32Op::create(
-          builder, runtimeSeq.getLoc(),
-          AIEX::createConstantI32(builder, runtimeSeq.getLoc(),
-                                  broadcastReg->offset),
-          AIEX::createConstantI32(builder, runtimeSeq.getLoc(), *userEvent0),
-          nullptr, builder.getI32IntegerAttr(shimCol),
+          builder, runtimeSeq.getLoc(), stopBroadcastRegOffsetVal,
+          userEvent0Val, nullptr, builder.getI32IntegerAttr(shimCol),
           builder.getI32IntegerAttr(0));
 
       const RegisterInfo *stopEventGenReg = targetModel.lookupRegister(
           "Event_Generate", shimInfo.shimTile.getTileID());
       if (!stopEventGenReg)
         llvm::report_fatal_error("Failed to lookup Event_Generate register");
+      Value stopEventGenRegOffsetVal = AIEX::createConstantI32(
+          builder, runtimeSeq.getLoc(), stopEventGenReg->offset);
+      Value userEvent0AgainVal =
+          AIEX::createConstantI32(builder, runtimeSeq.getLoc(), *userEvent0);
       xilinx::AIEX::NpuWrite32Op::create(
-          builder, runtimeSeq.getLoc(),
-          AIEX::createConstantI32(builder, runtimeSeq.getLoc(),
-                                  stopEventGenReg->offset),
-          AIEX::createConstantI32(builder, runtimeSeq.getLoc(), *userEvent0),
-          nullptr, builder.getI32IntegerAttr(shimCol),
+          builder, runtimeSeq.getLoc(), stopEventGenRegOffsetVal,
+          userEvent0AgainVal, nullptr, builder.getI32IntegerAttr(shimCol),
           builder.getI32IntegerAttr(0));
     }
 

@@ -198,12 +198,13 @@ public:
             shimTile->getAttrOfType<AIE::PacketInfoAttr>("controller_id");
         uint32_t data = controller_id_attr.getPktId() << 8;
         uint32_t mask = 0x00001F00;
-        NpuMaskWrite32Op::create(
-            rewriter, op->getLoc(),
-            createConstantI32(rewriter, op->getLoc(), ctrl_offset),
-            createConstantI32(rewriter, op->getLoc(), data),
-            createConstantI32(rewriter, op->getLoc(), mask), nullptr, nullptr,
-            nullptr);
+        Value ctrlOffset =
+            createConstantI32(rewriter, op->getLoc(), ctrl_offset);
+        Value dataValue = createConstantI32(rewriter, op->getLoc(), data);
+        Value maskValue = createConstantI32(rewriter, op->getLoc(), mask);
+        NpuMaskWrite32Op::create(rewriter, op->getLoc(), ctrlOffset,
+                                 dataValue, maskValue, nullptr, nullptr,
+                                 nullptr);
       } else if (!tm.isShimNOCTile(op.getColumn(), op.getRow())) {
         // Shim-tile pushes with no controller_id are tolerated for isolated
         // unit tests; a core/mem-tile push has no such precedent, and
@@ -535,13 +536,14 @@ public:
 
     // push the patched bd onto the dma task queue. bd_id and repeat_count are
     // SSA operands; materialize them as constants here (the static path).
+    Value repeatCountVal = createConstantI32(
+        rewriter, op->getLoc(),
+        static_cast<uint32_t>(repeat_count.getInt()));
+    Value bdIdVal = createConstantI32(
+        rewriter, op->getLoc(), static_cast<uint32_t>(bd_id.getInt()));
     NpuPushQueueOp::create(
         rewriter, op->getLoc(), column, row, infoOp.getChannelDirAttr(),
-        infoOp.getChannelIndexAttr(), issue_token,
-        createConstantI32(rewriter, op->getLoc(),
-                          static_cast<uint32_t>(repeat_count.getInt())),
-        createConstantI32(rewriter, op->getLoc(),
-                          static_cast<uint32_t>(bd_id.getInt())));
+        infoOp.getChannelIndexAttr(), issue_token, repeatCountVal, bdIdVal);
 
     rewriter.eraseOp(op);
     return success();
