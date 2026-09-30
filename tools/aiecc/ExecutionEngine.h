@@ -9,6 +9,7 @@
 #define AIECC_EXECUTIONENGINE_H
 
 #include "Graph.h"
+#include "ProfileTrace.h"
 #include "Utils.h"
 
 #include "mlir/Support/LogicalResult.h"
@@ -575,10 +576,25 @@ struct Engine {
         renderProgress();
         lock.unlock();
 
+        // --profile-trace: one span per (edge, item) task, on the worker
+        // thread that ran it; a fan-out edge's items therefore land on
+        // whichever lanes actually executed them.
+        uint64_t taskStartUs = nowEpochUs();
+        int64_t tid = traceThreadId();
+
         // Run the task without the scheduler lock.
         mlir::LogicalResult r = task.item < 0
                                     ? s.edge->execute()
                                     : s.edge->executeForItem((size_t)task.item);
+
+        if (ProfileTrace::instance().enabled) {
+          std::string name = displayName(s.edge).str();
+          if (task.item >= 0)
+            name += "[" + std::to_string(task.item) + "]";
+          ProfileTrace::instance().addSpan(
+              name, getpid(), tid, taskStartUs,
+              (int64_t)(nowEpochUs() - taskStartUs));
+        }
 
         lock.lock();
         --s.running;

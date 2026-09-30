@@ -2643,6 +2643,16 @@ int main(int argc, char **argv) {
   llvm::cl::ParseCommandLineOptions(parseArgc, effArgv,
                                     "aiecc declarative driver\n");
 
+  // --profile-trace: arm the sink before any edge or pass can run, and write
+  // it on every exit from main (including the early `return 1`s below).
+  if (!profileTrace.empty()) {
+    ProfileTrace::instance().enabled = true;
+    ProfileTrace::instance().path = profileTrace.getValue();
+    ProfileTrace::instance().startEpochUs = nowEpochUs();
+  }
+  llvm::scope_exit writeProfileTrace(
+      [] { ProfileTrace::instance().write(); });
+
   // Exactly one input MLIR file may appear before the `--` separator; host
   // source files and host-compiler flags belong after it.
   if (positionalArgs.size() > 1) {

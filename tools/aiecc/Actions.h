@@ -19,6 +19,7 @@
 #define AIECC_ACTIONS_H
 
 #include "Graph.h"
+#include "ProfileTrace.h"
 #include "Utils.h"
 
 #include "mlir/IR/BuiltinOps.h"
@@ -125,6 +126,11 @@ inline bool verifyEachPass = false;
 inline mlir::LogicalResult runPasses(mlir::PassManager &pm,
                                      mlir::Operation *op) {
   pm.enableVerifier(verifyEachPass);
+  // --profile-trace: one span per pass execution per anchor op. addInstrumentation
+  // takes ownership; harmless to add on every run since ProfileTrace is a no-op
+  // sink when the flag is off.
+  if (ProfileTrace::instance().enabled)
+    pm.addInstrumentation(std::make_unique<TracingPassInstrumentation>());
   if (mlir::failed(runPipeline(pm, op))) {
     return mlir::failure();
   }

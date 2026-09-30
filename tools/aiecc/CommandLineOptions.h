@@ -503,6 +503,12 @@ inline cl::opt<bool> dryRun("n", cl::desc("Dry run"));
 inline cl::opt<bool> profile(
     "profile",
     cl::desc("Print a per-edge time and resident-memory summary at the end"));
+// Chrome Trace Event JSON: one span per edge plus, inside every PassPipeline
+// edge, one span per pass execution per anchor op. See ProfileTrace.h.
+inline cl::opt<std::string> profileTrace(
+    "profile-trace",
+    cl::desc("Write a Chrome Trace Event JSON with per-edge and per-pass "
+             "spans to the given file"));
 inline cl::opt<bool> progress(
     "progress",
     cl::desc("Show single-line execution progress: overwrite one status line "
