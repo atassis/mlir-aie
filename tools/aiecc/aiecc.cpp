@@ -1814,9 +1814,12 @@ static std::vector<EdgeBase *> buildMainGraph(mlir::MLIRContext &context,
                                const Item<Directory> &cdoItem,
                                Item<std::string> &out) -> mlir::LogicalResult {
                               DeviceOp d = devItem.get().op;
-                              out.value =
-                                  makeBifText(absolutePath(cdoItem.asFile()),
-                                              d.getSymName());
+                              // Absolute: bootgen consumes this BIF
+                              // in-process, with this invocation's cwd,
+                              // which need not be getWorkDir().
+                              out.value = makeBifText(
+                                  absolutePath(cdoItem.asFile()),
+                                  d.getSymName());
                               return mlir::success();
                             });
 
@@ -2352,16 +2355,20 @@ static std::vector<EdgeBase *> buildMainGraph(mlir::MLIRContext &context,
                 llvm::StringMap<std::string> pdiPaths, instsPaths;
                 llvm::StringMap<std::string> ctrlPktPaths, patchInfoPaths;
                 for (const auto &item : pdis.items) {
-                  pdiPaths[item.key] = absolutePath(item.asFile());
+                  pdiPaths[item.key] =
+                      relativeToDirOrAbsolute(getWorkDir(), item.asFile());
                 }
                 for (const auto &item : instsBins.items) {
-                  instsPaths[item.key] = absolutePath(item.asFile());
+                  instsPaths[item.key] =
+                      relativeToDirOrAbsolute(getWorkDir(), item.asFile());
                 }
                 for (const auto &item : ctrlPkts.items) {
-                  ctrlPktPaths[item.key] = absolutePath(item.asFile());
+                  ctrlPktPaths[item.key] =
+                      relativeToDirOrAbsolute(getWorkDir(), item.asFile());
                 }
                 for (const auto &item : patchInfos.items) {
-                  patchInfoPaths[item.key] = absolutePath(item.asFile());
+                  patchInfoPaths[item.key] =
+                      relativeToDirOrAbsolute(getWorkDir(), item.asFile());
                 }
                 out.value = makeFullElfConfigJson(devices, pdiPaths, instsPaths,
                                                   ctrlPktPaths, patchInfoPaths);

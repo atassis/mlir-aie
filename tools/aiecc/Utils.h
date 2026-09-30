@@ -110,6 +110,28 @@ inline std::string absolutePath(llvm::StringRef p) {
   return std::string(abs);
 }
 
+// `p`, relative to `baseDir`, when `p` sits under it; otherwise `p` absolute.
+// A sidecar's references to its own siblings survive the directory being
+// copied elsewhere this way; aiebu-asm's aie2_config target already resolves
+// a relative path in its input JSON against the JSON's own directory.
+inline std::string relativeToDirOrAbsolute(llvm::StringRef baseDir,
+                                           llvm::StringRef p) {
+  llvm::SmallString<256> absP(p);
+  llvm::sys::fs::make_absolute(absP);
+  llvm::sys::path::remove_dots(absP, /*remove_dot_dot=*/true);
+  llvm::SmallString<256> absBase(baseDir);
+  llvm::sys::fs::make_absolute(absBase);
+  llvm::sys::path::remove_dots(absBase, /*remove_dot_dot=*/true);
+  llvm::StringRef rest(absP);
+  if (rest.consume_front(llvm::StringRef(absBase)) &&
+      (rest.empty() || llvm::sys::path::is_separator(rest.front()))) {
+    while (!rest.empty() && llvm::sys::path::is_separator(rest.front()))
+      rest = rest.drop_front();
+    return rest.empty() ? std::string(".") : rest.str();
+  }
+  return std::string(absP);
+}
+
 // Recursively copy the contents of directory `src` into `dst` (creating `dst`).
 // Used as the cross-device fallback for publishDirectory and to snapshot a
 // directory artifact into a checkpoint.
