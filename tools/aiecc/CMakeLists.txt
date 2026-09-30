@@ -33,6 +33,13 @@ install(TARGETS aiecc
   RUNTIME DESTINATION ${LLVM_TOOLS_INSTALL_DIR}
   COMPONENT aiecc)
 
+# Vendored aiebu-asm (top-level CMakeLists.txt) lands next to aiecc, so
+# ShellCommand::resolveTool finds it beside aiecc's own executable before PATH.
+if(TARGET aiebu-asm)
+  add_dependencies(aiecc aiebu-asm)
+  install(TARGETS aiebu-asm RUNTIME DESTINATION ${LLVM_TOOLS_INSTALL_DIR})
+endif()
+
 get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
 get_property(conversion_libs GLOBAL PROPERTY MLIR_CONVERSION_LIBS)
 get_property(extension_libs GLOBAL PROPERTY MLIR_EXTENSION_LIBS)

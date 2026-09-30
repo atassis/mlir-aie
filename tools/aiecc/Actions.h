@@ -376,6 +376,18 @@ struct ShellCommand {
       }
     }
     if (result.empty()) {
+      // A tool built alongside aiecc (e.g. the vendored aiebu-asm, installed
+      // to the same LLVM_TOOLS_INSTALL_DIR) wins over a same-named binary
+      // elsewhere on PATH.
+      std::string mainExe = llvm::sys::fs::getMainExecutable(
+          nullptr, reinterpret_cast<void *>(&resolveTool));
+      llvm::SmallString<256> candidate(llvm::sys::path::parent_path(mainExe));
+      llvm::sys::path::append(candidate, name);
+      if (llvm::sys::fs::can_execute(candidate)) {
+        result = std::string(candidate);
+      }
+    }
+    if (result.empty()) {
       if (auto r = llvm::sys::findProgramByName(name)) {
         result = *r;
       }

@@ -241,6 +241,15 @@ if(aiebu_FOUND)
   message(STATUS "Found AIEBU library - aiecc will use direct library calls for ELF generation")
 else()
   message(STATUS "AIEBU library not found - aiecc will use subprocess calls to aiebu-asm")
+  # aiebu_assembler_buffer_type_aie2_config is a no-op in the XRT build we test
+  # against (returns a 0-byte ELF), so the library path above must stay off
+  # regardless; build the aiebu-asm CLI ourselves instead of depending on
+  # whatever binary happens to be on PATH. Build only the asm target, not
+  # aiebu's tests/python bindings.
+  set(AIEBU_PYTHON OFF CACHE STRING "" FORCE)
+  set(AIEBU_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(AIEBU_CTRLCODE_CODEGEN OFF CACHE BOOL "" FORCE)
+  add_subdirectory(third_party/aiebu EXCLUDE_FROM_ALL)
 endif()
 
 # Set up default Vitis Sysroot as sysroot when testing on aarch64
